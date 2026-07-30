@@ -5,6 +5,7 @@ mod background;
 mod cli;
 mod config;
 mod git;
+mod github;
 mod model;
 mod operations;
 mod terminal;

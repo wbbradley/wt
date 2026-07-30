@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::model::{RepositoryConfig, Worktree, WorktreeStatus};
+use crate::github::GitHubError;
+use crate::model::{GitHubBranchData, RepositoryConfig, Worktree, WorktreeStatus};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RowId {
@@ -16,6 +17,27 @@ pub enum StatusState {
     Pending,
     Ready(WorktreeStatus),
     Error(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitHubState {
+    Loading {
+        previous: Option<GitHubBranchData>,
+    },
+    Ready(GitHubBranchData),
+    Stale {
+        previous: Option<GitHubBranchData>,
+        error: String,
+    },
+}
+
+impl GitHubState {
+    pub fn data(&self) -> Option<&GitHubBranchData> {
+        match self {
+            Self::Loading { previous } | Self::Stale { previous, .. } => previous.as_ref(),
+            Self::Ready(data) => Some(data),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +176,7 @@ pub enum Intent {
     Accept(PathBuf),
     Cancel,
     Refresh,
+    RefreshGitHub,
     BeginAction(Action),
     SubmitForm { action: Action, values: Vec<String> },
     ConfirmAction(Action),
@@ -179,6 +202,9 @@ pub struct App {
     pub inline_error: Option<String>,
     pub progress: Option<String>,
     pub statuses: HashMap<PathBuf, StatusState>,
+    pub github: HashMap<PathBuf, GitHubState>,
+    pub github_generation: u64,
+    pub github_loading: bool,
     pub current_directory: PathBuf,
     pub generation: u64,
     pending_status: usize,
@@ -199,6 +225,9 @@ impl App {
             inline_error: None,
             progress: None,
             statuses: HashMap::new(),
+            github: HashMap::new(),
+            github_generation: 0,
+            github_loading: false,
             current_directory,
             generation: 0,
             pending_status: 0,
@@ -267,6 +296,26 @@ impl App {
                 StatusState::Pending => None,
             })
             .unwrap_or_default();
+        let github = self
+            .github
+            .get(&worktree.path)
+            .map(|state| match state {
+                GitHubState::Loading { previous } => previous
+                    .as_ref()
+                    .map(github_search_text)
+                    .unwrap_or_else(|| "github loading".to_owned()),
+                GitHubState::Ready(data) => github_search_text(data),
+                GitHubState::Stale { previous, error } => {
+                    let mut text = previous
+                        .as_ref()
+                        .map(github_search_text)
+                        .unwrap_or_default();
+                    text.push(' ');
+                    text.push_str(error);
+                    text
+                }
+            })
+            .unwrap_or_default();
         worktree
             .path
             .to_string_lossy()
@@ -285,6 +334,7 @@ impl App {
                 .to_ascii_lowercase()
                 .contains(filter)
             || local.to_ascii_lowercase().contains(filter)
+            || github.to_ascii_lowercase().contains(filter)
     }
 
     pub fn selected_row(&self) -> Option<VisibleRow> {
@@ -610,7 +660,7 @@ impl App {
         if self.pending_status > 0 {
             self.refresh_queued = true;
             self.progress = Some("refresh queued".to_owned());
-            Intent::None
+            Intent::RefreshGitHub
         } else {
             Intent::Refresh
         }
@@ -642,6 +692,45 @@ impl App {
         }
         self.progress = Some(format!("loading status: {} remaining", self.pending_status));
         false
+    }
+
+    pub fn begin_github_refresh(&mut self, paths: &[PathBuf]) -> u64 {
+        self.github_generation = self.github_generation.wrapping_add(1);
+        self.github_loading = !paths.is_empty();
+        for path in paths {
+            let previous = self.github.get(path).and_then(GitHubState::data).cloned();
+            self.github
+                .insert(path.clone(), GitHubState::Loading { previous });
+        }
+        self.github_generation
+    }
+
+    pub fn apply_github_refresh(
+        &mut self,
+        generation: u64,
+        paths: &[PathBuf],
+        mut results: HashMap<PathBuf, Result<GitHubBranchData, GitHubError>>,
+    ) -> bool {
+        if generation != self.github_generation {
+            return false;
+        }
+        for path in paths {
+            let previous = self.github.get(path).and_then(GitHubState::data).cloned();
+            let state = match results.remove(path) {
+                Some(Ok(data)) => GitHubState::Ready(data),
+                Some(Err(error)) => GitHubState::Stale {
+                    previous,
+                    error: error.to_string(),
+                },
+                None => GitHubState::Stale {
+                    previous,
+                    error: "GitHub refresh returned no result".to_owned(),
+                },
+            };
+            self.github.insert(path.clone(), state);
+        }
+        self.github_loading = false;
+        true
     }
 
     pub fn replace_repositories(&mut self, repositories: Vec<RepositoryView>) {
@@ -817,6 +906,23 @@ impl App {
     }
 }
 
+fn github_search_text(data: &GitHubBranchData) -> String {
+    let mut parts = data.warnings.clone();
+    if let Some(pull_request) = &data.pull_request {
+        parts.extend([
+            format!("#{}", pull_request.number),
+            pull_request.title.clone(),
+            pull_request.url.clone(),
+            pull_request.state.to_string(),
+            pull_request.base.branch.clone(),
+            pull_request.head.branch.clone(),
+            pull_request.review_decision.clone().unwrap_or_default(),
+            pull_request.checks.to_string(),
+        ]);
+    }
+    parts.join(" ")
+}
+
 fn contains_path(worktree: &Path, candidate: &Path) -> bool {
     let worktree = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_owned());
     let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_owned());
@@ -916,7 +1022,7 @@ mod tests {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         let paths = vec![PathBuf::from("/repo"), PathBuf::from("/repo-topic")];
         let generation = app.begin_status_refresh(&paths);
-        assert_eq!(app.request_refresh(), Intent::None);
+        assert_eq!(app.request_refresh(), Intent::RefreshGitHub);
         assert!(!app.apply_status(StatusUpdate {
             generation: generation.wrapping_sub(1),
             path: paths[0].clone(),
@@ -932,6 +1038,70 @@ mod tests {
             path: paths[1].clone(),
             result: Ok(WorktreeStatus::default()),
         }));
+    }
+
+    #[test]
+    fn github_refresh_retains_stale_data_and_rejects_old_generations() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let path = PathBuf::from("/repo-topic");
+        let data = GitHubBranchData {
+            pull_request: None,
+            warnings: vec!["first warning".to_owned()],
+            rate_limit: None,
+        };
+        let first = app.begin_github_refresh(std::slice::from_ref(&path));
+        let mut results = HashMap::new();
+        results.insert(path.clone(), Ok(data.clone()));
+        assert!(app.apply_github_refresh(first, std::slice::from_ref(&path), results));
+
+        let second = app.begin_github_refresh(std::slice::from_ref(&path));
+        assert!(!app.apply_github_refresh(first, std::slice::from_ref(&path), HashMap::new(),));
+        let mut failed = HashMap::new();
+        failed.insert(path.clone(), Err(GitHubError::Unauthorized));
+        assert!(app.apply_github_refresh(second, std::slice::from_ref(&path), failed));
+        assert!(matches!(
+            app.github.get(&path),
+            Some(GitHubState::Stale {
+                previous: Some(previous),
+                error,
+            }) if previous == &data && error.contains("authentication")
+        ));
+    }
+
+    #[test]
+    fn filter_matches_pull_request_enrichment() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let path = PathBuf::from("/repo-topic");
+        app.github.insert(
+            path.clone(),
+            GitHubState::Ready(GitHubBranchData {
+                pull_request: Some(crate::model::PullRequest {
+                    number: 42,
+                    title: "Improve frobnicator".to_owned(),
+                    url: "https://example.test/pull/42".to_owned(),
+                    state: crate::model::PullRequestState::Open,
+                    updated_at: "2026-07-30T00:00:00Z".to_owned(),
+                    review_decision: Some("APPROVED".to_owned()),
+                    base: crate::model::PullRequestIdentity {
+                        repository: Some("team/repo".to_owned()),
+                        branch: "main".to_owned(),
+                        oid: None,
+                    },
+                    head: crate::model::PullRequestIdentity {
+                        repository: Some("fork/repo".to_owned()),
+                        branch: "topic".to_owned(),
+                        oid: None,
+                    },
+                    checks: crate::model::CheckRollup::Success,
+                }),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+        app.filter = "frobnicator".to_owned();
+        assert!(app.visible_rows().iter().any(
+            |row| matches!(row, VisibleRow::Worktree { id: RowId::Worktree(found), .. } if found == &path)
+        ));
     }
 
     #[test]

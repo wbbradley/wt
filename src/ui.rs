@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{App, Modal, Pane, StatusState, VisibleRow};
+use crate::app::{App, GitHubState, Modal, Pane, StatusState, VisibleRow};
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -20,13 +20,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         Paragraph::new(Line::from(vec![
             Span::styled(" wt ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::raw(" global worktrees"),
-            Span::styled(
-                app.progress
-                    .as_ref()
-                    .map(|progress| format!("  ·  {progress}"))
-                    .unwrap_or_default(),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(header_progress(app), Style::default().fg(Color::Yellow)),
         ])),
         vertical[0],
     );
@@ -130,6 +124,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     Some(StatusState::Error(_)) => "status error".to_owned(),
                     None => String::new(),
                 };
+                let github = github_summary(app.github.get(&worktree.path));
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         if current { "  ● " } else { "    " },
@@ -163,6 +158,14 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             format!("  {local}")
                         },
                         Style::default().fg(Color::Magenta),
+                    ),
+                    Span::styled(
+                        if github.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {github}")
+                        },
+                        Style::default().fg(Color::Cyan),
                     ),
                 ]))
             }
@@ -241,6 +244,25 @@ fn render_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 format!("status error {error}"),
                 Style::default().fg(Color::Red),
             )),
+            None => {}
+        }
+        match app.github.get(&worktree.path) {
+            Some(GitHubState::Loading { previous }) => {
+                lines.push(field("GitHub", "loading…".to_owned()));
+                if let Some(data) = previous {
+                    append_github_details(&mut lines, data);
+                }
+            }
+            Some(GitHubState::Ready(data)) => append_github_details(&mut lines, data),
+            Some(GitHubState::Stale { previous, error }) => {
+                lines.push(Line::styled(
+                    format!("GitHub stale: {error}"),
+                    Style::default().fg(Color::Yellow),
+                ));
+                if let Some(data) = previous {
+                    append_github_details(&mut lines, data);
+                }
+            }
             None => {}
         }
     } else if let Some((repository, _)) = app.selected_repository() {
@@ -410,6 +432,95 @@ fn field(label: &str, value: String) -> Line<'static> {
         Span::styled(format!("{label:<11}"), Style::default().fg(Color::DarkGray)),
         Span::raw(value),
     ])
+}
+
+fn header_progress(app: &App) -> String {
+    let mut progress = app.progress.clone().into_iter().collect::<Vec<_>>();
+    if app.github_loading {
+        progress.push("loading GitHub PRs".to_owned());
+    }
+    if progress.is_empty() {
+        String::new()
+    } else {
+        format!("  ·  {}", progress.join(" · "))
+    }
+}
+
+fn github_summary(state: Option<&GitHubState>) -> String {
+    match state {
+        Some(GitHubState::Loading { previous }) => previous
+            .as_ref()
+            .map(|data| format!("{} (refreshing)", pull_request_summary(data)))
+            .unwrap_or_else(|| "PR …".to_owned()),
+        Some(GitHubState::Ready(data)) => pull_request_summary(data),
+        Some(GitHubState::Stale { previous, .. }) => previous
+            .as_ref()
+            .map(|data| format!("{} (stale)", pull_request_summary(data)))
+            .unwrap_or_else(|| "GitHub error".to_owned()),
+        None => String::new(),
+    }
+}
+
+fn pull_request_summary(data: &crate::model::GitHubBranchData) -> String {
+    data.pull_request
+        .as_ref()
+        .map(|pull_request| {
+            format!(
+                "PR #{} {} · {} · {}",
+                pull_request.number, pull_request.state, pull_request.checks, pull_request.title
+            )
+        })
+        .unwrap_or_else(|| "no PR".to_owned())
+}
+
+fn append_github_details(lines: &mut Vec<Line<'static>>, data: &crate::model::GitHubBranchData) {
+    if let Some(pull_request) = &data.pull_request {
+        lines.push(field(
+            "PR",
+            format!("#{} {}", pull_request.number, pull_request.state),
+        ));
+        lines.push(field("title", pull_request.title.clone()));
+        lines.push(field("URL", pull_request.url.clone()));
+        lines.push(field(
+            "base",
+            format!(
+                "{}:{}",
+                pull_request.base.repository.as_deref().unwrap_or("?"),
+                pull_request.base.branch
+            ),
+        ));
+        lines.push(field(
+            "head",
+            format!(
+                "{}:{}",
+                pull_request.head.repository.as_deref().unwrap_or("?"),
+                pull_request.head.branch
+            ),
+        ));
+        lines.push(field(
+            "review",
+            pull_request
+                .review_decision
+                .clone()
+                .unwrap_or_else(|| "-".to_owned()),
+        ));
+        lines.push(field("checks", pull_request.checks.to_string()));
+        lines.push(field("PR updated", pull_request.updated_at.clone()));
+    } else {
+        lines.push(field("GitHub", "no associated PR".to_owned()));
+    }
+    if let Some(rate) = &data.rate_limit {
+        lines.push(field(
+            "rate limit",
+            format!("{} remaining · reset {}", rate.remaining, rate.reset_at),
+        ));
+    }
+    for warning in &data.warnings {
+        lines.push(Line::styled(
+            format!("warning: {warning}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
 }
 
 fn short(head: &str) -> &str {

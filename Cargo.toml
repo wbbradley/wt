@@ -11,3 +11,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.20"
 thiserror = "2.0"
+time = { version = "0.3", features = ["parsing"] }
+ureq = { version = "3.1", features = ["json"] }

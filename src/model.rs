@@ -103,3 +103,78 @@ pub struct RepositoryDiscovery {
     pub repository: RepositoryConfig,
     pub result: Result<Vec<Worktree>, String>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullRequestState {
+    Draft,
+    Open,
+    Merged,
+    Closed,
+}
+
+impl std::fmt::Display for PullRequestState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Draft => "draft",
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckRollup {
+    Success,
+    Failure,
+    Pending,
+    Expected,
+    Error,
+    Unknown,
+}
+
+impl std::fmt::Display for CheckRollup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Pending => "pending",
+            Self::Expected => "expected",
+            Self::Error => "error",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestIdentity {
+    pub repository: Option<String>,
+    pub branch: String,
+    pub oid: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: PullRequestState,
+    pub updated_at: String,
+    pub review_decision: Option<String>,
+    pub base: PullRequestIdentity,
+    pub head: PullRequestIdentity,
+    pub checks: CheckRollup,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RateLimit {
+    pub remaining: u64,
+    pub reset_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitHubBranchData {
+    pub pull_request: Option<PullRequest>,
+    pub warnings: Vec<String>,
+    pub rate_limit: Option<RateLimit>,
+}

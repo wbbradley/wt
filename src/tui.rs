@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEventKind};
 use thiserror::Error;
@@ -11,12 +12,20 @@ use crate::app::{Action, App, FormField, Intent, RepositoryView};
 use crate::background::{StatusPool, StatusTask};
 use crate::config;
 use crate::git::{self, SystemGit};
+use crate::github::{GitHubRefresh, GitHubService, RepositoryGitHubInput};
 use crate::model::{Catalog, RepositoryConfig, Worktree};
 use crate::operations::{self, CreateMode};
 use crate::terminal::{InteractiveTerminal, PanicHookGuard};
 use crate::ui;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
+const MIN_GITHUB_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+struct GitHubMessage {
+    generation: u64,
+    paths: Vec<PathBuf>,
+    refresh: GitHubRefresh,
+}
 
 #[derive(Debug, Error)]
 pub enum TuiError {
@@ -124,12 +133,13 @@ pub fn run() -> Result<Option<PathBuf>, TuiError> {
         .terminal_mut()
         .draw(|frame| ui::render(frame, &mut controller.app))?;
     controller.start_status_refresh();
+    controller.request_github_refresh();
     terminal
         .terminal_mut()
         .draw(|frame| ui::render(frame, &mut controller.app))?;
 
     loop {
-        if controller.pump_status_results() {
+        if controller.pump_background_results() {
             terminal
                 .terminal_mut()
                 .draw(|frame| ui::render(frame, &mut controller.app))?;
@@ -190,6 +200,13 @@ struct Controller {
     app: App,
     status_pool: StatusPool,
     status_backlog: VecDeque<StatusTask>,
+    github_service: GitHubService,
+    github_sender: Sender<GitHubMessage>,
+    github_receiver: Receiver<GitHubMessage>,
+    github_in_flight: bool,
+    github_refresh_queued: bool,
+    github_refresh_interval: Duration,
+    next_github_refresh: Instant,
     pending_action: Option<PendingAction>,
 }
 
@@ -198,12 +215,21 @@ impl Controller {
         let workers = std::thread::available_parallelism()
             .map(|parallelism| parallelism.get().min(4))
             .unwrap_or(2);
+        let github_refresh_interval = github_refresh_interval(&catalog);
+        let (github_sender, github_receiver) = mpsc::channel();
         Self {
             catalog_path,
             catalog,
             app,
             status_pool: StatusPool::with_git(workers),
             status_backlog: VecDeque::new(),
+            github_service: GitHubService::new(),
+            github_sender,
+            github_receiver,
+            github_in_flight: false,
+            github_refresh_queued: false,
+            github_refresh_interval,
+            next_github_refresh: Instant::now(),
             pending_action: None,
         }
     }
@@ -218,6 +244,10 @@ impl Controller {
             Intent::Cancel => Ok(ControlFlow::Exit(None)),
             Intent::Refresh => {
                 self.refresh_local()?;
+                Ok(ControlFlow::Continue)
+            }
+            Intent::RefreshGitHub => {
+                self.request_github_refresh();
                 Ok(ControlFlow::Continue)
             }
             Intent::BeginAction(action) => {
@@ -675,9 +705,11 @@ impl Controller {
 
     fn refresh_local(&mut self) -> Result<(), TuiError> {
         self.catalog = config::load(&self.catalog_path)?;
+        self.github_refresh_interval = github_refresh_interval(&self.catalog);
         let repositories = load_repository_views(&self.catalog, &self.app.current_directory);
         self.app.replace_repositories(repositories);
         self.start_status_refresh();
+        self.request_github_refresh();
         Ok(())
     }
 
@@ -707,7 +739,54 @@ impl Controller {
         }
     }
 
-    fn pump_status_results(&mut self) -> bool {
+    fn request_github_refresh(&mut self) {
+        if self.github_in_flight {
+            self.github_refresh_queued = true;
+            return;
+        }
+
+        let inputs: Vec<RepositoryGitHubInput> = self
+            .app
+            .repositories
+            .iter()
+            .filter(|repository| repository.stale_error.is_none())
+            .map(|repository| RepositoryGitHubInput {
+                repository: repository.config.clone(),
+                worktrees: repository.worktrees.clone(),
+            })
+            .collect();
+        let paths: Vec<PathBuf> = inputs
+            .iter()
+            .flat_map(|input| input.worktrees.iter())
+            .filter(|worktree| {
+                !worktree.bare
+                    && worktree
+                        .branch
+                        .as_deref()
+                        .is_some_and(|branch| branch.starts_with("refs/heads/"))
+            })
+            .map(|worktree| worktree.path.clone())
+            .collect();
+        let generation = self.app.begin_github_refresh(&paths);
+        self.next_github_refresh = Instant::now() + self.github_refresh_interval;
+        if paths.is_empty() {
+            return;
+        }
+
+        self.github_in_flight = true;
+        let service = self.github_service.clone();
+        let sender = self.github_sender.clone();
+        std::thread::spawn(move || {
+            let refresh = service.fetch_catalog(&inputs);
+            let _ = sender.send(GitHubMessage {
+                generation,
+                paths,
+                refresh,
+            });
+        });
+    }
+
+    fn pump_background_results(&mut self) -> bool {
         self.submit_status_backlog();
         let mut refresh = false;
         let mut changed = false;
@@ -719,8 +798,27 @@ impl Controller {
             self.app.inline_error = Some(error.to_string());
             changed = true;
         }
+        while let Ok(message) = self.github_receiver.try_recv() {
+            self.github_in_flight = false;
+            changed |= self.app.apply_github_refresh(
+                message.generation,
+                &message.paths,
+                message.refresh.branches,
+            );
+            if std::mem::take(&mut self.github_refresh_queued) {
+                self.request_github_refresh();
+            }
+        }
+        if !self.github_in_flight && Instant::now() >= self.next_github_refresh {
+            self.request_github_refresh();
+            changed |= self.app.github_loading;
+        }
         changed
     }
+}
+
+fn github_refresh_interval(catalog: &Catalog) -> Duration {
+    Duration::from_secs(catalog.github_refresh_interval_secs).max(MIN_GITHUB_REFRESH_INTERVAL)
 }
 
 fn load_repository_views(catalog: &Catalog, current_directory: &Path) -> Vec<RepositoryView> {
@@ -891,6 +989,29 @@ mod tests {
             absolute_path(Path::new("/base"), "relative"),
             PathBuf::from("/base/relative")
         );
+    }
+
+    #[test]
+    fn github_refresh_interval_has_a_thirty_second_floor() {
+        let mut catalog = Catalog {
+            github_refresh_interval_secs: 1,
+            ..Catalog::default()
+        };
+        assert_eq!(github_refresh_interval(&catalog), Duration::from_secs(30));
+        catalog.github_refresh_interval_secs = 450;
+        assert_eq!(github_refresh_interval(&catalog), Duration::from_secs(450));
+    }
+
+    #[test]
+    fn overlapping_github_refreshes_coalesce() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::default();
+        let app = App::new(Vec::new(), directory.path().to_owned());
+        let mut controller = Controller::new(directory.path().join("wt.json"), catalog, app);
+        controller.github_in_flight = true;
+        controller.request_github_refresh();
+        controller.request_github_refresh();
+        assert!(controller.github_refresh_queued);
     }
 
     #[test]
