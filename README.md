@@ -54,7 +54,7 @@ Navigation keys:
 - `h`/`l` or left/right: collapse, expand, or switch panes
 - `/`: filter across repository, path, branch, status, PR, checks, review, warning, and error text
 - `r`: coalesced local and GitHub refresh
-- `Enter`: select a worktree or toggle a repository; `Esc`/`Ctrl-c`: cancel
+- `Enter`: select a worktree or toggle a repository; `q`/`Esc`/`Ctrl-c`: cancel
 - `?` or Space: action palette
 
 Direct action shortcuts:
