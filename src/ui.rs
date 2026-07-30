@@ -376,7 +376,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
             fields,
             active,
         } => {
-            let lines: Vec<Line<'_>> = fields
+            let mut lines: Vec<Line<'_>> = fields
                 .iter()
                 .enumerate()
                 .map(|(index, field)| {
@@ -395,8 +395,18 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
                     )
                 })
                 .collect();
+            // A rejected submission leaves the form open, so the reason belongs
+            // next to the fields instead of only on the footer line, where it
+            // reads as the submission having done nothing at all.
+            if let Some(error) = &app.inline_error {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("error: {error}"),
+                    Style::default().fg(Color::Red),
+                ));
+            }
             frame.render_widget(
-                Paragraph::new(lines).block(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                     Block::default()
                         .title(format!(" {} · Enter submit · Esc cancel ", action.label()))
                         .borders(Borders::ALL),
@@ -697,6 +707,23 @@ mod tests {
         assert!(stale.contains("GitHub stale: network unavailable"));
         assert!(stale.contains("12 remaining"));
         assert!(stale.contains("warning: partial response"));
+    }
+
+    #[test]
+    fn open_form_shows_the_rejection_reason_beside_its_fields() {
+        let mut app = App::new(Vec::new(), PathBuf::from("/outside"));
+        app.open_form(
+            crate::app::Action::Create,
+            vec![crate::app::FormField {
+                label: "destination (blank = suggested)".to_owned(),
+                value: String::new(),
+            }],
+        );
+        app.inline_error = Some("destination parent does not exist: /trees".to_owned());
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("error: destination parent does not exist: /trees"));
     }
 
     #[test]
