@@ -1,3 +1,13 @@
+use clap::Parser;
+
+mod cli;
+mod config;
+mod git;
+mod model;
+
 fn main() {
-    println!("Hello, world!");
+    if let Err(error) = cli::run(cli::Cli::parse()) {
+        eprintln!("wt: {error}");
+        std::process::exit(1);
+    }
 }
