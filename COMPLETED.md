@@ -78,3 +78,17 @@ Complete shell-facing navigation and local-only discovery ergonomics.
 - Add `wt <repo-label>:<branch-or-worktree>` unique resolution by branch/basename/path, opening the TUI prefiltered when ambiguous rather than guessing.
 - Add Bash 3.2-compatible completion for flags, subcommands, labels, qualified selectors, branches, and paths through a local-only endpoint that preserves spaces, avoids GitHub, and never opens the TUI.
 - Shell-test navigation, exact roots, spaces, cancellation/failure preservation, passthrough, selectors, ambiguity handling, and completion.
+
+## Documentation, integration hardening, and completion audit
+
+Added comprehensive product documentation for installation, catalog and bare-repository workflows, TUI navigation and actions, safe scriptable CRUD, Bash navigation/completion, selectors, configuration, GitHub/GHE credentials and failure behavior, troubleshooting, and development checks. Strengthened renderer coverage for progressive and stale GitHub states, ran the complete formatting/lint/test suite, and manually exercised isolated normal/bare registration, confirmed CRUD, exact selection, sourced Bash navigation, progressive local/GitHub rendering, cancellation, and terminal restoration. The final requirement audit found no remaining PLAN work.
+
+## Documentation, integration hardening, and completion audit
+
+Finish product documentation and verify the complete normal/bare/global workflow end to end.
+
+- Document installation, registration, unregistered-session onboarding, bare repositories, CRUD safety and confirmations, keys/action palette, shell setup/completion, selectors, config, GitHub/GHE authentication, rate/error behavior, and troubleshooting in `README.md`.
+- Verify repository-level error isolation, progressive local/GitHub rendering, action confirmations, selection output, and terminal cleanup across integrated flows.
+- Ensure `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` pass.
+- Manually verify normal and bare workflows, progressive GitHub updates, CRUD confirmations and safeguards, terminal restoration, cancellation/failure behavior, and sourced Bash navigation.
+- Audit every requirement preserved across the preceding phases and add/fix any missing coverage before declaring the product complete.

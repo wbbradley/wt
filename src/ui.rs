@@ -555,8 +555,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{RepositoryView, RowId};
-    use crate::model::{RepositoryConfig, Worktree};
+    use crate::app::{GitHubState, RepositoryView, RowId};
+    use crate::model::{GitHubBranchData, RateLimit, RepositoryConfig, Worktree};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
@@ -624,6 +624,63 @@ mod tests {
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("lost [stale]"));
         assert!(content.contains("not found"));
+    }
+
+    #[test]
+    fn renders_progressive_and_stale_github_states() {
+        let path = PathBuf::from("/repo");
+        let repository = RepositoryView {
+            config: RepositoryConfig {
+                path: path.clone(),
+                label: Some("project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+            },
+            session_only: false,
+            stale_error: None,
+            expanded: true,
+            worktrees: vec![Worktree {
+                path: path.clone(),
+                head: Some("1234567890".to_owned()),
+                branch: Some("refs/heads/main".to_owned()),
+                detached: false,
+                bare: false,
+                locked: None,
+                prunable: None,
+            }],
+        };
+        let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        app.selected = Some(RowId::Worktree(path.clone()));
+        app.github_loading = true;
+        app.github
+            .insert(path.clone(), GitHubState::Loading { previous: None });
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let loading = buffer_text(terminal.backend().buffer());
+        assert!(loading.contains("loading GitHub PRs"));
+        assert!(loading.contains("PR …"));
+
+        let previous = GitHubBranchData {
+            pull_request: None,
+            warnings: vec!["partial response".to_owned()],
+            rate_limit: Some(RateLimit {
+                remaining: 12,
+                reset_at: "later".to_owned(),
+            }),
+        };
+        app.github_loading = false;
+        app.github.insert(
+            path,
+            GitHubState::Stale {
+                previous: Some(previous),
+                error: "network unavailable".to_owned(),
+            },
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let stale = buffer_text(terminal.backend().buffer());
+        assert!(stale.contains("GitHub stale: network unavailable"));
+        assert!(stale.contains("12 remaining"));
+        assert!(stale.contains("warning: partial response"));
     }
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
