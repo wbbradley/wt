@@ -24,11 +24,13 @@ Running `wt` opens the global TUI. Running it inside an unregistered Git reposit
 
 ## Bash navigation and completion
 
-Source the bundled Bash 3.2-compatible integration from `.bashrc`:
+Add the self-contained Bash 3.2-compatible integration to `.bashrc`:
 
 ```bash
-source /path/to/wt/shell/wt.bash
+eval "$(wt shell-init bash)"
 ```
+
+When developing from a checkout, sourcing `shell/wt.bash` directly is also supported.
 
 With the function loaded, `wt` changes the current shell to the worktree selected in the TUI. Cancellation, an empty selection, and failures leave `$PWD` unchanged. Scriptable `repo` and `worktree` commands plus help and version requests pass directly to the binary.
 
@@ -146,7 +148,7 @@ When a refresh fails, the last successful PR data remains visible as stale. Exha
 - **SSO/SAML or classic PAT error:** authorize the token for the organization or use a token type allowed by its policy.
 - **Rate limited:** the detail pane shows the reset value; `wt` suppresses requests until then while retaining stale data.
 - **Removal disabled:** inspect dirtiness, locks, whether the row is the main/bare worktree, and whether it contains the current directory.
-- **Shell does not change directory:** ensure `shell/wt.bash` is sourced in the current interactive shell and that `command -v wt` finds the binary.
+- **Shell does not change directory:** ensure `eval "$(wt shell-init bash)"` runs in the current interactive shell and that `command -v wt` finds the binary. From a development checkout, `source shell/wt.bash` is equivalent.
 - **Terminal looks altered after an external kill:** run `reset`. Normal success, cancellation, errors, Ctrl-C, and panics restore raw mode, cursor visibility, and the alternate screen automatically.
 
 ## Development checks
