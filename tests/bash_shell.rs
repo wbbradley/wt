@@ -5,7 +5,93 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[test]
-fn bash_wrapper_navigates_safely_passes_commands_through_and_preserves_spaces() {
+fn shell_init_emits_the_bash_script_without_loading_the_catalog() {
+    let directory = tempfile::tempdir().unwrap();
+    let invalid_config = directory.path().join("invalid.json");
+    fs::write(&invalid_config, "not json").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wt"))
+        .args(["shell-init", "bash"])
+        .env("WT_CONFIG_PATH", invalid_config)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/shell/wt.bash")).unwrap()
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn shell_init_rejects_missing_and_unsupported_shells() {
+    let missing = Command::new(env!("CARGO_BIN_EXE_wt"))
+        .arg("shell-init")
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let missing_error = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        missing_error.contains("Usage: wt shell-init <SHELL>"),
+        "{missing_error}"
+    );
+    assert!(
+        missing_error.contains("required arguments were not provided"),
+        "{missing_error}"
+    );
+
+    let unsupported = Command::new(env!("CARGO_BIN_EXE_wt"))
+        .args(["shell-init", "zsh"])
+        .output()
+        .unwrap();
+    assert!(!unsupported.status.success());
+    let unsupported_error = String::from_utf8_lossy(&unsupported.stderr);
+    assert!(
+        unsupported_error.contains("invalid value 'zsh'"),
+        "{unsupported_error}"
+    );
+    assert!(
+        unsupported_error.contains("possible values: bash"),
+        "{unsupported_error}"
+    );
+}
+
+#[test]
+fn shell_init_is_in_local_completion_candidates() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("missing.json");
+    let top_level = Command::new(env!("CARGO_BIN_EXE_wt"))
+        .args(["__complete", ""])
+        .env("WT_CONFIG_PATH", &config)
+        .output()
+        .unwrap();
+    assert!(top_level.status.success());
+    assert!(
+        String::from_utf8_lossy(&top_level.stdout)
+            .lines()
+            .any(|candidate| candidate == "shell-init")
+    );
+
+    let shell = Command::new(env!("CARGO_BIN_EXE_wt"))
+        .args(["__complete", "shell-init", ""])
+        .env("WT_CONFIG_PATH", config)
+        .output()
+        .unwrap();
+    assert!(shell.status.success());
+    assert!(
+        String::from_utf8_lossy(&shell.stdout)
+            .lines()
+            .any(|candidate| candidate == "bash")
+    );
+}
+
+#[test]
+fn initialized_bash_wrapper_navigates_safely_passes_commands_through_and_preserves_spaces() {
     let directory = tempfile::tempdir().unwrap();
     let binary_directory = directory.path().join("bin");
     let destination = directory.path().join("destination with spaces");
@@ -16,6 +102,7 @@ fn bash_wrapper_navigates_safely_passes_commands_through_and_preserves_spaces() 
         &fake_wt,
         r#"#!/bin/bash
 case "${1-}" in
+    shell-init) exec "$WT_REAL_BINARY" "$@" ;;
     success) printf '%s\n' "$WT_TEST_DESTINATION" ;;
     cancel) exit 0 ;;
     fail) exit 7 ;;
@@ -29,9 +116,8 @@ esac
     permissions.set_mode(0o755);
     fs::set_permissions(&fake_wt, permissions).unwrap();
 
-    let script = format!(
-        r#"
-source {shell:?}
+    let script = r#"
+eval "$(wt shell-init bash)"
 wt cancel
 printf 'cancel:%s\n' "$PWD"
 wt fail
@@ -42,13 +128,15 @@ printf 'success:%s\n' "$PWD"
 wt repo list
 wt help
 wt --version
+wt_reloaded="$(wt shell-init bash)"
+case "$wt_reloaded" in
+    *'wt() {'*) printf 'shell-init:reloaded\n' ;;
+esac
 COMP_WORDS=(wt anything)
 COMP_CWORD=1
 _wt_complete
-printf 'completion:%s|%s\n' "${{COMPREPLY[0]}}" "${{COMPREPLY[1]}}"
-"#,
-        shell = format!("{}/shell/wt.bash", env!("CARGO_MANIFEST_DIR")),
-    );
+printf 'completion:%s|%s\n' "${COMPREPLY[0]}" "${COMPREPLY[1]}"
+"#;
     let output = Command::new("bash")
         .arg("-c")
         .arg(script)
@@ -62,6 +150,8 @@ printf 'completion:%s|%s\n' "${{COMPREPLY[0]}}" "${{COMPREPLY[1]}}"
             ),
         )
         .env("WT_TEST_DESTINATION", &destination)
+        .env("WT_REAL_BINARY", env!("CARGO_BIN_EXE_wt"))
+        .env("WT_CONFIG_PATH", directory.path().join("invalid.json"))
         .output()
         .unwrap();
     assert!(
@@ -80,6 +170,7 @@ printf 'completion:%s|%s\n' "${{COMPREPLY[0]}}" "${{COMPREPLY[1]}}"
     assert!(stdout.contains("passthrough:repo"));
     assert!(stdout.contains("passthrough:help"));
     assert!(stdout.contains("passthrough:--version"));
+    assert!(stdout.contains("shell-init:reloaded"));
     assert!(stdout.contains("completion:candidate with spaces|plain"));
 }
 

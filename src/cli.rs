@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use thiserror::Error;
 
 use crate::config;
@@ -29,6 +29,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print shell integration code for evaluation.
+    ShellInit {
+        #[arg(value_enum)]
+        shell: SupportedShell,
+    },
     /// Manage the persistent repository catalog.
     Repo {
         #[command(subcommand)]
@@ -42,6 +47,13 @@ enum Command {
     #[command(name = "__complete", hide = true)]
     Complete(CompletionArgs),
 }
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SupportedShell {
+    Bash,
+}
+
+const BASH_SHELL_INIT: &str = include_str!("../shell/wt.bash");
 
 #[derive(Debug, Args)]
 struct CompletionArgs {
@@ -242,6 +254,8 @@ pub enum CliError {
     ConfirmationIo(io::Error),
     #[error("operation cancelled")]
     Cancelled,
+    #[error("failed to write shell initialization: {0}")]
+    ShellInitIo(io::Error),
     #[error(transparent)]
     Tui(#[from] tui::TuiError),
 }
@@ -258,6 +272,16 @@ pub fn run(cli: Cli) -> Result<Option<PathBuf>, CliError> {
     if cli.command.is_none() {
         return Ok(tui::run()?);
     }
+    if let Some(Command::ShellInit { shell }) = cli.command.as_ref() {
+        let script = match shell {
+            SupportedShell::Bash => BASH_SHELL_INIT,
+        };
+        io::stdout()
+            .lock()
+            .write_all(script.as_bytes())
+            .map_err(CliError::ShellInitIo)?;
+        return Ok(None);
+    }
     let path = config::catalog_path()?;
     run_with(&SystemGit, &path, cli)?;
     Ok(None)
@@ -266,6 +290,7 @@ pub fn run(cli: Cli) -> Result<Option<PathBuf>, CliError> {
 fn run_with(runner: &dyn GitRunner, catalog_path: &Path, cli: Cli) -> Result<(), CliError> {
     let mut catalog = config::load(catalog_path)?;
     match cli.command.expect("checked by caller") {
+        Command::ShellInit { .. } => unreachable!("handled before catalog loading"),
         Command::Repo { command } => match command {
             RepoCommand::Add(arguments) => add(runner, catalog_path, &mut catalog, arguments),
             RepoCommand::List => list(runner, &catalog),
@@ -350,10 +375,17 @@ fn completion_candidates(
     let first = words.first().map(String::as_str).unwrap_or("");
     match first {
         "repo" => complete_repo(catalog, words, &mut candidates),
+        "shell-init" => {
+            candidates.insert("bash".to_owned());
+        }
         "worktree" => complete_worktree(runner, catalog, words, &mut candidates),
         _ => {
             candidates.extend(["--version".to_owned(), "-V".to_owned()]);
-            candidates.extend(["repo".to_owned(), "worktree".to_owned()]);
+            candidates.extend(
+                ["repo", "shell-init", "worktree"]
+                    .into_iter()
+                    .map(str::to_owned),
+            );
             for repository in &catalog.repositories {
                 if let Ok(worktrees) = git::discover_worktrees(runner, &repository.path) {
                     for worktree in worktrees.iter().filter(|worktree| worktree.navigable()) {

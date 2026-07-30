@@ -92,3 +92,21 @@ Finish product documentation and verify the complete normal/bare/global workflow
 - Ensure `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` pass.
 - Manually verify normal and bare workflows, progressive GitHub updates, CRUD confirmations and safeguards, terminal restoration, cancellation/failure behavior, and sourced Bash navigation.
 - Audit every requirement preserved across the preceding phases and add/fix any missing coverage before declaring the product complete.
+
+## Self-contained Bash shell initialization
+
+Added `wt shell-init bash` as a self-contained, config-independent initialization command that emits the checked-in Bash integration byte-for-byte with normal stdout error handling. Extended wrapper passthrough and local completion, made quoted command substitution the documented setup path while retaining direct sourcing for checkout development, and added CLI and eval-based shell coverage for validation, malformed catalogs, navigation, spaces, cancellation, failures, passthrough, completion, repeated initialization, and Bash syntax.
+
+## Self-contained Bash shell initialization
+
+Make Bash navigation and completion installable directly from the `wt` binary, without requiring users to locate the repository's `shell/wt.bash` file.
+
+- Add a public `wt shell-init bash` CLI command that writes the Bash 3.2-compatible integration script to stdout and exits successfully without opening the TUI, emitting a navigation selection, reading the repository catalog, or contacting GitHub.
+- Embed or otherwise derive the command output from `shell/wt.bash` so the installed binary is self-contained and the checked-in script cannot drift from the emitted integration.
+- Add `shell-init` to the Bash wrapper's passthrough commands so `wt shell-init bash` continues to work after the `wt` function has already been registered.
+- Keep unsupported or missing shell names as clear, nonzero CLI usage errors; Bash is the only required shell for this task.
+- Update `README.md` installation, shell setup, and troubleshooting guidance to use the safe form `eval "$(wt shell-init bash)"`, while retaining direct sourcing only as an optional development alternative if useful.
+- Extend `tests/bash_shell.rs` or add CLI coverage proving that the emitted script matches the maintained Bash integration, evaluates successfully in Bash, enables navigation and completion, preserves passthrough behavior, remains Bash 3.2-compatible, and works independently of catalog validity.
+- Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `bash -n shell/wt.bash`.
+
+Complete when a user with only the installed `wt` binary can add `eval "$(wt shell-init bash)"` to `.bashrc` and receive the existing navigation wrapper and completion behavior.
