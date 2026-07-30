@@ -425,6 +425,7 @@ impl App {
                 self.modal = Some(Modal::Palette { selected: 0 });
                 Intent::None
             }
+            KeyCode::Char('q') => Intent::Cancel,
             KeyCode::Char(character) => self.direct_action(character),
             KeyCode::Enter => self.accept_or_toggle(),
             KeyCode::Esc => Intent::Cancel,

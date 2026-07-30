@@ -318,7 +318,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else if !app.filter.is_empty() {
         format!("filter: {}", app.filter)
     } else {
-        "j/k move  h/l panes  / filter  r refresh  ? actions  Enter select  Esc cancel".to_owned()
+        "j/k move  h/l panes  / filter  r refresh  ? actions  Enter select  q/Esc cancel".to_owned()
     };
     let bottom = app
         .inline_error
