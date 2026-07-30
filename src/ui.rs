@@ -1,0 +1,526 @@
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+
+use crate::app::{App, Modal, Pane, StatusState, VisibleRow};
+
+pub fn render(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" wt ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::raw(" global worktrees"),
+            Span::styled(
+                app.progress
+                    .as_ref()
+                    .map(|progress| format!("  ·  {progress}"))
+                    .unwrap_or_default(),
+                Style::default().fg(Color::Yellow),
+            ),
+        ])),
+        vertical[0],
+    );
+
+    let body = if area.width >= 72 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(vertical[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(vertical[1])
+    };
+    render_list(frame, app, body[0]);
+    render_detail(frame, app, body[1]);
+    render_footer(frame, app, vertical[2]);
+    if let Some(modal) = &app.modal {
+        render_modal(frame, app, modal, area);
+    }
+}
+
+fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let rows = app.visible_rows();
+    app.set_viewport_height(area.height.saturating_sub(2) as usize);
+    if rows.is_empty() {
+        let message = if app.repositories.is_empty() {
+            "No repositories registered. Run `wt repo add`, or launch from inside a Git repository and press a to register it."
+        } else if !app.filter.is_empty() {
+            "No repositories or worktrees match the filter."
+        } else {
+            "Catalog entries are unavailable. Select a stale repository to relink or unregister it."
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .wrap(Wrap { trim: true })
+                .block(list_block(app)),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem<'_>> = rows
+        .iter()
+        .map(|row| match row {
+            VisibleRow::Repository {
+                repository_index, ..
+            } => {
+                let repository = &app.repositories[*repository_index];
+                let arrow = if repository.expanded { "▾" } else { "▸" };
+                let state = if repository.session_only {
+                    " [session-only]"
+                } else if repository.stale_error.is_some() {
+                    " [stale]"
+                } else {
+                    ""
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{arrow} {}", repository.config.display_label()),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(state, Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("  {}", repository.config.path.display()),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            }
+            VisibleRow::Worktree {
+                repository_index,
+                worktree_index,
+                ..
+            } => {
+                let worktree = &app.repositories[*repository_index].worktrees[*worktree_index];
+                let current = path_contains(&worktree.path, &app.current_directory);
+                let identity = worktree
+                    .branch
+                    .as_deref()
+                    .and_then(|branch| branch.strip_prefix("refs/heads/"))
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        worktree
+                            .head
+                            .as_ref()
+                            .map(|head| format!("detached:{}", short(head)))
+                    })
+                    .unwrap_or_else(|| if worktree.bare { "bare" } else { "unknown" }.to_owned());
+                let flags = [
+                    worktree.locked.as_ref().map(|_| "locked"),
+                    worktree.prunable.as_ref().map(|_| "prunable"),
+                    worktree.bare.then_some("anchor"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(",");
+                let local = match app.statuses.get(&worktree.path) {
+                    Some(StatusState::Pending) => "status …".to_owned(),
+                    Some(StatusState::Ready(status)) => status.summary(),
+                    Some(StatusState::Error(_)) => "status error".to_owned(),
+                    None => String::new(),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if current { "  ● " } else { "    " },
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::raw(identity),
+                    Span::styled(
+                        worktree
+                            .head
+                            .as_deref()
+                            .map(|head| format!("  {}", short(head)))
+                            .unwrap_or_default(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        if flags.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  [{flags}]")
+                        },
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("  {}", worktree.path.display()),
+                        Style::default().fg(Color::Blue),
+                    ),
+                    Span::styled(
+                        if local.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {local}")
+                        },
+                        Style::default().fg(Color::Magenta),
+                    ),
+                ]))
+            }
+        })
+        .collect();
+    let selected = app
+        .selected
+        .as_ref()
+        .and_then(|selected| rows.iter().position(|row| row.id() == selected));
+    let mut state = ListState::default()
+        .with_selected(selected)
+        .with_offset(app.scroll);
+    let list = List::new(items)
+        .block(list_block(app))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(45, 55, 72))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn list_block(app: &App) -> Block<'static> {
+    Block::default()
+        .title(" Repositories / Worktrees ")
+        .borders(Borders::ALL)
+        .border_style(if app.pane == Pane::List {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        })
+}
+
+fn render_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if let Some((repository, worktree, _)) = app.selected_worktree() {
+        lines.push(Line::from(vec![
+            Span::styled("repository  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(repository.config.display_label()),
+        ]));
+        lines.push(field(
+            "anchor",
+            repository.config.path.display().to_string(),
+        ));
+        lines.push(field("path", worktree.path.display().to_string()));
+        lines.push(field(
+            "branch",
+            worktree
+                .branch
+                .clone()
+                .unwrap_or_else(|| "detached".to_owned()),
+        ));
+        lines.push(field(
+            "HEAD",
+            worktree.head.clone().unwrap_or_else(|| "-".to_owned()),
+        ));
+        lines.push(field(
+            "locked",
+            worktree.locked.clone().unwrap_or_else(|| "no".to_owned()),
+        ));
+        lines.push(field(
+            "prunable",
+            worktree.prunable.clone().unwrap_or_else(|| "no".to_owned()),
+        ));
+        match app.statuses.get(&worktree.path) {
+            Some(StatusState::Ready(status)) => {
+                lines.push(field(
+                    "upstream",
+                    status.upstream.clone().unwrap_or_else(|| "-".to_owned()),
+                ));
+                lines.push(field("local", status.summary()));
+            }
+            Some(StatusState::Pending) => lines.push(Line::from("local       loading…")),
+            Some(StatusState::Error(error)) => lines.push(Line::styled(
+                format!("status error {error}"),
+                Style::default().fg(Color::Red),
+            )),
+            None => {}
+        }
+    } else if let Some((repository, _)) = app.selected_repository() {
+        lines.push(field("label", repository.config.display_label()));
+        lines.push(field(
+            "anchor",
+            repository.config.path.display().to_string(),
+        ));
+        lines.push(field(
+            "catalog",
+            if repository.session_only {
+                "session-only; press a to register".to_owned()
+            } else {
+                "registered".to_owned()
+            },
+        ));
+        if let Some(error) = &repository.stale_error {
+            lines.push(Line::styled(
+                format!("stale       {error}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    } else {
+        lines.push(Line::from("Select a repository or worktree."));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Details ")
+                    .borders(Borders::ALL)
+                    .border_style(if app.pane == Pane::Detail {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        Style::default()
+                    }),
+            ),
+        area,
+    );
+}
+
+fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let top = if app.filter_active {
+        format!("/{}█", app.filter)
+    } else if !app.filter.is_empty() {
+        format!("filter: {}", app.filter)
+    } else {
+        "j/k move  h/l panes  / filter  r refresh  ? actions  Enter select  Esc cancel".to_owned()
+    };
+    let bottom = app
+        .inline_error
+        .as_ref()
+        .map(|error| format!("error: {error}"))
+        .unwrap_or_else(|| {
+            "c create  m move  L/U lock  d remove  R repair  p prune  a/e/x catalog".to_owned()
+        });
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::raw(top),
+            Line::styled(
+                bottom,
+                Style::default().fg(if app.inline_error.is_some() {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+        ]),
+        area,
+    );
+}
+
+fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
+    let popup = centered_rect(72, 70, area);
+    frame.render_widget(Clear, popup);
+    match modal {
+        Modal::Palette { selected } => {
+            let items: Vec<ListItem<'_>> = crate::app::Action::ALL
+                .iter()
+                .map(|action| {
+                    let availability = app.action_availability(*action);
+                    let suffix = availability
+                        .reason
+                        .map(|reason| format!(" — {reason}"))
+                        .unwrap_or_default();
+                    ListItem::new(format!(
+                        "[{}] {}{}",
+                        action.shortcut(),
+                        action.label(),
+                        suffix
+                    ))
+                    .style(if availability.enabled {
+                        Style::default()
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    })
+                })
+                .collect();
+            let mut state = ListState::default().with_selected(Some(*selected));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(Block::default().title(" Actions ").borders(Borders::ALL))
+                    .highlight_style(Style::default().bg(Color::Blue)),
+                popup,
+                &mut state,
+            );
+        }
+        Modal::Form {
+            action,
+            fields,
+            active,
+        } => {
+            let lines: Vec<Line<'_>> = fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    Line::styled(
+                        format!(
+                            "{}: {}{}",
+                            field.label,
+                            field.value,
+                            if index == *active { "█" } else { "" }
+                        ),
+                        if index == *active {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default()
+                        },
+                    )
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .title(format!(" {} · Enter submit · Esc cancel ", action.label()))
+                        .borders(Borders::ALL),
+                ),
+                popup,
+            );
+        }
+        Modal::Confirm { action, summary } => {
+            let mut lines: Vec<Line<'_>> = summary
+                .iter()
+                .map(|line| Line::raw(line.as_str()))
+                .collect();
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "Enter/y confirms · n/Esc cancels",
+                Style::default().fg(Color::Yellow),
+            ));
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .title(format!(" Confirm {} ", action.label()))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                ),
+                popup,
+            );
+        }
+    }
+}
+
+fn field(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<11}"), Style::default().fg(Color::DarkGray)),
+        Span::raw(value),
+    ])
+}
+
+fn short(head: &str) -> &str {
+    head.get(..head.len().min(8)).unwrap_or(head)
+}
+
+fn path_contains(worktree: &std::path::Path, candidate: &std::path::Path) -> bool {
+    let worktree = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_owned());
+    let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_owned());
+    candidate.starts_with(worktree)
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{RepositoryView, RowId};
+    use crate::model::{RepositoryConfig, Worktree};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::path::PathBuf;
+
+    #[test]
+    fn renders_grouped_rows_details_and_resizes() {
+        let repository = RepositoryView {
+            config: RepositoryConfig {
+                path: PathBuf::from("/repo"),
+                label: Some("project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+            },
+            session_only: true,
+            stale_error: None,
+            expanded: true,
+            worktrees: vec![Worktree {
+                path: PathBuf::from("/repo"),
+                head: Some("1234567890".to_owned()),
+                branch: Some("refs/heads/main".to_owned()),
+                detached: false,
+                bare: false,
+                locked: None,
+                prunable: None,
+            }],
+        };
+        let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("project [session-only]"));
+        assert!(content.contains("branch"));
+        terminal.resize(Rect::new(0, 0, 42, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn renders_empty_stale_and_action_palette_states() {
+        let mut empty = App::new(Vec::new(), PathBuf::from("/outside"));
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut empty)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("No repositories registered"));
+
+        empty.modal = Some(Modal::Palette { selected: 0 });
+        terminal.draw(|frame| render(frame, &mut empty)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("Actions"));
+
+        let stale = RepositoryView {
+            config: RepositoryConfig {
+                path: PathBuf::from("/missing"),
+                label: Some("lost".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+            },
+            session_only: false,
+            stale_error: Some("not found".to_owned()),
+            expanded: true,
+            worktrees: Vec::new(),
+        };
+        let mut stale_app = App::new(vec![stale], PathBuf::from("/outside"));
+        terminal
+            .draw(|frame| render(frame, &mut stale_app))
+            .unwrap();
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("lost [stale]"));
+        assert!(content.contains("not found"));
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
