@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -12,10 +14,17 @@ use crate::operations::{self, CreateMode};
 use crate::tui;
 
 #[derive(Debug, Parser)]
-#[command(name = "wt", version, about = "Global Git worktree manager")]
+#[command(
+    name = "wt",
+    version,
+    about = "Global Git worktree manager",
+    args_conflicts_with_subcommands = true
+)]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Navigate directly with <repository-label>:<branch-or-worktree>.
+    selector: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -30,6 +39,14 @@ enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+    #[command(name = "__complete", hide = true)]
+    Complete(CompletionArgs),
+}
+
+#[derive(Debug, Args)]
+struct CompletionArgs {
+    #[arg(allow_hyphen_values = true)]
+    words: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -208,6 +225,13 @@ pub enum CliError {
     SelectorNotFound(String),
     #[error("repository selector {0:?} is ambiguous")]
     AmbiguousSelector(String),
+    #[error("navigation selector {0:?} must use <repository-label>:<branch-or-worktree>")]
+    InvalidNavigationSelector(String),
+    #[error("worktree selector {selector:?} did not match in repository {repository:?}")]
+    NavigationTargetNotFound {
+        repository: String,
+        selector: String,
+    },
     #[error("repository is already registered as {0:?}")]
     DuplicateRepository(String),
     #[error("{0} cannot be empty")]
@@ -223,6 +247,14 @@ pub enum CliError {
 }
 
 pub fn run(cli: Cli) -> Result<Option<PathBuf>, CliError> {
+    if let Some(selector) = cli.selector.as_deref() {
+        let path = config::catalog_path()?;
+        let catalog = config::load(&path)?;
+        return match resolve_navigation(&SystemGit, &catalog, selector)? {
+            NavigationResolution::Exact(path) => Ok(Some(path)),
+            NavigationResolution::Ambiguous { filter } => Ok(tui::run_with_filter(&filter)?),
+        };
+    }
     if cli.command.is_none() {
         return Ok(tui::run()?);
     }
@@ -243,7 +275,250 @@ fn run_with(runner: &dyn GitRunner, catalog_path: &Path, cli: Cli) -> Result<(),
             }
         },
         Command::Worktree { command } => worktree(runner, &catalog, command),
+        Command::Complete(arguments) => complete(runner, &catalog, &arguments.words),
     }
+}
+
+enum NavigationResolution {
+    Exact(PathBuf),
+    Ambiguous { filter: String },
+}
+
+fn resolve_navigation(
+    runner: &dyn GitRunner,
+    catalog: &Catalog,
+    selector: &str,
+) -> Result<NavigationResolution, CliError> {
+    let (repository_selector, worktree_selector) = selector
+        .split_once(':')
+        .filter(|(repository, worktree)| !repository.is_empty() && !worktree.is_empty())
+        .ok_or_else(|| CliError::InvalidNavigationSelector(selector.to_owned()))?;
+    let repository = repository(catalog, repository_selector)?;
+    let worktrees = git::discover_worktrees(runner, &repository.path)?;
+    let matches: Vec<_> = worktrees
+        .iter()
+        .filter(|worktree| worktree.navigable() && worktree_matches(worktree, worktree_selector))
+        .collect();
+    match matches.as_slice() {
+        [] => Err(CliError::NavigationTargetNotFound {
+            repository: repository_selector.to_owned(),
+            selector: worktree_selector.to_owned(),
+        }),
+        [worktree] => Ok(NavigationResolution::Exact(
+            fs::canonicalize(&worktree.path).unwrap_or_else(|_| worktree.path.clone()),
+        )),
+        _ => Ok(NavigationResolution::Ambiguous {
+            filter: worktree_selector.to_owned(),
+        }),
+    }
+}
+
+fn worktree_matches(worktree: &crate::model::Worktree, selector: &str) -> bool {
+    let selector_path = Path::new(selector);
+    worktree.path == selector_path
+        || (selector_path.exists()
+            && fs::canonicalize(selector_path).is_ok_and(|path| {
+                fs::canonicalize(&worktree.path).is_ok_and(|other| other == path)
+            }))
+        || worktree
+            .path
+            .file_name()
+            .is_some_and(|name| name == selector)
+        || worktree.branch.as_deref() == Some(selector)
+        || worktree
+            .branch
+            .as_deref()
+            .and_then(|branch| branch.strip_prefix("refs/heads/"))
+            == Some(selector)
+}
+
+fn complete(runner: &dyn GitRunner, catalog: &Catalog, words: &[String]) -> Result<(), CliError> {
+    for candidate in completion_candidates(runner, catalog, words) {
+        println!("{candidate}");
+    }
+    Ok(())
+}
+
+fn completion_candidates(
+    runner: &dyn GitRunner,
+    catalog: &Catalog,
+    words: &[String],
+) -> Vec<String> {
+    let current = words.last().map(String::as_str).unwrap_or("");
+    let mut candidates = BTreeSet::new();
+    candidates.extend(["--help".to_owned(), "-h".to_owned()]);
+    let first = words.first().map(String::as_str).unwrap_or("");
+    match first {
+        "repo" => complete_repo(catalog, words, &mut candidates),
+        "worktree" => complete_worktree(runner, catalog, words, &mut candidates),
+        _ => {
+            candidates.extend(["--version".to_owned(), "-V".to_owned()]);
+            candidates.extend(["repo".to_owned(), "worktree".to_owned()]);
+            for repository in &catalog.repositories {
+                if let Ok(worktrees) = git::discover_worktrees(runner, &repository.path) {
+                    for worktree in worktrees.iter().filter(|worktree| worktree.navigable()) {
+                        for identity in worktree_identities(worktree) {
+                            candidates.insert(format!("{}:{identity}", repository.display_label()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.starts_with(current))
+        .collect()
+}
+
+fn complete_repo(catalog: &Catalog, words: &[String], candidates: &mut BTreeSet<String>) {
+    if words.len() <= 2 {
+        candidates.extend(["add", "edit", "list", "remove"].map(str::to_owned));
+    }
+    let subcommand = words.get(1).map(String::as_str);
+    if matches!(subcommand, Some("edit" | "remove")) && words.len() == 3 {
+        candidates.extend(repository_identities(catalog));
+    }
+    if subcommand == Some("add") {
+        candidates.extend(file_candidates(
+            words.last().map(String::as_str).unwrap_or(""),
+        ));
+        candidates.extend(["--label", "--worktree-root", "--github-remote"].map(str::to_owned));
+    }
+    if subcommand == Some("edit") {
+        candidates.extend(
+            [
+                "--path",
+                "--label",
+                "--clear-label",
+                "--worktree-root",
+                "--clear-worktree-root",
+                "--github-remote",
+                "--clear-github-remote",
+            ]
+            .map(str::to_owned),
+        );
+    }
+}
+
+fn complete_worktree(
+    runner: &dyn GitRunner,
+    catalog: &Catalog,
+    words: &[String],
+    candidates: &mut BTreeSet<String>,
+) {
+    if words.len() <= 2 {
+        candidates.extend(
+            [
+                "create",
+                "force-remove",
+                "inspect",
+                "list",
+                "lock",
+                "move",
+                "prune",
+                "prune-preview",
+                "remove",
+                "repair",
+                "unlock",
+            ]
+            .map(str::to_owned),
+        );
+        return;
+    }
+    let subcommand = words[1].as_str();
+    if words.len() == 3 {
+        candidates.extend(repository_identities(catalog));
+    } else if let Some(repository_selector) = words.get(2)
+        && let Ok(repository) = repository(catalog, repository_selector)
+        && matches!(
+            subcommand,
+            "inspect" | "move" | "lock" | "unlock" | "remove" | "force-remove"
+        )
+        && words.len() == 4
+        && let Ok(worktrees) = git::discover_worktrees(runner, &repository.path)
+    {
+        for worktree in &worktrees {
+            candidates.extend(worktree_identities(worktree));
+        }
+    }
+    if matches!(subcommand, "create" | "move" | "repair") {
+        candidates.extend(file_candidates(
+            words.last().map(String::as_str).unwrap_or(""),
+        ));
+    }
+    let flags: &[&str] = match subcommand {
+        "create" => &[
+            "--branch",
+            "--new-branch",
+            "--start-point",
+            "--detach",
+            "--create-parents",
+            "--yes",
+        ],
+        "move" => &["--create-parents", "--yes"],
+        "lock" => &["--reason", "--yes"],
+        "unlock" | "remove" | "repair" | "prune" => &["--yes"],
+        "force-remove" => &["--confirm"],
+        _ => &[],
+    };
+    candidates.extend(flags.iter().map(|flag| (*flag).to_owned()));
+}
+
+fn repository_identities(catalog: &Catalog) -> impl Iterator<Item = String> + '_ {
+    catalog.repositories.iter().flat_map(|repository| {
+        [
+            repository.display_label(),
+            repository.path.to_string_lossy().into_owned(),
+        ]
+    })
+}
+
+fn worktree_identities(worktree: &crate::model::Worktree) -> BTreeSet<String> {
+    let mut identities = BTreeSet::from([worktree.path.to_string_lossy().into_owned()]);
+    if let Some(name) = worktree.path.file_name() {
+        identities.insert(name.to_string_lossy().into_owned());
+    }
+    if let Some(branch) = worktree.branch.as_deref() {
+        identities.insert(branch.to_owned());
+        if let Some(short) = branch.strip_prefix("refs/heads/") {
+            identities.insert(short.to_owned());
+        }
+    }
+    identities
+}
+
+fn file_candidates(prefix: &str) -> Vec<String> {
+    let path = Path::new(prefix);
+    let (directory, name_prefix) = if prefix.ends_with(std::path::MAIN_SEPARATOR) {
+        (path, "")
+    } else {
+        (
+            path.parent().unwrap_or_else(|| Path::new(".")),
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(""),
+        )
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(name_prefix))
+        .map(|entry| {
+            let candidate = if directory == Path::new(".") {
+                entry.path().file_name().unwrap().into()
+            } else {
+                directory.join(entry.file_name())
+            };
+            let mut candidate = candidate.to_string_lossy().into_owned();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                candidate.push(std::path::MAIN_SEPARATOR);
+            }
+            candidate
+        })
+        .collect()
 }
 
 fn worktree(
@@ -746,6 +1021,8 @@ fn absolute_path(path: PathBuf) -> Result<PathBuf, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::{CommandOutput, GitError};
+    use std::ffi::OsString;
 
     #[test]
     fn selector_rejects_duplicate_labels() {
@@ -758,6 +1035,32 @@ mod tests {
             Err(CliError::AmbiguousSelector(_))
         ));
         assert_eq!(select(&catalog, "/two").unwrap(), 1);
+    }
+
+    #[test]
+    fn ambiguous_qualified_selector_returns_a_tui_filter() {
+        struct WorktreeList;
+        impl GitRunner for WorktreeList {
+            fn run(
+                &self,
+                _directory: &Path,
+                _arguments: &[OsString],
+            ) -> Result<CommandOutput, GitError> {
+                Ok(CommandOutput {
+                    stdout: b"worktree /trees/topic\0HEAD a\0branch refs/heads/main\0\0worktree /trees/other\0HEAD b\0branch refs/heads/topic\0\0".to_vec(),
+                    stderr: Vec::new(),
+                    success: true,
+                })
+            }
+        }
+        let catalog = Catalog {
+            repositories: vec![repository("/repo", "project")],
+            ..Catalog::default()
+        };
+        assert!(matches!(
+            resolve_navigation(&WorktreeList, &catalog, "project:topic").unwrap(),
+            NavigationResolution::Ambiguous { filter } if filter == "topic"
+        ));
     }
 
     fn repository(path: &str, label: &str) -> RepositoryConfig {
