@@ -5,7 +5,9 @@ use std::process::Command;
 
 use thiserror::Error;
 
-use crate::model::{Catalog, RepositoryConfig, RepositoryDiscovery, RepositoryIdentity, Worktree};
+use crate::model::{
+    Catalog, RepositoryConfig, RepositoryDiscovery, RepositoryIdentity, Worktree, WorktreeStatus,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandOutput {
@@ -52,6 +54,8 @@ pub enum GitError {
     },
     #[error("malformed worktree porcelain: {0}")]
     MalformedPorcelain(String),
+    #[error("malformed status porcelain: {0}")]
+    MalformedStatus(String),
 }
 
 pub fn resolve_repository(
@@ -131,6 +135,111 @@ fn run_checked(
             message
         },
     })
+}
+
+pub fn run_git(
+    runner: &dyn GitRunner,
+    directory: &Path,
+    arguments: &[OsString],
+) -> Result<Vec<u8>, GitError> {
+    Ok(run_git_output(runner, directory, arguments)?.stdout)
+}
+
+pub fn run_git_output(
+    runner: &dyn GitRunner,
+    directory: &Path,
+    arguments: &[OsString],
+) -> Result<CommandOutput, GitError> {
+    let output = runner.run(directory, arguments)?;
+    if output.success {
+        return Ok(output);
+    }
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(GitError::Command {
+        message: if message.is_empty() {
+            "unknown Git error".to_owned()
+        } else {
+            message
+        },
+    })
+}
+
+pub fn git_succeeds(
+    runner: &dyn GitRunner,
+    directory: &Path,
+    arguments: &[OsString],
+) -> Result<bool, GitError> {
+    Ok(runner.run(directory, arguments)?.success)
+}
+
+pub fn status(runner: &dyn GitRunner, worktree: &Path) -> Result<WorktreeStatus, GitError> {
+    let output = run_git(
+        runner,
+        worktree,
+        &[
+            OsString::from("status"),
+            OsString::from("--porcelain=v2"),
+            OsString::from("--branch"),
+            OsString::from("-z"),
+        ],
+    )?;
+    parse_status_porcelain(&output)
+}
+
+pub fn parse_status_porcelain(input: &[u8]) -> Result<WorktreeStatus, GitError> {
+    let fields: Vec<&[u8]> = input.split(|byte| *byte == 0).collect();
+    let mut status = WorktreeStatus::default();
+    let mut index = 0;
+    while index < fields.len() {
+        let field = fields[index];
+        index += 1;
+        if field.is_empty() {
+            continue;
+        }
+        if let Some(value) = field.strip_prefix(b"# branch.oid ") {
+            if value != b"(initial)" {
+                status.head = Some(lossy(value));
+            }
+            continue;
+        }
+        if let Some(value) = field.strip_prefix(b"# branch.head ") {
+            if value != b"(detached)" {
+                status.branch = Some(lossy(value));
+            }
+            continue;
+        }
+        if let Some(value) = field.strip_prefix(b"# branch.upstream ") {
+            status.upstream = Some(lossy(value));
+            continue;
+        }
+        match field.first().copied() {
+            Some(b'1' | b'2' | b'u') => {
+                if field.len() < 4 || field[1] != b' ' {
+                    return Err(GitError::MalformedStatus(lossy(field)));
+                }
+                let x = field[2];
+                let y = field[3];
+                if x != b'.' {
+                    status.staged += 1;
+                }
+                if y != b'.' {
+                    status.modified += 1;
+                }
+                if field[0] == b'2' {
+                    if index >= fields.len() || fields[index].is_empty() {
+                        return Err(GitError::MalformedStatus(
+                            "rename record lacks its original path".to_owned(),
+                        ));
+                    }
+                    index += 1;
+                }
+            }
+            Some(b'?') if field.get(1) == Some(&b' ') => status.untracked += 1,
+            Some(b'!') if field.get(1) == Some(&b' ') => {}
+            _ => return Err(GitError::MalformedStatus(lossy(field))),
+        }
+    }
+    Ok(status)
 }
 
 pub fn parse_worktree_porcelain(input: &[u8]) -> Result<Vec<Worktree>, GitError> {
@@ -261,6 +370,28 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let parsed = parse_worktree_porcelain(b"worktree /tmp/bad\xffpath\0HEAD abc\0\0").unwrap();
         assert_eq!(parsed[0].path.as_os_str().as_bytes(), b"/tmp/bad\xffpath");
+    }
+
+    #[test]
+    fn parses_v2_status_headers_and_counts() {
+        let input = b"# branch.oid abc123\0# branch.head topic\0# branch.upstream origin/topic\x001 M. N... 100644 100644 100644 a b file\x002 .M N... 100644 100644 100644 a b R100 new\0old\0? untracked\0";
+        let status = parse_status_porcelain(input).unwrap();
+        assert_eq!(status.head.as_deref(), Some("abc123"));
+        assert_eq!(status.branch.as_deref(), Some("topic"));
+        assert_eq!(status.upstream.as_deref(), Some("origin/topic"));
+        assert_eq!(status.staged, 1);
+        assert_eq!(status.modified, 1);
+        assert_eq!(status.untracked, 1);
+        assert!(status.is_dirty());
+    }
+
+    #[test]
+    fn rejects_incomplete_rename_status() {
+        let input = b"2 R. N... 100644 100644 100644 a b R100 new\0";
+        assert!(matches!(
+            parse_status_porcelain(input),
+            Err(GitError::MalformedStatus(_))
+        ));
     }
 
     #[test]
