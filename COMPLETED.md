@@ -64,3 +64,17 @@ Add non-blocking GitHub pull-request enrichment using direct HTTP, following the
 - Track and display remaining/reset metadata, suppress retries through exhausted resets, enforce a 30-second minimum on the configurable 300-second default refresh, coalesce overlaps, and retain visibly stale prior data after failure.
 - Integrate async PR summaries/details/filter text without ever blocking local navigation or CRUD.
 - Test with a local fake server: remote/Enterprise parsing, precedence, redaction, batching/variables, fork PRs, normalization/preference, partial data, classified failures, rate suppression, and stale retention.
+
+## Bash navigation, selectors, and completion
+
+Implemented a Bash 3.2-compatible navigation wrapper that safely changes directories only after successful nonempty selections while passing scriptable/help/version commands through unchanged. Added exact repository-qualified navigation by branch, basename, or path with ambiguity routed into a prefiltered TUI, plus a hidden local-only completion endpoint covering commands, flags, repositories, branches, selectors, and filesystem paths. Added real-repository and shell tests for exact roots, spaces, cancellation and failure preservation, passthrough, ambiguity, completion, and Bash syntax compatibility.
+
+## Bash navigation, selectors, and completion
+
+Complete shell-facing navigation and local-only discovery ergonomics.
+
+- Add `shell/wt.bash` with a Bash 3.2-compatible `wt` function: navigation captures `command wt` stdout and calls `builtin cd -- "$destination"` only after successful nonempty selection; catalog/worktree/help/version commands pass through unchanged.
+- Ensure accepted selections always navigate to the worktree root and that cancellation/failure leaves PWD unchanged, including paths containing spaces.
+- Add `wt <repo-label>:<branch-or-worktree>` unique resolution by branch/basename/path, opening the TUI prefiltered when ambiguous rather than guessing.
+- Add Bash 3.2-compatible completion for flags, subcommands, labels, qualified selectors, branches, and paths through a local-only endpoint that preserves spaces, avoids GitHub, and never opens the TUI.
+- Shell-test navigation, exact roots, spaces, cancellation/failure preservation, passthrough, selectors, ambiguity handling, and completion.

@@ -118,11 +118,17 @@ impl PendingAction {
 }
 
 pub fn run() -> Result<Option<PathBuf>, TuiError> {
+    run_with_filter("")
+}
+
+pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError> {
     let catalog_path = config::catalog_path()?;
     let catalog = config::load(&catalog_path)?;
     let current_directory = env::current_dir().map_err(TuiError::CurrentDirectory)?;
     let repositories = load_repository_views(&catalog, &current_directory);
-    let app = App::new(repositories, current_directory);
+    let mut app = App::new(repositories, current_directory);
+    app.filter = initial_filter.to_owned();
+    app.filter_active = !initial_filter.is_empty();
     let mut controller = Controller::new(catalog_path, catalog, app);
     let _panic_hook = PanicHookGuard::install();
     let mut terminal = InteractiveTerminal::open()?;
