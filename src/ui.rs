@@ -118,11 +118,18 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .flatten()
                 .collect::<Vec<_>>()
                 .join(",");
-                let local = match app.statuses.get(&worktree.path) {
-                    Some(StatusState::Pending) => "status …".to_owned(),
-                    Some(StatusState::Ready(status)) => status.summary(),
-                    Some(StatusState::Error(_)) => "status error".to_owned(),
-                    None => String::new(),
+                let (local, local_color) = match app.statuses.get(&worktree.path) {
+                    Some(StatusState::Pending) => ("[…]".to_owned(), Color::DarkGray),
+                    Some(StatusState::Ready(status)) => (
+                        status.compact(),
+                        if status.is_dirty() {
+                            Color::Red
+                        } else {
+                            Color::Green
+                        },
+                    ),
+                    Some(StatusState::Error(_)) => ("[!]".to_owned(), Color::Yellow),
+                    None => (String::new(), Color::DarkGray),
                 };
                 let github = github_summary(app.github.get(&worktree.path));
                 ListItem::new(Line::from(vec![
@@ -157,7 +164,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         } else {
                             format!("  {local}")
                         },
-                        Style::default().fg(Color::Magenta),
+                        Style::default().fg(local_color),
                     ),
                     Span::styled(
                         if github.is_empty() {

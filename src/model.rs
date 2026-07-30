@@ -90,6 +90,10 @@ impl WorktreeStatus {
             self.staged, self.modified, self.untracked
         )
     }
+
+    pub fn compact(&self) -> String {
+        format!("[{} {} {}]", self.staged, self.modified, self.untracked)
+    }
 }
 
 impl Worktree {
