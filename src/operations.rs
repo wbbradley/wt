@@ -130,7 +130,7 @@ pub fn create(
     create_parents: bool,
 ) -> Result<(), OperationError> {
     validate_create(runner, repository, destination, mode, create_parents)?;
-    ensure_destination_parent(destination, create_parents)?;
+    ensure_destination_parent(repository, destination, create_parents)?;
     match mode {
         CreateMode::ExistingBranch(branch) => {
             git::run_git(
@@ -187,7 +187,7 @@ pub fn validate_create(
 ) -> Result<(), OperationError> {
     let worktrees = list(runner, repository)?;
     validate_destination(&worktrees, destination)?;
-    validate_destination_parent(destination, create_parents)?;
+    validate_destination_parent(repository, destination, create_parents)?;
     match mode {
         CreateMode::ExistingBranch(branch) => {
             if !branch_exists(runner, &repository.path, branch)? {
@@ -221,7 +221,7 @@ pub fn move_worktree(
     create_parents: bool,
 ) -> Result<Worktree, OperationError> {
     let worktree = validate_move(runner, repository, selector, destination, create_parents)?;
-    ensure_destination_parent(destination, create_parents)?;
+    ensure_destination_parent(repository, destination, create_parents)?;
     git::run_git(
         runner,
         &repository.path,
@@ -248,7 +248,7 @@ pub fn validate_move(
         return Err(OperationError::MainWorktree);
     }
     validate_destination(&worktrees, destination)?;
-    validate_destination_parent(destination, create_parents)?;
+    validate_destination_parent(repository, destination, create_parents)?;
     Ok(worktree.clone())
 }
 
@@ -464,10 +464,11 @@ fn validate_destination(worktrees: &[Worktree], destination: &Path) -> Result<()
 }
 
 fn ensure_destination_parent(
+    repository: &RepositoryConfig,
     destination: &Path,
     create_parents: bool,
 ) -> Result<(), OperationError> {
-    validate_destination_parent(destination, create_parents)?;
+    validate_destination_parent(repository, destination, create_parents)?;
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     if !parent.exists() {
         fs::create_dir_all(parent).map_err(|source| OperationError::CreateParent {
@@ -479,14 +480,26 @@ fn ensure_destination_parent(
 }
 
 fn validate_destination_parent(
+    repository: &RepositoryConfig,
     destination: &Path,
     create_parents: bool,
 ) -> Result<(), OperationError> {
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.exists() && !create_parents {
-        return Err(OperationError::MissingParent(parent.to_owned()));
+    if parent.exists() || create_parents || inside_worktree_root(repository, parent) {
+        return Ok(());
     }
-    Ok(())
+    Err(OperationError::MissingParent(parent.to_owned()))
+}
+
+/// Registering a worktree root declares that wt owns that directory, so missing
+/// directories at or below it are created on demand. Everywhere else a missing
+/// parent still means a typo, and `--create-parents` remains the way to say
+/// otherwise.
+fn inside_worktree_root(repository: &RepositoryConfig, parent: &Path) -> bool {
+    repository
+        .worktree_root
+        .as_deref()
+        .is_some_and(|root| parent.starts_with(root))
 }
 
 fn validate_commit(
@@ -615,5 +628,56 @@ mod tests {
             ),
             PathBuf::from("/trees/feature-a-thing")
         );
+    }
+
+    #[test]
+    fn missing_parents_are_allowed_only_inside_the_configured_root() {
+        let configured = RepositoryConfig {
+            path: PathBuf::from("/repos/project"),
+            label: None,
+            worktree_root: Some(PathBuf::from("/trees")),
+            github_remote: None,
+        };
+        let unconfigured = RepositoryConfig {
+            worktree_root: None,
+            ..configured.clone()
+        };
+        assert!(
+            validate_destination_parent(&configured, Path::new("/trees/topic"), false).is_ok(),
+            "the configured root itself is created on demand"
+        );
+        assert!(
+            validate_destination_parent(&configured, Path::new("/trees/team/topic"), false).is_ok(),
+            "directories below the configured root are created on demand"
+        );
+        assert!(matches!(
+            validate_destination_parent(&configured, Path::new("/elsewhere/topic"), false),
+            Err(OperationError::MissingParent(parent)) if parent == Path::new("/elsewhere")
+        ));
+        assert!(matches!(
+            validate_destination_parent(&unconfigured, Path::new("/trees/topic"), false),
+            Err(OperationError::MissingParent(parent)) if parent == Path::new("/trees")
+        ));
+        assert!(
+            validate_destination_parent(&unconfigured, Path::new("/trees/topic"), true).is_ok(),
+            "--create-parents still covers unmanaged destinations"
+        );
+    }
+
+    #[test]
+    fn creating_a_destination_parent_builds_the_whole_configured_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("managed trees");
+        let repository = RepositoryConfig {
+            path: temporary.path().join("project"),
+            label: None,
+            worktree_root: Some(root.clone()),
+            github_remote: None,
+        };
+        let destination = root.join("team/topic");
+        ensure_destination_parent(&repository, &destination, false).unwrap();
+        assert!(root.is_dir());
+        assert!(destination.parent().unwrap().is_dir());
+        assert!(!destination.exists());
     }
 }

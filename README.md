@@ -88,7 +88,7 @@ Mutating commands print an exact preview and prompt unless `--yes` is supplied w
 - Normal removal refuses bare anchors, main worktrees, the worktree containing `$PWD`, locked worktrees, and dirty worktrees.
 - Removal does not delete the branch.
 - Force removal is a distinct command and requires `--confirm` to exactly match the branch or full worktree path.
-- Parent directories are created only with `--create-parents`.
+- Missing parent directories at or below a repository's configured `worktree_root` are created automatically; anywhere else they need `--create-parents`.
 - Prune displays `git worktree prune --dry-run --verbose` output and confirms the same preview before acting.
 - Catalog removal only unregisters metadata; it never deletes a repository or worktree.
 - Git is always invoked with argument arrays rather than shell command strings.
@@ -116,7 +116,7 @@ Example:
 }
 ```
 
-`label`, `worktree_root`, and `github_remote` are optional. The GitHub refresh interval defaults to 300 seconds and is clamped to a minimum of 30 seconds.
+`label`, `worktree_root`, and `github_remote` are optional. A configured `worktree_root` supplies the suggested destination for `wt worktree create` and is created on first use if it does not exist yet. The GitHub refresh interval defaults to 300 seconds and is clamped to a minimum of 30 seconds.
 
 ## GitHub and GitHub Enterprise
 
