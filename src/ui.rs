@@ -142,7 +142,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         worktree
                             .head
                             .as_deref()
-                            .map(|head| format!("  {}", short(head)))
+                            .map(|head| format!(" {}", short(head)))
                             .unwrap_or_default(),
                         Style::default().fg(Color::DarkGray),
                     ),
@@ -150,19 +150,19 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         if flags.is_empty() {
                             String::new()
                         } else {
-                            format!("  [{flags}]")
+                            format!(" [{flags}]")
                         },
                         Style::default().fg(Color::Yellow),
                     ),
                     Span::styled(
-                        format!("  {}", display_path(&worktree.path)),
+                        format!(" {}", display_path(&worktree.path)),
                         Style::default().fg(Color::Blue),
                     ),
                     Span::styled(
                         if local.is_empty() {
                             String::new()
                         } else {
-                            format!("  {local}")
+                            format!(" {local}")
                         },
                         Style::default().fg(local_color),
                     ),
@@ -170,7 +170,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         if github.is_empty() {
                             String::new()
                         } else {
-                            format!("  {github}")
+                            format!(" {github}")
                         },
                         Style::default().fg(Color::Cyan),
                     ),
