@@ -1,18 +1,5 @@
 # Next Up
 
-## Local-first global TUI and terminal lifecycle
-
-Implement the interactive catalog/worktree browser and all local action workflows.
-
-- Group rows by repository and show label/anchor, current-PWD marker, path, branch/detached identity, short HEAD, lock/prunable state, and asynchronously populated local status.
-- Select the containing worktree initially, preserve identity across refreshes/mutations, and support collapse/expand, cross-field filtering, resize, scrolling, a detail pane, progress, and actionable inline errors.
-- Implement Vim-oriented navigation (`j`/`k`, arrows, contextual `h`/`l`, `g`/`G`, `Ctrl-d`/`Ctrl-u`, `/`, `r`, `Enter`, `Esc`) plus an action palette and documented CRUD/catalog shortcuts with correct availability for headers, bare anchors, and stale records.
-- Draw local catalog/worktree data before slow status work. Use bounded workers and generation-tagged channels so stale background updates cannot overwrite current state; coalesce refreshes.
-- When launched inside an unregistered repository, show it as session-only with explicit registration; show actionable onboarding for an empty catalog.
-- Render on the controlling terminal or stderr, reserve stdout for an accepted absolute worktree-root path and newline, print nothing on cancellation, and restore raw mode/cursor/alternate screen after success, cancellation, error, Ctrl-C, and panic.
-- Send errors to stderr with nonzero status and use `ratatui`/`crossterm` with a guaranteed-restoration terminal layer.
-- Test navigation/filter/collapse, empty/session-only/stale states, action availability and transitions, selection preservation, refresh coalescing/generation rejection, resizing, output protocol, and terminal restoration.
-
 ## Direct GitHub API enrichment
 
 Add non-blocking GitHub pull-request enrichment using direct HTTP, following the transport/error patterns in `../git-stack/src/github.rs` and refresh/partial-result patterns in `../rollup`.

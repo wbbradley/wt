@@ -1,0 +1,1031 @@
+use std::collections::VecDeque;
+use std::env;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crossterm::event::{self, Event, KeyEventKind};
+use thiserror::Error;
+
+use crate::app::{Action, App, FormField, Intent, RepositoryView};
+use crate::background::{StatusPool, StatusTask};
+use crate::config;
+use crate::git::{self, SystemGit};
+use crate::model::{Catalog, RepositoryConfig, Worktree};
+use crate::operations::{self, CreateMode};
+use crate::terminal::{InteractiveTerminal, PanicHookGuard};
+use crate::ui;
+
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
+
+#[derive(Debug, Error)]
+pub enum TuiError {
+    #[error(transparent)]
+    Config(#[from] config::ConfigError),
+    #[error(transparent)]
+    Git(#[from] git::GitError),
+    #[error(transparent)]
+    Operation(#[from] operations::OperationError),
+    #[error("terminal error: {0}")]
+    Terminal(#[from] io::Error),
+    #[error("cannot determine the current directory: {0}")]
+    CurrentDirectory(io::Error),
+    #[error("invalid {field}: {message}")]
+    InvalidForm {
+        field: &'static str,
+        message: String,
+    },
+    #[error("the selected repository is no longer available")]
+    RepositoryGone,
+    #[error("the selected worktree is no longer available")]
+    WorktreeGone,
+}
+
+#[derive(Clone, Debug)]
+enum PendingAction {
+    Create {
+        repository: PathBuf,
+        destination: PathBuf,
+        mode: CreateMode,
+        create_parents: bool,
+    },
+    Move {
+        repository: PathBuf,
+        worktree: PathBuf,
+        destination: PathBuf,
+        create_parents: bool,
+    },
+    Lock {
+        repository: PathBuf,
+        worktree: PathBuf,
+        reason: Option<String>,
+    },
+    Unlock {
+        repository: PathBuf,
+        worktree: PathBuf,
+    },
+    Remove {
+        repository: PathBuf,
+        worktree: PathBuf,
+    },
+    Repair {
+        repository: PathBuf,
+        path: PathBuf,
+    },
+    Prune {
+        repository: PathBuf,
+        preview: String,
+    },
+    RegisterRepository {
+        repository: RepositoryConfig,
+    },
+    EditRepository {
+        repository: PathBuf,
+        new_repository: PathBuf,
+        label: Option<String>,
+        worktree_root: Option<PathBuf>,
+        github_remote: Option<String>,
+    },
+    RemoveRepository {
+        repository: PathBuf,
+    },
+}
+
+impl PendingAction {
+    fn action(&self) -> Action {
+        match self {
+            Self::Create { .. } => Action::Create,
+            Self::Move { .. } => Action::Move,
+            Self::Lock { .. } => Action::Lock,
+            Self::Unlock { .. } => Action::Unlock,
+            Self::Remove { .. } => Action::Remove,
+            Self::Repair { .. } => Action::Repair,
+            Self::Prune { .. } => Action::Prune,
+            Self::RegisterRepository { .. } => Action::RegisterRepository,
+            Self::EditRepository { .. } => Action::EditRepository,
+            Self::RemoveRepository { .. } => Action::RemoveRepository,
+        }
+    }
+}
+
+pub fn run() -> Result<Option<PathBuf>, TuiError> {
+    let catalog_path = config::catalog_path()?;
+    let catalog = config::load(&catalog_path)?;
+    let current_directory = env::current_dir().map_err(TuiError::CurrentDirectory)?;
+    let repositories = load_repository_views(&catalog, &current_directory);
+    let app = App::new(repositories, current_directory);
+    let mut controller = Controller::new(catalog_path, catalog, app);
+    let _panic_hook = PanicHookGuard::install();
+    let mut terminal = InteractiveTerminal::open()?;
+
+    // The first frame contains only catalog and worktree-list data. Slow status
+    // work starts only after that frame is visible.
+    terminal
+        .terminal_mut()
+        .draw(|frame| ui::render(frame, &mut controller.app))?;
+    controller.start_status_refresh();
+    terminal
+        .terminal_mut()
+        .draw(|frame| ui::render(frame, &mut controller.app))?;
+
+    loop {
+        if controller.pump_status_results() {
+            terminal
+                .terminal_mut()
+                .draw(|frame| ui::render(frame, &mut controller.app))?;
+        }
+        if !event::poll(EVENT_POLL_INTERVAL)? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                let intent = controller.app.handle_key(key);
+                if matches!(intent, Intent::ConfirmAction(_)) {
+                    controller.app.progress = Some("performing operation…".to_owned());
+                    terminal
+                        .terminal_mut()
+                        .draw(|frame| ui::render(frame, &mut controller.app))?;
+                }
+                match controller.handle_intent(intent) {
+                    Ok(ControlFlow::Continue) => {
+                        terminal
+                            .terminal_mut()
+                            .draw(|frame| ui::render(frame, &mut controller.app))?;
+                    }
+                    Ok(ControlFlow::Exit(selection)) => {
+                        terminal.restore()?;
+                        return Ok(selection);
+                    }
+                    Err(error) => {
+                        controller.app.progress = None;
+                        let mut message = error.to_string();
+                        if let Err(refresh_error) = controller.refresh_local() {
+                            message.push_str(&format!("; refresh also failed: {refresh_error}"));
+                        }
+                        controller.app.inline_error = Some(message);
+                        terminal
+                            .terminal_mut()
+                            .draw(|frame| ui::render(frame, &mut controller.app))?;
+                    }
+                }
+            }
+            Event::Resize(_, _) => {
+                terminal
+                    .terminal_mut()
+                    .draw(|frame| ui::render(frame, &mut controller.app))?;
+            }
+            _ => {}
+        }
+    }
+}
+
+enum ControlFlow {
+    Continue,
+    Exit(Option<PathBuf>),
+}
+
+struct Controller {
+    catalog_path: PathBuf,
+    catalog: Catalog,
+    app: App,
+    status_pool: StatusPool,
+    status_backlog: VecDeque<StatusTask>,
+    pending_action: Option<PendingAction>,
+}
+
+impl Controller {
+    fn new(catalog_path: PathBuf, catalog: Catalog, app: App) -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get().min(4))
+            .unwrap_or(2);
+        Self {
+            catalog_path,
+            catalog,
+            app,
+            status_pool: StatusPool::with_git(workers),
+            status_backlog: VecDeque::new(),
+            pending_action: None,
+        }
+    }
+
+    fn handle_intent(&mut self, intent: Intent) -> Result<ControlFlow, TuiError> {
+        match intent {
+            Intent::None => Ok(ControlFlow::Continue),
+            Intent::Accept(path) => {
+                let absolute = std::fs::canonicalize(&path).unwrap_or(path);
+                Ok(ControlFlow::Exit(Some(absolute)))
+            }
+            Intent::Cancel => Ok(ControlFlow::Exit(None)),
+            Intent::Refresh => {
+                self.refresh_local()?;
+                Ok(ControlFlow::Continue)
+            }
+            Intent::BeginAction(action) => {
+                self.begin_action(action)?;
+                Ok(ControlFlow::Continue)
+            }
+            Intent::SubmitForm { action, values } => {
+                self.submit_form(action, values)?;
+                Ok(ControlFlow::Continue)
+            }
+            Intent::ConfirmAction(action) => {
+                let pending = self.pending_action.take().ok_or(TuiError::InvalidForm {
+                    field: "confirmation",
+                    message: "no operation is awaiting confirmation".to_owned(),
+                })?;
+                if pending.action() != action {
+                    return Err(TuiError::InvalidForm {
+                        field: "confirmation",
+                        message: "the selected operation changed".to_owned(),
+                    });
+                }
+                self.execute(pending)?;
+                self.app.progress = None;
+                self.refresh_local()?;
+                Ok(ControlFlow::Continue)
+            }
+        }
+    }
+
+    fn begin_action(&mut self, action: Action) -> Result<(), TuiError> {
+        let (repository, _) = self
+            .app
+            .selected_repository()
+            .ok_or(TuiError::RepositoryGone)?;
+        let repository_path = repository.config.path.clone();
+        match action {
+            Action::Create => self.app.open_form(
+                action,
+                vec![
+                    field("mode (existing/new/detached)", "new"),
+                    field("branch or commit-ish", ""),
+                    field("start point (new only)", "HEAD"),
+                    field("destination (blank = suggested)", ""),
+                    field("create missing parents (yes/no)", "no"),
+                ],
+            ),
+            Action::Move => {
+                self.require_selected_worktree()?;
+                self.app.open_form(
+                    action,
+                    vec![
+                        field("destination", ""),
+                        field("create missing parents (yes/no)", "no"),
+                    ],
+                );
+            }
+            Action::Lock => {
+                self.require_selected_worktree()?;
+                self.app
+                    .open_form(action, vec![field("reason (optional)", "")]);
+            }
+            Action::Repair => {
+                let (_, worktree, _) = self.require_selected_worktree()?;
+                self.app.open_form(
+                    action,
+                    vec![field("worktree path", &worktree.path.to_string_lossy())],
+                );
+            }
+            Action::EditRepository => self.app.open_form(
+                action,
+                vec![
+                    field(
+                        "repository path (relink)",
+                        &repository.config.path.to_string_lossy(),
+                    ),
+                    field(
+                        "label (blank = derived)",
+                        repository.config.label.as_deref().unwrap_or(""),
+                    ),
+                    field(
+                        "worktree root (blank = sibling)",
+                        &repository
+                            .config
+                            .worktree_root
+                            .as_deref()
+                            .map(Path::to_string_lossy)
+                            .unwrap_or_default(),
+                    ),
+                    field(
+                        "GitHub remote (blank = origin)",
+                        repository.config.github_remote.as_deref().unwrap_or(""),
+                    ),
+                ],
+            ),
+            Action::Unlock => {
+                let (_, worktree, _) = self.require_selected_worktree()?;
+                let pending = PendingAction::Unlock {
+                    repository: repository_path,
+                    worktree: worktree.path.clone(),
+                };
+                self.confirm(pending, vec![format!("unlock {}", worktree.path.display())]);
+            }
+            Action::Remove => {
+                let (_, worktree, _) = self.require_selected_worktree()?;
+                let details = operations::removal_preview(
+                    &SystemGit,
+                    &repository.config,
+                    &worktree.path.to_string_lossy(),
+                    &self.app.current_directory,
+                    false,
+                )?;
+                let mut summary = vec![
+                    format!("repository: {}", repository.config.display_label()),
+                    format!("branch: {}", identity(&details.worktree)),
+                    format!("path: {}", details.worktree.path.display()),
+                ];
+                if let Some(status) = details.status {
+                    summary.push(format!("local status: {}", status.summary()));
+                }
+                let pending = PendingAction::Remove {
+                    repository: repository_path,
+                    worktree: worktree.path.clone(),
+                };
+                self.confirm(pending, summary);
+            }
+            Action::Prune => {
+                let preview = operations::preview_prune(&SystemGit, &repository.config)?;
+                let summary = if preview.is_empty() {
+                    vec!["Git reports no stale worktree records.".to_owned()]
+                } else {
+                    preview.lines().map(str::to_owned).collect()
+                };
+                let pending = PendingAction::Prune {
+                    repository: repository_path,
+                    preview,
+                };
+                self.confirm(pending, summary);
+            }
+            Action::RegisterRepository => {
+                let pending = PendingAction::RegisterRepository {
+                    repository: repository.config.clone(),
+                };
+                self.confirm(
+                    pending,
+                    vec![format!("register {}", repository.config.path.display())],
+                );
+            }
+            Action::RemoveRepository => {
+                let pending = PendingAction::RemoveRepository {
+                    repository: repository_path,
+                };
+                self.confirm(
+                    pending,
+                    vec![
+                        "Only the catalog entry will be removed.".to_owned(),
+                        "No repository or worktree will be deleted.".to_owned(),
+                    ],
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn submit_form(&mut self, action: Action, values: Vec<String>) -> Result<(), TuiError> {
+        let (repository_view, _) = self
+            .app
+            .selected_repository()
+            .ok_or(TuiError::RepositoryGone)?;
+        let repository = repository_view.config.clone();
+        match action {
+            Action::Create => {
+                require_len(&values, 5, "create")?;
+                let reference = nonempty(&values[1], "branch or commit-ish")?;
+                let mode = match values[0].trim().to_ascii_lowercase().as_str() {
+                    "existing" => CreateMode::ExistingBranch(reference.to_owned()),
+                    "new" => CreateMode::NewBranch {
+                        branch: reference.to_owned(),
+                        start_point: if values[2].trim().is_empty() {
+                            "HEAD".to_owned()
+                        } else {
+                            values[2].trim().to_owned()
+                        },
+                    },
+                    "detached" => CreateMode::Detached(reference.to_owned()),
+                    _ => return invalid("mode", "use existing, new, or detached"),
+                };
+                let destination = if values[3].trim().is_empty() {
+                    operations::suggested_destination(&repository, &mode)
+                } else {
+                    absolute_path(&self.app.current_directory, values[3].trim())
+                };
+                let create_parents = parse_yes_no(&values[4], "create missing parents")?;
+                operations::validate_create(
+                    &SystemGit,
+                    &repository,
+                    &destination,
+                    &mode,
+                    create_parents,
+                )?;
+                let pending = PendingAction::Create {
+                    repository: repository.path.clone(),
+                    destination: destination.clone(),
+                    mode: mode.clone(),
+                    create_parents,
+                };
+                self.confirm(
+                    pending,
+                    vec![
+                        format!("repository: {}", repository.display_label()),
+                        format!("destination: {}", destination.display()),
+                        format!("mode: {mode:?}"),
+                        format!("create parents: {create_parents}"),
+                    ],
+                );
+            }
+            Action::Move => {
+                require_len(&values, 2, "move")?;
+                let (_, worktree, _) = self.require_selected_worktree()?;
+                let worktree_path = worktree.path.clone();
+                let destination = absolute_path(
+                    &self.app.current_directory,
+                    nonempty(&values[0], "destination")?,
+                );
+                let create_parents = parse_yes_no(&values[1], "create missing parents")?;
+                operations::validate_move(
+                    &SystemGit,
+                    &repository,
+                    &worktree_path.to_string_lossy(),
+                    &destination,
+                    create_parents,
+                )?;
+                let pending = PendingAction::Move {
+                    repository: repository.path.clone(),
+                    worktree: worktree_path.clone(),
+                    destination: destination.clone(),
+                    create_parents,
+                };
+                self.confirm(
+                    pending,
+                    vec![
+                        format!("from: {}", worktree_path.display()),
+                        format!("to: {}", destination.display()),
+                    ],
+                );
+            }
+            Action::Lock => {
+                require_len(&values, 1, "lock")?;
+                let (_, worktree, _) = self.require_selected_worktree()?;
+                let reason = optional_text(&values[0]);
+                let pending = PendingAction::Lock {
+                    repository: repository.path,
+                    worktree: worktree.path.clone(),
+                    reason: reason.clone(),
+                };
+                self.confirm(
+                    pending,
+                    vec![
+                        format!("path: {}", worktree.path.display()),
+                        format!("reason: {}", reason.as_deref().unwrap_or("none")),
+                    ],
+                );
+            }
+            Action::Repair => {
+                require_len(&values, 1, "repair")?;
+                let path = absolute_path(
+                    &self.app.current_directory,
+                    nonempty(&values[0], "worktree path")?,
+                );
+                let pending = PendingAction::Repair {
+                    repository: repository.path,
+                    path: path.clone(),
+                };
+                self.confirm(pending, vec![format!("repair: {}", path.display())]);
+            }
+            Action::EditRepository => {
+                require_len(&values, 4, "repository metadata")?;
+                let path = absolute_path(
+                    &self.app.current_directory,
+                    nonempty(&values[0], "repository path")?,
+                );
+                let identity = git::resolve_repository(&SystemGit, &path)?;
+                for other in self
+                    .catalog
+                    .repositories
+                    .iter()
+                    .filter(|other| other.path != repository.path)
+                {
+                    if git::resolve_repository(&SystemGit, &other.path)
+                        .is_ok_and(|other| other.common_git_dir == identity.common_git_dir)
+                    {
+                        return invalid("repository path", "that repository is already registered");
+                    }
+                }
+                let worktree_root = optional_text(&values[2])
+                    .map(|path| absolute_path(&self.app.current_directory, &path));
+                let pending = PendingAction::EditRepository {
+                    repository: repository.path.clone(),
+                    new_repository: identity.anchor.clone(),
+                    label: optional_text(&values[1]),
+                    worktree_root,
+                    github_remote: optional_text(&values[3]),
+                };
+                self.confirm(
+                    pending,
+                    vec![
+                        format!("from: {}", repository.path.display()),
+                        format!("to: {}", identity.anchor.display()),
+                        "update repository metadata".to_owned(),
+                    ],
+                );
+            }
+            _ => return invalid("action", "this action does not use a form"),
+        }
+        Ok(())
+    }
+
+    fn confirm(&mut self, pending: PendingAction, summary: Vec<String>) {
+        let action = pending.action();
+        self.pending_action = Some(pending);
+        self.app.open_confirmation(action, summary);
+    }
+
+    fn execute(&mut self, pending: PendingAction) -> Result<(), TuiError> {
+        match pending {
+            PendingAction::Create {
+                repository,
+                destination,
+                mode,
+                create_parents,
+            } => {
+                let repository = self.repository(&repository)?.clone();
+                operations::create(&SystemGit, &repository, &destination, &mode, create_parents)?;
+            }
+            PendingAction::Move {
+                repository,
+                worktree,
+                destination,
+                create_parents,
+            } => {
+                let repository = self.repository(&repository)?.clone();
+                operations::move_worktree(
+                    &SystemGit,
+                    &repository,
+                    &worktree.to_string_lossy(),
+                    &destination,
+                    create_parents,
+                )?;
+            }
+            PendingAction::Lock {
+                repository,
+                worktree,
+                reason,
+            } => {
+                let repository = self.repository(&repository)?.clone();
+                operations::lock(
+                    &SystemGit,
+                    &repository,
+                    &worktree.to_string_lossy(),
+                    reason.as_deref(),
+                )?;
+            }
+            PendingAction::Unlock {
+                repository,
+                worktree,
+            } => {
+                let repository = self.repository(&repository)?.clone();
+                operations::unlock(&SystemGit, &repository, &worktree.to_string_lossy())?;
+            }
+            PendingAction::Remove {
+                repository,
+                worktree,
+            } => {
+                let repository = self.repository(&repository)?.clone();
+                operations::remove(
+                    &SystemGit,
+                    &repository,
+                    &worktree.to_string_lossy(),
+                    &self.app.current_directory,
+                )?;
+            }
+            PendingAction::Repair { repository, path } => {
+                let repository = self.repository(&repository)?.clone();
+                operations::repair(&SystemGit, &repository, &path)?;
+            }
+            PendingAction::Prune {
+                repository,
+                preview,
+            } => {
+                let repository = self.repository(&repository)?.clone();
+                let current = operations::preview_prune(&SystemGit, &repository)?;
+                if current != preview {
+                    return invalid(
+                        "prune preview",
+                        "stale records changed; refresh and review the new preview",
+                    );
+                }
+                operations::prune(&SystemGit, &repository)?;
+            }
+            PendingAction::RegisterRepository { repository } => {
+                if !self
+                    .catalog
+                    .repositories
+                    .iter()
+                    .any(|existing| existing.path == repository.path)
+                {
+                    self.catalog.repositories.push(repository);
+                    config::save(&self.catalog_path, &self.catalog)?;
+                }
+            }
+            PendingAction::EditRepository {
+                repository,
+                new_repository,
+                label,
+                worktree_root,
+                github_remote,
+            } => {
+                let entry = self
+                    .catalog
+                    .repositories
+                    .iter_mut()
+                    .find(|entry| entry.path == repository)
+                    .ok_or(TuiError::RepositoryGone)?;
+                entry.path = new_repository;
+                entry.label = label;
+                entry.worktree_root = worktree_root;
+                entry.github_remote = github_remote;
+                config::save(&self.catalog_path, &self.catalog)?;
+            }
+            PendingAction::RemoveRepository { repository } => {
+                let before = self.catalog.repositories.len();
+                self.catalog
+                    .repositories
+                    .retain(|entry| entry.path != repository);
+                if self.catalog.repositories.len() == before {
+                    return Err(TuiError::RepositoryGone);
+                }
+                config::save(&self.catalog_path, &self.catalog)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn repository(&self, path: &Path) -> Result<&RepositoryConfig, TuiError> {
+        self.app
+            .repositories
+            .iter()
+            .find(|repository| repository.config.path == path)
+            .map(|repository| &repository.config)
+            .ok_or(TuiError::RepositoryGone)
+    }
+
+    fn require_selected_worktree(&self) -> Result<(&RepositoryView, &Worktree, usize), TuiError> {
+        self.app.selected_worktree().ok_or(TuiError::WorktreeGone)
+    }
+
+    fn refresh_local(&mut self) -> Result<(), TuiError> {
+        self.catalog = config::load(&self.catalog_path)?;
+        let repositories = load_repository_views(&self.catalog, &self.app.current_directory);
+        self.app.replace_repositories(repositories);
+        self.start_status_refresh();
+        Ok(())
+    }
+
+    fn start_status_refresh(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .app
+            .repositories
+            .iter()
+            .flat_map(|repository| repository.worktrees.iter())
+            .filter(|worktree| worktree.navigable() && worktree.path.exists())
+            .map(|worktree| worktree.path.clone())
+            .collect();
+        let generation = self.app.begin_status_refresh(&paths);
+        self.status_backlog = paths
+            .into_iter()
+            .map(|path| StatusTask { generation, path })
+            .collect();
+        self.submit_status_backlog();
+    }
+
+    fn submit_status_backlog(&mut self) {
+        while let Some(task) = self.status_backlog.pop_front() {
+            if let Err(task) = self.status_pool.try_submit(task) {
+                self.status_backlog.push_front(task);
+                break;
+            }
+        }
+    }
+
+    fn pump_status_results(&mut self) -> bool {
+        self.submit_status_backlog();
+        let mut refresh = false;
+        let mut changed = false;
+        while let Some(result) = self.status_pool.try_recv() {
+            changed = true;
+            refresh |= self.app.apply_status(result);
+        }
+        if refresh && let Err(error) = self.refresh_local() {
+            self.app.inline_error = Some(error.to_string());
+            changed = true;
+        }
+        changed
+    }
+}
+
+fn load_repository_views(catalog: &Catalog, current_directory: &Path) -> Vec<RepositoryView> {
+    let mut views: Vec<RepositoryView> = catalog
+        .repositories
+        .iter()
+        .cloned()
+        .map(
+            |repository| match git::discover_worktrees(&SystemGit, &repository.path) {
+                Ok(worktrees) => RepositoryView {
+                    config: repository,
+                    session_only: false,
+                    stale_error: None,
+                    expanded: true,
+                    worktrees,
+                },
+                Err(error) => RepositoryView {
+                    config: repository,
+                    session_only: false,
+                    stale_error: Some(error.to_string()),
+                    expanded: true,
+                    worktrees: Vec::new(),
+                },
+            },
+        )
+        .collect();
+
+    if let Ok(identity) = git::resolve_repository(&SystemGit, current_directory) {
+        let registered = catalog.repositories.iter().any(|repository| {
+            git::resolve_repository(&SystemGit, &repository.path)
+                .is_ok_and(|existing| existing.common_git_dir == identity.common_git_dir)
+        });
+        if !registered {
+            let config = RepositoryConfig {
+                path: identity.anchor.clone(),
+                label: None,
+                worktree_root: None,
+                github_remote: None,
+            };
+            match git::discover_worktrees(&SystemGit, &identity.anchor) {
+                Ok(worktrees) => views.push(RepositoryView {
+                    config,
+                    session_only: true,
+                    stale_error: None,
+                    expanded: true,
+                    worktrees,
+                }),
+                Err(error) => views.push(RepositoryView {
+                    config,
+                    session_only: true,
+                    stale_error: Some(error.to_string()),
+                    expanded: true,
+                    worktrees: Vec::new(),
+                }),
+            }
+        }
+    }
+    views
+}
+
+fn field(label: &str, value: &str) -> FormField {
+    FormField {
+        label: label.to_owned(),
+        value: value.to_owned(),
+    }
+}
+
+fn identity(worktree: &Worktree) -> String {
+    worktree
+        .branch
+        .as_deref()
+        .and_then(|branch| branch.strip_prefix("refs/heads/"))
+        .map(str::to_owned)
+        .or_else(|| {
+            worktree
+                .head
+                .as_ref()
+                .map(|head| format!("detached:{head}"))
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn optional_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn nonempty<'a>(value: &'a str, field: &'static str) -> Result<&'a str, TuiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        invalid(field, "value cannot be empty")
+    } else {
+        Ok(value)
+    }
+}
+
+fn require_len(values: &[String], expected: usize, field: &'static str) -> Result<(), TuiError> {
+    if values.len() == expected {
+        Ok(())
+    } else {
+        invalid(field, "form fields changed unexpectedly")
+    }
+}
+
+fn parse_yes_no(value: &str, field: &'static str) -> Result<bool, TuiError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" | "true" => Ok(true),
+        "n" | "no" | "false" | "" => Ok(false),
+        _ => invalid(field, "use yes or no"),
+    }
+}
+
+fn invalid<T>(field: &'static str, message: impl Into<String>) -> Result<T, TuiError> {
+    Err(TuiError::InvalidForm {
+        field,
+        message: message.into(),
+    })
+}
+
+fn absolute_path(current_directory: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        current_directory.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::Modal;
+    use std::process::Command;
+
+    #[test]
+    fn empty_catalog_inside_repository_creates_session_only_onboarding() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project");
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(directory.path())
+                .args(["init", repository.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let views = load_repository_views(&Catalog::default(), &repository);
+        assert_eq!(views.len(), 1);
+        assert!(views[0].session_only);
+        assert_eq!(
+            views[0].config.path,
+            std::fs::canonicalize(repository).unwrap()
+        );
+    }
+
+    #[test]
+    fn empty_catalog_outside_repository_remains_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(load_repository_views(&Catalog::default(), directory.path()).is_empty());
+    }
+
+    #[test]
+    fn form_parsers_reject_ambiguous_values() {
+        assert!(parse_yes_no("maybe", "choice").is_err());
+        assert!(nonempty("  ", "branch").is_err());
+        assert_eq!(
+            absolute_path(Path::new("/base"), "relative"),
+            PathBuf::from("/base/relative")
+        );
+    }
+
+    #[test]
+    fn controller_registers_edits_and_unregisters_session_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project");
+        run_git_command(directory.path(), &["init", repository.to_str().unwrap()]);
+        let catalog_path = directory.path().join("config/wt.json");
+        let catalog = Catalog::default();
+        let views = load_repository_views(&catalog, &repository);
+        let app = App::new(views.clone(), repository.clone());
+        let mut controller = Controller::new(catalog_path.clone(), catalog, app);
+        let config = views[0].config.clone();
+
+        controller
+            .execute(PendingAction::RegisterRepository {
+                repository: config.clone(),
+            })
+            .unwrap();
+        assert_eq!(config::load(&catalog_path).unwrap().repositories.len(), 1);
+        controller
+            .execute(PendingAction::EditRepository {
+                repository: config.path.clone(),
+                new_repository: config.path.clone(),
+                label: Some("renamed".to_owned()),
+                worktree_root: Some(directory.path().join("trees")),
+                github_remote: Some("upstream".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(
+            config::load(&catalog_path).unwrap().repositories[0]
+                .label
+                .as_deref(),
+            Some("renamed")
+        );
+        controller
+            .execute(PendingAction::RemoveRepository {
+                repository: config.path,
+            })
+            .unwrap();
+        assert!(config::load(&catalog_path).unwrap().repositories.is_empty());
+    }
+
+    #[test]
+    fn create_form_validates_then_opens_exact_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project");
+        run_git_command(
+            directory.path(),
+            &["init", "-b", "main", repository.to_str().unwrap()],
+        );
+        run_git_command(&repository, &["config", "user.email", "test@example.com"]);
+        run_git_command(&repository, &["config", "user.name", "Test User"]);
+        run_git_command(&repository, &["commit", "--allow-empty", "-m", "initial"]);
+        let identity = git::resolve_repository(&SystemGit, &repository).unwrap();
+        let repository_config = RepositoryConfig {
+            path: identity.anchor,
+            label: Some("project".to_owned()),
+            worktree_root: None,
+            github_remote: None,
+        };
+        let catalog = Catalog {
+            repositories: vec![repository_config],
+            ..Catalog::default()
+        };
+        let views = load_repository_views(&catalog, &repository);
+        let app = App::new(views, repository);
+        let mut controller = Controller::new(directory.path().join("wt.json"), catalog, app);
+        let destination = directory.path().join("topic");
+        controller
+            .submit_form(
+                Action::Create,
+                vec![
+                    "new".to_owned(),
+                    "topic".to_owned(),
+                    "HEAD".to_owned(),
+                    destination.to_string_lossy().into_owned(),
+                    "no".to_owned(),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            controller.pending_action,
+            Some(PendingAction::Create { .. })
+        ));
+        assert!(matches!(controller.app.modal, Some(Modal::Confirm { .. })));
+    }
+
+    #[test]
+    fn stale_repository_edit_form_relinks_the_catalog_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let relocated = directory.path().join("relocated");
+        run_git_command(directory.path(), &["init", relocated.to_str().unwrap()]);
+        let catalog_path = directory.path().join("wt.json");
+        let catalog = Catalog {
+            repositories: vec![RepositoryConfig {
+                path: directory.path().join("missing"),
+                label: Some("stale".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+            }],
+            ..Catalog::default()
+        };
+        config::save(&catalog_path, &catalog).unwrap();
+        let views = load_repository_views(&catalog, directory.path());
+        let app = App::new(views, directory.path().to_owned());
+        let mut controller = Controller::new(catalog_path.clone(), catalog, app);
+        controller
+            .submit_form(
+                Action::EditRepository,
+                vec![
+                    relocated.to_string_lossy().into_owned(),
+                    "relinked".to_owned(),
+                    String::new(),
+                    "origin".to_owned(),
+                ],
+            )
+            .unwrap();
+        let pending = controller.pending_action.take().unwrap();
+        controller.execute(pending).unwrap();
+        let stored = config::load(&catalog_path).unwrap();
+        assert_eq!(stored.repositories[0].label.as_deref(), Some("relinked"));
+        assert_eq!(
+            stored.repositories[0].path,
+            std::fs::canonicalize(relocated).unwrap()
+        );
+    }
+
+    fn run_git_command(directory: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?} failed");
+    }
+}

@@ -9,12 +9,13 @@ use crate::config;
 use crate::git::{self, GitRunner, SystemGit};
 use crate::model::{Catalog, RepositoryConfig};
 use crate::operations::{self, CreateMode};
+use crate::tui;
 
 #[derive(Debug, Parser)]
 #[command(name = "wt", version, about = "Global Git worktree manager")]
 pub struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -217,16 +218,22 @@ pub enum CliError {
     ConfirmationIo(io::Error),
     #[error("operation cancelled")]
     Cancelled,
+    #[error(transparent)]
+    Tui(#[from] tui::TuiError),
 }
 
-pub fn run(cli: Cli) -> Result<(), CliError> {
+pub fn run(cli: Cli) -> Result<Option<PathBuf>, CliError> {
+    if cli.command.is_none() {
+        return Ok(tui::run()?);
+    }
     let path = config::catalog_path()?;
-    run_with(&SystemGit, &path, cli)
+    run_with(&SystemGit, &path, cli)?;
+    Ok(None)
 }
 
 fn run_with(runner: &dyn GitRunner, catalog_path: &Path, cli: Cli) -> Result<(), CliError> {
     let mut catalog = config::load(catalog_path)?;
-    match cli.command {
+    match cli.command.expect("checked by caller") {
         Command::Repo { command } => match command {
             RepoCommand::Add(arguments) => add(runner, catalog_path, &mut catalog, arguments),
             RepoCommand::List => list(runner, &catalog),
