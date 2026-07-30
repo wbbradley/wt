@@ -121,13 +121,13 @@ fn creates_all_modes_reports_status_and_validates_conflicts() {
 fn suggests_moves_locks_unlocks_and_repairs_worktrees() {
     let fixture = Fixture::normal_with_worktree_root("updates");
     git(&fixture.anchor, &["branch", "suggested/topic"]);
+    assert!(!fixture.worktree_root.exists());
     assert_success(&fixture.wt(&[
         "worktree",
         "create",
         "project",
         "--branch",
         "suggested/topic",
-        "--create-parents",
         "--yes",
     ]));
     let suggested = fixture.worktree_root.join("suggested-topic");
@@ -170,6 +170,49 @@ fn suggests_moves_locks_unlocks_and_repairs_worktrees() {
         "--yes",
     ]));
     assert_success(&git_output(&relocated, &["status", "--short"]));
+}
+
+#[test]
+fn missing_worktree_root_is_created_for_creates_and_moves() {
+    let fixture = Fixture::normal_with_worktree_root("root creation");
+    git(&fixture.anchor, &["branch", "nested/topic"]);
+    assert!(!fixture.worktree_root.exists());
+
+    let nested = fixture.worktree_root.join("team/nested-topic");
+    assert_success(&fixture.wt(&[
+        "worktree",
+        "create",
+        "project",
+        nested.to_str().unwrap(),
+        "--branch",
+        "nested/topic",
+        "--yes",
+    ]));
+    assert!(nested.join(".git").exists());
+
+    let unmanaged = fixture.root.join("unmanaged/topic");
+    let refusal = fixture.wt(&[
+        "worktree",
+        "create",
+        "project",
+        unmanaged.to_str().unwrap(),
+        "--detach",
+        "HEAD",
+        "--yes",
+    ]);
+    assert_failure_contains(&refusal, "destination parent does not exist");
+    assert!(!fixture.root.join("unmanaged").exists());
+
+    let relocated = fixture.worktree_root.join("moved/nested-topic");
+    assert_success(&fixture.wt(&[
+        "worktree",
+        "move",
+        "project",
+        "nested/topic",
+        relocated.to_str().unwrap(),
+        "--yes",
+    ]));
+    assert!(relocated.join(".git").exists());
 }
 
 #[test]
