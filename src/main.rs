@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod git;
 mod model;
+mod operations;
 
 fn main() {
     if let Err(error) = cli::run(cli::Cli::parse()) {

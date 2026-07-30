@@ -69,6 +69,29 @@ pub struct Worktree {
     pub prunable: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub upstream: Option<String>,
+    pub staged: usize,
+    pub modified: usize,
+    pub untracked: usize,
+}
+
+impl WorktreeStatus {
+    pub fn is_dirty(&self) -> bool {
+        self.staged > 0 || self.modified > 0 || self.untracked > 0
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "{} staged, {} modified, {} untracked",
+            self.staged, self.modified, self.untracked
+        )
+    }
+}
+
 impl Worktree {
     pub fn navigable(&self) -> bool {
         !self.bare
