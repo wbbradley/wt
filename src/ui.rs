@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let body = if area.width >= 72 {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .constraints([Constraint::Percentage(63), Constraint::Percentage(37)])
             .split(vertical[1])
     } else {
         Layout::default()
@@ -85,7 +85,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     ),
                     Span::styled(state, Style::default().fg(Color::Yellow)),
                     Span::styled(
-                        format!("  {}", repository.config.path.display()),
+                        format!("  {}", display_path(&repository.config.path)),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]))
@@ -148,7 +148,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         Style::default().fg(Color::Yellow),
                     ),
                     Span::styled(
-                        format!("  {}", worktree.path.display()),
+                        format!("  {}", display_path(&worktree.path)),
                         Style::default().fg(Color::Blue),
                     ),
                     Span::styled(
@@ -527,6 +527,22 @@ fn short(head: &str) -> &str {
     head.get(..head.len().min(8)).unwrap_or(head)
 }
 
+fn display_path(path: &std::path::Path) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    shorten_home(path, home.as_deref())
+}
+
+fn shorten_home(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    let Some(home) = home.filter(|home| home.parent().is_some()) else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 fn path_contains(worktree: &std::path::Path, candidate: &std::path::Path) -> bool {
     let worktree = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_owned());
     let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_owned());
@@ -681,6 +697,33 @@ mod tests {
         assert!(stale.contains("GitHub stale: network unavailable"));
         assert!(stale.contains("12 remaining"));
         assert!(stale.contains("warning: partial response"));
+    }
+
+    #[test]
+    fn shortens_home_prefix_only_on_component_boundaries() {
+        let home = PathBuf::from("/Users/dev");
+        assert_eq!(shorten_home(&PathBuf::from("/Users/dev"), Some(&home)), "~");
+        assert_eq!(
+            shorten_home(&PathBuf::from("/Users/dev/src/wt"), Some(&home)),
+            "~/src/wt"
+        );
+        assert_eq!(
+            shorten_home(&PathBuf::from("/Users/developer/src"), Some(&home)),
+            "/Users/developer/src"
+        );
+        assert_eq!(
+            shorten_home(&PathBuf::from("/opt/tools"), Some(&home)),
+            "/opt/tools"
+        );
+        assert_eq!(shorten_home(&PathBuf::from("/opt"), None), "/opt");
+        assert_eq!(
+            shorten_home(&PathBuf::from("/opt"), Some(&PathBuf::from("/"))),
+            "/opt"
+        );
+        assert_eq!(
+            shorten_home(&PathBuf::from("/opt"), Some(&PathBuf::from(""))),
+            "/opt"
+        );
     }
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
