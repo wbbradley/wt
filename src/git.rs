@@ -212,6 +212,10 @@ pub fn parse_status_porcelain(input: &[u8]) -> Result<WorktreeStatus, GitError> 
             status.upstream = Some(lossy(value));
             continue;
         }
+        if field.starts_with(b"# ") {
+            // Git emits further headers (branch.ab, stash) that carry no data we track.
+            continue;
+        }
         match field.first().copied() {
             Some(b'1' | b'2' | b'u') => {
                 if field.len() < 4 || field[1] != b' ' {
@@ -374,7 +378,7 @@ mod tests {
 
     #[test]
     fn parses_v2_status_headers_and_counts() {
-        let input = b"# branch.oid abc123\0# branch.head topic\0# branch.upstream origin/topic\x001 M. N... 100644 100644 100644 a b file\x002 .M N... 100644 100644 100644 a b R100 new\0old\0? untracked\0";
+        let input = b"# branch.oid abc123\0# branch.head topic\0# branch.upstream origin/topic\0# branch.ab +0 -0\x001 M. N... 100644 100644 100644 a b file\x002 .M N... 100644 100644 100644 a b R100 new\0old\0? untracked\0";
         let status = parse_status_porcelain(input).unwrap();
         assert_eq!(status.head.as_deref(), Some("abc123"));
         assert_eq!(status.branch.as_deref(), Some("topic"));
