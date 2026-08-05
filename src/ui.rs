@@ -385,25 +385,38 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
             fields,
             active,
         } => {
-            let mut lines: Vec<Line<'_>> = fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    Line::styled(
-                        format!(
-                            "{}: {}{}",
-                            field.label,
-                            field.value,
-                            if index == *active { "█" } else { "" }
-                        ),
-                        if index == *active {
-                            Style::default().fg(Color::Cyan)
-                        } else {
-                            Style::default()
-                        },
-                    )
-                })
-                .collect();
+            let mut lines = Vec::new();
+            if *action == crate::app::Action::Create
+                && let Some((repository, _)) = app.selected_repository()
+            {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "Repository: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(repository.config.display_label()),
+                ]));
+                lines.push(Line::styled(
+                    format!("Path: {}", display_path(&repository.config.path)),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                lines.push(Line::raw(""));
+            }
+            lines.extend(fields.iter().enumerate().map(|(index, field)| {
+                Line::styled(
+                    format!(
+                        "{}: {}{}",
+                        field.label,
+                        field.value,
+                        if index == *active { "█" } else { "" }
+                    ),
+                    if index == *active {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        Style::default()
+                    },
+                )
+            }));
             // A rejected submission leaves the form open, so the reason belongs
             // next to the fields instead of only on the footer line, where it
             // reads as the submission having done nothing at all.
@@ -743,6 +756,35 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("error: destination parent does not exist: /trees"));
+    }
+
+    #[test]
+    fn create_form_identifies_the_selected_repository() {
+        let repository = RepositoryView {
+            config: RepositoryConfig {
+                path: PathBuf::from("/src/project"),
+                label: Some("project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+            },
+            session_only: false,
+            stale_error: None,
+            expanded: true,
+            worktrees: Vec::new(),
+        };
+        let mut app = App::new(vec![repository], PathBuf::from("/outside"));
+        app.open_form(
+            crate::app::Action::Create,
+            vec![crate::app::FormField {
+                label: "mode (existing/new/detached)".to_owned(),
+                value: "new".to_owned(),
+            }],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Repository: project"));
+        assert!(content.contains("Path: /src/project"));
     }
 
     #[test]
