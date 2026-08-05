@@ -25,17 +25,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         vertical[0],
     );
 
-    let body = if area.width >= 72 {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(63), Constraint::Percentage(37)])
-            .split(vertical[1])
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(vertical[1])
-    };
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(63), Constraint::Percentage(37)])
+        .split(vertical[1]);
     render_list(frame, app, body[0]);
     render_detail(frame, app, body[1]);
     render_footer(frame, app, vertical[2]);
@@ -207,7 +200,7 @@ fn list_block(app: &App) -> Block<'static> {
         })
 }
 
-fn render_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut lines = Vec::new();
     if let Some((repository, worktree, _)) = app.selected_worktree() {
         lines.push(Line::from(vec![
@@ -295,21 +288,30 @@ fn render_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         lines.push(Line::from("Select a repository or worktree."));
     }
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Details ")
-                    .borders(Borders::ALL)
-                    .border_style(if app.pane == Pane::Detail {
-                        Style::default().fg(Color::Cyan)
-                    } else {
-                        Style::default()
-                    }),
-            ),
-        area,
-    );
+    let block = Block::default()
+        .title(" Details ")
+        .borders(Borders::ALL)
+        .border_style(if app.pane == Pane::Detail {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        });
+    let inner = block.inner(area);
+    let line_count = wrapped_line_count(&lines, inner.width);
+    let paragraph = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .block(block);
+    app.set_detail_max_scroll(line_count.saturating_sub(inner.height as usize));
+    let paragraph = paragraph.scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0));
+    frame.render_widget(paragraph, area);
+}
+
+fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
+    let width = width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
 }
 
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -620,6 +622,7 @@ mod tests {
         app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.viewport_height, 11);
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("project [session-only]"));
         assert!(content.contains("branch"));
@@ -712,8 +715,17 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let stale = buffer_text(terminal.backend().buffer());
         assert!(stale.contains("GitHub stale: network unavailable"));
-        assert!(stale.contains("12 remaining"));
-        assert!(stale.contains("warning: partial response"));
+        app.pane = Pane::Detail;
+        for _ in 0..20 {
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let scrolled = buffer_text(terminal.backend().buffer());
+        assert!(scrolled.contains("12 remaining"));
+        assert!(scrolled.contains("warning: partial response"));
     }
 
     #[test]

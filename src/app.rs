@@ -198,6 +198,8 @@ pub struct App {
     pub pane: Pane,
     pub scroll: usize,
     pub viewport_height: usize,
+    pub detail_scroll: usize,
+    detail_max_scroll: usize,
     pub modal: Option<Modal>,
     pub inline_error: Option<String>,
     pub progress: Option<String>,
@@ -221,6 +223,8 @@ impl App {
             pane: Pane::List,
             scroll: 0,
             viewport_height: 1,
+            detail_scroll: 0,
+            detail_max_scroll: 0,
             modal: None,
             inline_error: None,
             progress: None,
@@ -395,8 +399,22 @@ impl App {
             };
         }
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.move_and_continue(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_and_continue(-1),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.pane == Pane::Detail {
+                    self.scroll_detail(1);
+                    Intent::None
+                } else {
+                    self.move_and_continue(1)
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.pane == Pane::Detail {
+                    self.scroll_detail(-1);
+                    Intent::None
+                } else {
+                    self.move_and_continue(-1)
+                }
+            }
             KeyCode::Char('g') => {
                 self.select_index(0);
                 Intent::None
@@ -756,6 +774,11 @@ impl App {
         self.ensure_selected_in_view();
     }
 
+    pub fn set_detail_max_scroll(&mut self, max_scroll: usize) {
+        self.detail_max_scroll = max_scroll;
+        self.detail_scroll = self.detail_scroll.min(max_scroll);
+    }
+
     fn direct_action(&mut self, character: char) -> Intent {
         let action = match character {
             'c' => Action::Create,
@@ -813,6 +836,7 @@ impl App {
         if let Some((_, repository_index)) = self.selected_repository() {
             self.repositories[repository_index].expanded = false;
             self.selected = Some(self.repositories[repository_index].id());
+            self.detail_scroll = 0;
             self.ensure_selected_in_view();
         }
     }
@@ -844,13 +868,26 @@ impl App {
             .and_then(|selected| rows.iter().position(|row| row.id() == selected))
             .unwrap_or(0);
         let next = (current as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
-        self.selected = Some(rows[next].id().clone());
+        let next_id = rows[next].id().clone();
+        if self.selected.as_ref() != Some(&next_id) {
+            self.detail_scroll = 0;
+        }
+        self.selected = Some(next_id);
         self.ensure_selected_in_view();
+    }
+
+    fn scroll_detail(&mut self, delta: isize) {
+        self.detail_scroll = (self.detail_scroll as isize + delta)
+            .clamp(0, self.detail_max_scroll as isize) as usize;
     }
 
     fn select_index(&mut self, index: usize) {
         if let Some(row) = self.visible_rows().get(index) {
-            self.selected = Some(row.id().clone());
+            let id = row.id().clone();
+            if self.selected.as_ref() != Some(&id) {
+                self.detail_scroll = 0;
+            }
+            self.selected = Some(id);
             self.ensure_selected_in_view();
         }
     }
@@ -874,6 +911,7 @@ impl App {
     }
 
     fn ensure_selection_visible(&mut self) {
+        let previous = self.selected.clone();
         let rows = self.visible_rows();
         let visible = self
             .selected
@@ -885,6 +923,9 @@ impl App {
                 .find(|row| matches!(row, VisibleRow::Worktree { .. }))
                 .or_else(|| rows.first())
                 .map(|row| row.id().clone());
+        }
+        if self.selected != previous {
+            self.detail_scroll = 0;
         }
         self.ensure_selected_in_view();
     }
@@ -1016,6 +1057,28 @@ mod tests {
         );
         app.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(app.selected, Some(RowId::Repository(_))));
+    }
+
+    #[test]
+    fn detail_pane_scrolls_without_moving_the_list_selection() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let selected = app.selected.clone();
+        app.set_detail_max_scroll(2);
+        app.handle_key(key(KeyCode::Char('l')));
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.detail_scroll, 1);
+        assert_eq!(app.selected, selected);
+        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.detail_scroll, 2);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.detail_scroll, 1);
+
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_ne!(app.selected, selected);
+        assert_eq!(app.detail_scroll, 0);
     }
 
     #[test]
