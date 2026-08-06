@@ -122,6 +122,22 @@ pub fn suggested_destination(repository: &RepositoryConfig, mode: &CreateMode) -
     parent.join(sanitize_name(mode.label()))
 }
 
+pub fn pull_request_destination(
+    repository: &RepositoryConfig,
+    repository_root: &Path,
+    identity: &crate::model::CanonicalPullRequestId,
+    local_branch: &str,
+) -> PathBuf {
+    match repository.worktree_root.as_deref() {
+        Some(root) => root.join(sanitize_name(local_branch)),
+        None => repository_root.join(format!(
+            "{}-pr-{}",
+            sanitize_name(&identity.repository.repository),
+            identity.number
+        )),
+    }
+}
+
 pub fn create(
     runner: &dyn GitRunner,
     repository: &RepositoryConfig,
@@ -449,7 +465,7 @@ fn contains_path(worktree: &Path, candidate: &Path) -> bool {
 }
 
 fn validate_destination(worktrees: &[Worktree], destination: &Path) -> Result<(), OperationError> {
-    if destination.exists() {
+    if fs::symlink_metadata(destination).is_ok() {
         return Err(OperationError::DestinationExists(destination.to_owned()));
     }
     if worktrees
@@ -590,7 +606,7 @@ fn short_branch(worktree: &Worktree) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn sanitize_name(value: &str) -> String {
+pub fn sanitize_name(value: &str) -> String {
     let sanitized: String = value
         .chars()
         .map(|character| {
@@ -630,6 +646,59 @@ mod tests {
             ),
             PathBuf::from("/trees/feature-a-thing")
         );
+    }
+
+    #[test]
+    fn pull_request_destinations_follow_configured_and_default_rules() {
+        let identity = crate::model::CanonicalPullRequestId {
+            repository: crate::model::GitHubRepositoryIdentity::canonical(
+                "github.com",
+                "team",
+                "project",
+            ),
+            number: 42,
+        };
+        let mut repository = RepositoryConfig {
+            path: PathBuf::from("/repositories/project.git"),
+            label: None,
+            worktree_root: Some(PathBuf::from("/trees")),
+            github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
+        };
+        assert_eq!(
+            pull_request_destination(
+                &repository,
+                Path::new("/repositories"),
+                &identity,
+                "feature/a thing"
+            ),
+            PathBuf::from("/trees/feature-a-thing")
+        );
+        repository.worktree_root = None;
+        assert_eq!(
+            pull_request_destination(
+                &repository,
+                Path::new("/repositories"),
+                &identity,
+                "ignored"
+            ),
+            PathBuf::from("/repositories/project-pr-42")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_destination_is_occupied() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("worktree");
+        symlink("missing", &destination).unwrap();
+        assert!(matches!(
+            validate_destination(&[], &destination),
+            Err(OperationError::DestinationExists(path)) if path == destination
+        ));
     }
 
     #[test]
