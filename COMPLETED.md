@@ -110,3 +110,61 @@ Make Bash navigation and completion installable directly from the `wt` binary, w
 - Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `bash -n shell/wt.bash`.
 
 Complete when a user with only the installed `wt` binary can add `eval "$(wt shell-init bash)"` to `.bashrc` and receive the existing navigation wrapper and completion behavior.
+
+## Catalog settings and mutation locking for authored PRs
+
+Added backward-compatible `repository_root` and `github_hosts` catalog settings with a `~/src` runtime default, deterministic host unioning, strict leading home/environment expansion, canonical symlink-aware root creation, and actual writability validation. Added `wt config show` and `wt config set repository-root` with exact expression persistence, Bash passthrough, and completion. Added a stable advisory `<catalog>.lock` with cancellable retry, and changed every CLI/TUI catalog mutation to lock, reload, mutate, and atomically save so concurrent writers cannot lose updates. Added focused model, resolver, symlink, rejection, lock cancellation/serialization, stale-writer, persistence, output, and completion coverage.
+
+## Catalog settings and mutation locking for authored PRs
+
+Establish the configuration and concurrency foundation needed to discover and materialize authored pull requests safely.
+
+- Extend `Catalog` in `src/model.rs` and persistence in `src/config.rs` with backward-compatible optional data:
+  - `repository_root`, preserving the configured expression and defaulting at runtime to `~/src`.
+  - `github_hosts`, with a runtime view that is always unioned with `github.com` and can include hosts inferred from tracked remotes.
+  - Expand only a leading `~`, `$VAR`, or `${VAR}` at runtime—never shell syntax, command substitution, backticks, or globbing. Undefined variables are configuration errors. Require an absolute expanded path, allow canonicalized directory symlinks, canonicalize the longest existing prefix, create the root recursively on first use, and reject non-directories or unwritable targets.
+- Add `wt config set repository-root <expression>` and `wt config show` in `src/cli.rs`. Preserve the expression exactly in JSON while showing both configured and resolved values. Update completion and CLI tests.
+- Add an advisory sidecar lock at `<catalog-path>.lock`; do not lock `wt.json` itself because saves atomically replace its inode. Provide a cancellable retry API for later TUI progress. All existing CLI and TUI catalog mutations must acquire the sidecar lock and reload the catalog before saving so concurrent mutations cannot overwrite one another.
+- Add focused coverage for config expansion/rejection and symlinks, root validation/creation, lock serialization with atomic saves, exact CLI output/persistence, completion, and stale-writer prevention.
+
+### Implementation plan
+
+- Modify `Cargo.toml`/`Cargo.lock` to use a cross-platform advisory file-lock implementation.
+- Modify `src/model.rs` with optional serialized settings, runtime defaults, and deterministic host union helpers.
+- Modify `src/config.rs` with strict leading-expression expansion, longest-existing-prefix canonicalization, recursive root creation and writability checks, sidecar-path construction, and cancellable exclusive lock acquisition.
+- Modify `src/cli.rs` to add `config show` and `config set repository-root`, complete their command words, and acquire/reload under the lock for every CLI catalog mutation.
+- Modify `src/tui.rs` so repository registration, editing, and removal lock and reload before applying their mutation.
+- Extend `tests/repo_cli.rs`, unit tests, and Bash completion coverage for the new public behavior and concurrency invariants.
+
+Risks: catalog writers currently mutate an in-memory snapshot, so merely locking `save` would still lose updates; lock scope must include the reload and mutation. Root writability needs an actual create probe rather than permission-bit guesses so symlinks and platform ACLs behave correctly.
+
+## Post-Plan Execution Steps
+
+Execute these steps in order:
+
+### Implement
+Execute the plan above.
+
+**Naming gate:** before creating any file, identifier, run-id, or env var, ask "would this name
+make sense to someone who never read the plan?" If it encodes a sequence position (`Stage N` /
+`Phase N` / `stepN`), rename it now — cheap before a checkpoint or downstream reference pins it.
+
+### Verify
+
+1. Run the project's build/lint command. Fix all warnings.
+2. Run the project's test suite.
+3. If tests fail, fix them before proceeding.
+4. If test coverage for the new work is insufficient, add tests.
+
+### Commit
+
+Use Conventional Commits commit message style. If there are pre-existing modified files and they don't look harmful, go ahead and commit them, too.
+
+### Update PLAN.md
+
+Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" section — do not leave it in place with a [DONE] tag, strikethrough, or any other marker. The task and its related subsections should no longer appear in PLAN.md at all. PLAN.md should not have any sort of "Done" section. Then append a new entry to `COMPLETED.md` with two parts, in this order:
+
+1. A brief summary, written now, of what was actually implemented.
+2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
+
+If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
