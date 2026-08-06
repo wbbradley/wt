@@ -202,18 +202,20 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let pull_request = &app.virtual_repositories[*virtual_repository_index]
                     .pull_requests[*pull_request_index];
                 ListItem::new(Line::from(vec![
+                    Span::raw(" ".repeat(
+                        if mapped_repository_index.is_some() {
+                            4
+                        } else {
+                            6
+                        } + stack_depth * 2,
+                    )),
+                    Span::styled(
+                        &pull_request.pull_request.head.branch,
+                        Style::default().fg(Color::LightMagenta),
+                    ),
                     Span::raw(format!(
-                        "{}#{} {} — {} ",
-                        " ".repeat(
-                            if mapped_repository_index.is_some() {
-                                4
-                            } else {
-                                6
-                            } + stack_depth * 2
-                        ),
-                        pull_request.identity.number,
-                        pull_request.pull_request.head.branch,
-                        pull_request.pull_request.title
+                        " #{} — {} ",
+                        pull_request.identity.number, pull_request.pull_request.title
                     )),
                     Span::styled("[virtual]", Style::default().fg(Color::Magenta)),
                     Span::styled(
@@ -907,9 +909,19 @@ mod tests {
         app.selected = Some(RowId::VirtualPullRequest(pull_request_id));
         let mut terminal = Terminal::new(TestBackend::new(120, 50)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let content = buffer_text(terminal.backend().buffer());
+        let buffer = terminal.backend().buffer();
+        let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
-        assert!(content.contains("#42 topic — virtual feature [virtual] [failure]"));
+        assert!(content.contains("topic #42 — virtual feature [virtual] [failure]"));
+        assert_eq!(
+            buffer
+                .content()
+                .iter()
+                .filter(|cell| cell.fg == Color::LightMagenta)
+                .map(|cell| cell.symbol())
+                .collect::<String>(),
+            "topic"
+        );
         assert!(content.contains("[auto-merge]"));
         assert!(content.contains("viewer/fork:topic"));
         assert!(content.contains("head-sha"));
