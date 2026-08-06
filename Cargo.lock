@@ -1386,6 +1386,7 @@ dependencies = [
  "clap",
  "crossterm",
  "fs2",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

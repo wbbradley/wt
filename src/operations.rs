@@ -146,7 +146,7 @@ pub fn create(
     create_parents: bool,
 ) -> Result<(), OperationError> {
     validate_create(runner, repository, destination, mode, create_parents)?;
-    ensure_destination_parent(repository, destination, create_parents)?;
+    prepare_destination_parent(repository, destination, create_parents)?;
     match mode {
         CreateMode::ExistingBranch(branch) => {
             git::run_git(
@@ -237,7 +237,7 @@ pub fn move_worktree(
     create_parents: bool,
 ) -> Result<Worktree, OperationError> {
     let worktree = validate_move(runner, repository, selector, destination, create_parents)?;
-    ensure_destination_parent(repository, destination, create_parents)?;
+    prepare_destination_parent(repository, destination, create_parents)?;
     git::run_git(
         runner,
         &repository.path,
@@ -479,7 +479,7 @@ fn validate_destination(worktrees: &[Worktree], destination: &Path) -> Result<()
     Ok(())
 }
 
-fn ensure_destination_parent(
+pub fn prepare_destination_parent(
     repository: &RepositoryConfig,
     destination: &Path,
     create_parents: bool,
@@ -750,7 +750,7 @@ mod tests {
             github_preferred_remote: None,
         };
         let destination = root.join("team/topic");
-        ensure_destination_parent(&repository, &destination, false).unwrap();
+        prepare_destination_parent(&repository, &destination, false).unwrap();
         assert!(root.is_dir());
         assert!(destination.parent().unwrap().is_dir());
         assert!(!destination.exists());
