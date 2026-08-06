@@ -169,6 +169,63 @@ Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" sectio
 
 If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
 
+## Safe PR branch and linked-worktree materialization
+
+Added a dedicated PR materialization service that selects and tracks a matching real head remote or falls back to GitHub's base PR ref without adding fork remotes, validates fetched OIDs against refreshed metadata, and passes private-fetch credentials only through redacted environment state. Canonical branch markers and ancestry checks safely fast-forward unattached branches while preserving checked-out, ahead, diverged, and other-PR branches under deterministic disambiguated names. Worktrees now reuse exact same-PR checkouts or use the shared creation path at the single configured/default destination, treating broken symlinks and all other objects as occupied. Enter refreshes the ordinary local view and returns the exact canonical path through the shell-selection protocol. Added real-Git and controller coverage for tracking, fallback, race rejection, credential safety, branch preservation, markers, destination rules/collisions, reuse, and exact selection.
+
+## Safe PR branch and linked-worktree materialization
+
+- If a local remote represents the head repository, fetch and track the real head branch, including forks. Otherwise fetch GitHub's PR head ref into `pr/<number>-<sanitized-head-branch>` without permanently adding the fork remote.
+- Record canonical PR identity in branch-local Git config. Fast-forward an unattached intended branch only when safe; preserve ahead/diverged/other-PR branches and choose a disambiguated name. Never discard local commits or reset solely because of a PR marker.
+- Create through shared operation helpers: use `<worktree_root>/<sanitized-local-branch>` when configured, otherwise `<repository_root>/<repo>-pr-<number>`. Fail if the destination belongs to something else; never add numeric path suffixes.
+- Refresh success into an ordinary row and return its canonical path through the existing stdout/Bash `chdir` protocol.
+- Cover real versus synthetic branches, divergence preservation, PR markers, destination rules, and exact shell selection.
+
+### Implementation plan
+
+- Create `src/materialize.rs` with a PR materialization service that:
+  - selects a configured local remote matching the head repository and fetches its real branch, or fetches the base repository's `refs/pull/<number>/head` into a private ref without adding a fork remote;
+  - validates the fetched commit against the authoritatively refreshed head SHA;
+  - records the canonical base-repository PR identity in branch-local Git config and sets a real remote branch as upstream when applicable;
+  - creates or safely fast-forwards only an unattached branch whose prior tip is an ancestor, while preserving checked-out, ahead, diverged, and other-PR branches under deterministic disambiguated names;
+  - reuses an existing exact same-PR worktree, otherwise creates through `operations::create` at the single required destination and returns its canonical path.
+- Extend `src/operations.rs` with reusable public sanitization and PR-destination helpers, and treat every existing filesystem object including broken symlinks as an occupied destination.
+- Modify `src/tui.rs` so Enter saves any successful bootstrap registration before later stages, invokes materialization with the refreshed PR, refreshes the local repository view into an ordinary row, and exits with the created/reused canonical path for the stdout/Bash selection protocol.
+- Register the new module in `src/main.rs` and add real-repository tests for local fork-remote tracking, synthetic PR refs without remote creation, safe fast-forwarding, preservation/disambiguation for ahead/diverged/other-PR branches, canonical markers, exact configured/default destinations, collision refusal, worktree reuse, and controller-level exact selection.
+
+Risks: branch names may contain Git-valid punctuation that is unsafe in refspecs or config keys, so all generated names and ref arguments must remain separate argument-array values and synthetic names must use shared sanitization. A branch marker proves intent but never authorizes discarding commits. Fetches can race a newly pushed PR head, so a fetched OID mismatch must fail safely rather than creating a worktree at an unverified commit.
+
+## Post-Plan Execution Steps
+
+Execute these steps in order:
+
+### Implement
+Execute the plan above.
+
+**Naming gate:** before creating any file, identifier, run-id, or env var, ask "would this name
+make sense to someone who never read the plan?" If it encodes a sequence position (`Stage N` /
+`Phase N` / `stepN`), rename it now — cheap before a checkpoint or downstream reference pins it.
+
+### Verify
+
+1. Run the project's build/lint command. Fix all warnings.
+2. Run the project's test suite.
+3. If tests fail, fix them before proceeding.
+4. If test coverage for the new work is insufficient, add tests.
+
+### Commit
+
+Use Conventional Commits commit message style. If there are pre-existing modified files and they don't look harmful, go ahead and commit them, too.
+
+### Update PLAN.md
+
+Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" section — do not leave it in place with a [DONE] tag, strikethrough, or any other marker. The task and its related subsections should no longer appear in PLAN.md at all. PLAN.md should not have any sort of "Done" section. Then append a new entry to `COMPLETED.md` with two parts, in this order:
+
+1. A brief summary, written now, of what was actually implemented.
+2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
+
+If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
+
 ## Safe repository bootstrap for virtual PRs
 
 Added authoritative selected-PR refreshes that accept closed and merged PRs while updating the current head SHA and rejecting missing or inaccessible PRs. Added deterministic, collision-safe bare-repository bootstrap with existing-repository reuse, staged partial clones and filter fallback, SSH-first transport, noninteractive environment-only HTTPS credentials, token redaction, post-clone identity validation, and atomic installation. Catalog registration now preserves stale-entry metadata and preferred remotes, selects unique labels, and cleans only owned incomplete-clone artifacts. Added focused coverage for metadata refresh, collisions and broken symlinks, transport fallback and credential safety, cleanup, stale relinking, matching reuse, and label selection.
