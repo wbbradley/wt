@@ -34,6 +34,11 @@ enum Command {
         #[arg(value_enum)]
         shell: SupportedShell,
     },
+    /// Inspect or update global configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Manage the persistent repository catalog.
     Repo {
         #[command(subcommand)]
@@ -46,6 +51,23 @@ enum Command {
     },
     #[command(name = "__complete", hide = true)]
     Complete(CompletionArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Show configured expressions and their resolved runtime values.
+    Show,
+    /// Update one global setting.
+    Set {
+        #[command(subcommand)]
+        setting: ConfigSetting,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigSetting {
+    /// Set the root used to bootstrap repositories for virtual pull requests.
+    RepositoryRoot { expression: String },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -288,20 +310,63 @@ pub fn run(cli: Cli) -> Result<Option<PathBuf>, CliError> {
 }
 
 fn run_with(runner: &dyn GitRunner, catalog_path: &Path, cli: Cli) -> Result<(), CliError> {
-    let mut catalog = config::load(catalog_path)?;
     match cli.command.expect("checked by caller") {
         Command::ShellInit { .. } => unreachable!("handled before catalog loading"),
+        Command::Config { command } => match command {
+            ConfigCommand::Show => show_config(&config::load(catalog_path)?),
+            ConfigCommand::Set { setting } => {
+                let _lock = config::acquire_catalog_lock(catalog_path)?;
+                let mut catalog = config::load(catalog_path)?;
+                match setting {
+                    ConfigSetting::RepositoryRoot { expression } => {
+                        let resolved = config::resolve_repository_root(&expression)?;
+                        catalog.repository_root = Some(expression.clone());
+                        config::save(catalog_path, &catalog)?;
+                        println!(
+                            "repository-root\tconfigured={expression}\tresolved={}",
+                            resolved.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+        },
         Command::Repo { command } => match command {
-            RepoCommand::Add(arguments) => add(runner, catalog_path, &mut catalog, arguments),
-            RepoCommand::List => list(runner, &catalog),
-            RepoCommand::Edit(arguments) => edit(runner, catalog_path, &mut catalog, arguments),
+            RepoCommand::List => list(runner, &config::load(catalog_path)?),
+            RepoCommand::Add(arguments) => {
+                let _lock = config::acquire_catalog_lock(catalog_path)?;
+                let mut catalog = config::load(catalog_path)?;
+                add(runner, catalog_path, &mut catalog, arguments)
+            }
+            RepoCommand::Edit(arguments) => {
+                let _lock = config::acquire_catalog_lock(catalog_path)?;
+                let mut catalog = config::load(catalog_path)?;
+                edit(runner, catalog_path, &mut catalog, arguments)
+            }
             RepoCommand::Remove(arguments) => {
+                let _lock = config::acquire_catalog_lock(catalog_path)?;
+                let mut catalog = config::load(catalog_path)?;
                 remove(catalog_path, &mut catalog, &arguments.selector)
             }
         },
-        Command::Worktree { command } => worktree(runner, &catalog, command),
-        Command::Complete(arguments) => complete(runner, &catalog, &arguments.words),
+        Command::Worktree { command } => worktree(runner, &config::load(catalog_path)?, command),
+        Command::Complete(arguments) => {
+            complete(runner, &config::load(catalog_path)?, &arguments.words)
+        }
     }
+}
+
+fn show_config(catalog: &Catalog) -> Result<(), CliError> {
+    let resolved = config::repository_root(catalog)?;
+    println!(
+        "repository-root\tconfigured={}\tresolved={}",
+        catalog.repository_root_expression(),
+        resolved.display()
+    );
+    for host in catalog.effective_github_hosts(std::iter::empty()) {
+        println!("github-host\t{host}");
+    }
+    Ok(())
 }
 
 enum NavigationResolution {
@@ -374,6 +439,7 @@ fn completion_candidates(
     candidates.extend(["--help".to_owned(), "-h".to_owned()]);
     let first = words.first().map(String::as_str).unwrap_or("");
     match first {
+        "config" => complete_config(words, &mut candidates),
         "repo" => complete_repo(catalog, words, &mut candidates),
         "shell-init" => {
             candidates.insert("bash".to_owned());
@@ -382,7 +448,7 @@ fn completion_candidates(
         _ => {
             candidates.extend(["--version".to_owned(), "-V".to_owned()]);
             candidates.extend(
-                ["repo", "shell-init", "worktree"]
+                ["config", "repo", "shell-init", "worktree"]
                     .into_iter()
                     .map(str::to_owned),
             );
@@ -401,6 +467,20 @@ fn completion_candidates(
         .into_iter()
         .filter(|candidate| candidate.starts_with(current))
         .collect()
+}
+
+fn complete_config(words: &[String], candidates: &mut BTreeSet<String>) {
+    if words.len() <= 2 {
+        candidates.extend(["set", "show"].map(str::to_owned));
+    }
+    if words.get(1).map(String::as_str) == Some("set") && words.len() <= 3 {
+        candidates.insert("repository-root".to_owned());
+    }
+    if words.get(2).map(String::as_str) == Some("repository-root") {
+        candidates.extend(file_candidates(
+            words.last().map(String::as_str).unwrap_or(""),
+        ));
+    }
 }
 
 fn complete_repo(catalog: &Catalog, words: &[String], candidates: &mut BTreeSet<String>) {

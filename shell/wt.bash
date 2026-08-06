@@ -2,7 +2,7 @@
 
 wt() {
     case "${1-}" in
-        repo|shell-init|worktree|help|__complete|-h|--help|-V|--version)
+        config|repo|shell-init|worktree|help|__complete|-h|--help|-V|--version)
             command wt "$@"
             return $?
             ;;
