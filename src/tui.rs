@@ -1477,6 +1477,7 @@ mod tests {
                 state: PullRequestState::Open,
                 updated_at: "2026-08-06T00:00:00Z".to_owned(),
                 review_decision: None,
+                auto_merge: false,
                 base: PullRequestIdentity {
                     repository: Some("team/project".to_owned()),
                     branch: "main".to_owned(),

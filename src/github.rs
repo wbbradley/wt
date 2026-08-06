@@ -839,6 +839,7 @@ fn authored_pull_request_query() -> String {
         nodes {{
           ... on PullRequest {{
             number title url state isDraft mergedAt updatedAt reviewDecision
+            autoMergeRequest {{ enabledAt }}
             author {{ login }}
             baseRefName baseRefOid baseRepository {{ nameWithOwner }}
             headRefName headRefOid headRepository {{ nameWithOwner }}
@@ -856,6 +857,7 @@ fn pull_request_query() -> &'static str {
       repository(owner: $owner, name: $repository) {
         pullRequest(number: $number) {
           number title url state isDraft mergedAt updatedAt reviewDecision
+          autoMergeRequest { enabledAt }
           author { login }
           baseRefName baseRefOid baseRepository { nameWithOwner }
           headRefName headRefOid headRepository { nameWithOwner }
@@ -1181,6 +1183,7 @@ fn build_query(
                   associatedPullRequests(first: 20) {{
                     nodes {{
                       number title url state isDraft mergedAt updatedAt reviewDecision
+                      autoMergeRequest {{ enabledAt }}
                       baseRefName baseRefOid baseRepository {{ nameWithOwner }}
                       headRefName headRefOid headRepository {{ nameWithOwner }}
                       commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state }} }} }} }}
@@ -1340,6 +1343,9 @@ fn normalize_pull_request(node: &Value) -> Result<PullRequest, GitHubError> {
             .get("reviewDecision")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        auto_merge: node
+            .get("autoMergeRequest")
+            .is_some_and(|request| !request.is_null()),
         base: identity("base")?,
         head: identity("head")?,
         checks,
@@ -2073,6 +2079,7 @@ mod tests {
             state: PullRequestState::Open,
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             review_decision: None,
+            auto_merge: false,
             base: PullRequestIdentity {
                 repository: Some("Base/Project".to_owned()),
                 branch: "main".to_owned(),
@@ -2500,6 +2507,7 @@ mod tests {
             "mergedAt": null,
             "updatedAt": "2026-01-02T00:00:00Z",
             "reviewDecision": "CHANGES_REQUESTED",
+            "autoMergeRequest": {"enabledAt": "2026-01-02T01:00:00Z"},
             "baseRefName": "main",
             "baseRefOid": "baseoid",
             "baseRepository": {"nameWithOwner": "upstream/repo"},
@@ -2513,6 +2521,10 @@ mod tests {
         assert_eq!(draft.checks, CheckRollup::Failure);
         assert_eq!(draft.head.repository.as_deref(), Some("fork/repo"));
         assert_eq!(draft.base.repository.as_deref(), Some("upstream/repo"));
+        assert!(draft.auto_merge);
+
+        node["autoMergeRequest"] = Value::Null;
+        assert!(!normalize_pull_request(&node).unwrap().auto_merge);
 
         node["isDraft"] = Value::Bool(false);
         assert_eq!(
