@@ -119,6 +119,15 @@ impl AuthoredPullRequestState {
             .map(|pull_request| pull_request.identity)
             .collect()
     }
+
+    pub fn update(&mut self, pull_request: AuthoredPullRequest) {
+        let identity = pull_request.identity.clone();
+        if let Some(existing) = self.pending.get_mut(&identity) {
+            *existing = pull_request;
+        } else {
+            self.baseline.insert(identity, pull_request);
+        }
+    }
 }
 
 impl GitHubState {

@@ -2,6 +2,7 @@ use clap::Parser;
 
 mod app;
 mod background;
+mod bootstrap;
 mod cli;
 mod config;
 mod git;

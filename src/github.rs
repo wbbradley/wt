@@ -294,8 +294,16 @@ pub struct ResolvedToken {
 }
 
 impl ResolvedToken {
-    fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         &self.token.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(value: &str) -> Self {
+        Self {
+            token: SecretToken(value.to_owned()),
+            source: AuthSource::Environment,
+        }
     }
 }
 
@@ -364,6 +372,8 @@ pub enum GitHubError {
     LocalGit(String),
     #[error("branch {0:?} does not exist on its selected GitHub remote")]
     BranchNotFound(String),
+    #[error("pull request {repository}#{number} is gone or inaccessible")]
+    PullRequestUnavailable { repository: String, number: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -573,6 +583,104 @@ impl GitHubService {
         });
     }
 
+    pub fn fetch_pull_request_with(
+        &self,
+        credentials: &dyn CredentialProvider,
+        host: &AuthoredHost,
+        identity: &CanonicalPullRequestId,
+    ) -> Result<AuthoredPullRequest, GitHubError> {
+        if identity.repository.host != host.host {
+            return Err(GitHubError::Malformed(
+                "pull request host does not match request host".to_owned(),
+            ));
+        }
+        let token = resolve_token(credentials, &host.host, &host.credential_anchor)?;
+        if let Some(error) = self.suppressed_error(&host.host) {
+            return Err(error);
+        }
+        let mut variables = serde_json::Map::new();
+        variables.insert(
+            "owner".to_owned(),
+            Value::String(identity.repository.owner.clone()),
+        );
+        variables.insert(
+            "repository".to_owned(),
+            Value::String(identity.repository.repository.clone()),
+        );
+        variables.insert("number".to_owned(), Value::from(identity.number));
+        let body = GraphQlRequest {
+            query: pull_request_query().to_owned(),
+            variables,
+        };
+        let mut response = self
+            .agent
+            .post(&host.graphql_url)
+            .header("Authorization", &format!("Bearer {}", token.expose()))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "wt")
+            .send_json(&body)
+            .map_err(|error| GitHubError::Network(error.to_string()))?;
+        let status = response.status().as_u16();
+        let header_rate = rate_from_headers(response.headers());
+        let response_body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| GitHubError::Network(error.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(classify_http_error(
+                status,
+                &response_body,
+                header_rate.as_ref(),
+            ));
+        }
+        let envelope: GraphQlEnvelope = serde_json::from_str(&response_body)
+            .map_err(|error| GitHubError::Malformed(error.to_string()))?;
+        let warnings = deduplicate(envelope.errors.iter().map(|error| error.message.clone()));
+        let data = envelope
+            .data
+            .ok_or_else(|| classify_graphql_errors(&warnings))?;
+        if let Some(rate) = parse_graphql_rate(&data).or(header_rate)
+            && rate.remaining == 0
+        {
+            self.suppress(
+                &host.host,
+                &rate.reset_at,
+                header_reset_epoch(response.headers()),
+            );
+        }
+        let node = data.pointer("/repository/pullRequest").ok_or_else(|| {
+            GitHubError::PullRequestUnavailable {
+                repository: identity.repository.full_name(),
+                number: identity.number,
+            }
+        })?;
+        if node.is_null() {
+            return Err(GitHubError::PullRequestUnavailable {
+                repository: identity.repository.full_name(),
+                number: identity.number,
+            });
+        }
+        let author = node
+            .pointer("/author/login")
+            .and_then(Value::as_str)
+            .ok_or_else(|| GitHubError::Malformed("pull request author is missing".to_owned()))?;
+        let pull_request = normalize_pull_request(node)?;
+        let refreshed_identity =
+            canonical_pull_request_id(&host.host, &pull_request).ok_or_else(|| {
+                GitHubError::Malformed("pull request base repository is missing".to_owned())
+            })?;
+        if &refreshed_identity != identity {
+            return Err(GitHubError::Malformed(
+                "pull request canonical identity changed".to_owned(),
+            ));
+        }
+        Ok(AuthoredPullRequest {
+            identity: refreshed_identity,
+            author: author.to_owned(),
+            pull_request,
+        })
+    }
+
     fn fetch_authored_page(
         &self,
         host: &AuthoredHost,
@@ -741,6 +849,21 @@ fn authored_pull_request_query() -> String {
       rateLimit {{ remaining resetAt }}
     }}"#
     )
+}
+
+fn pull_request_query() -> &'static str {
+    r#"query($owner: String!, $repository: String!, $number: Int!) {
+      repository(owner: $owner, name: $repository) {
+        pullRequest(number: $number) {
+          number title url state isDraft mergedAt updatedAt reviewDecision
+          author { login }
+          baseRefName baseRefOid baseRepository { nameWithOwner }
+          headRefName headRefOid headRepository { nameWithOwner }
+          commits(last: 1) { nodes { commit { oid statusCheckRollup { state } } } }
+        }
+      }
+      rateLimit { remaining resetAt }
+    }"#
 }
 
 fn parse_authored_page(
@@ -1747,6 +1870,96 @@ mod tests {
                 error: None,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn selected_pull_request_refetch_accepts_merged_state_and_current_head_sha() {
+        let mut node = authored_node(42, "viewer", false);
+        node["state"] = Value::String("CLOSED".to_owned());
+        node["mergedAt"] = Value::String("2026-02-01T00:00:00Z".to_owned());
+        node["headRefOid"] = Value::String("current-head".to_owned());
+        let body = serde_json::json!({
+            "data": {
+                "repository": {"pullRequest": node},
+                "rateLimit": {"remaining": 100, "resetAt": "2026-07-30T12:00:00Z"}
+            }
+        })
+        .to_string();
+        let (base, requests, server) = fake_server(vec![FakeResponse {
+            status: "200 OK",
+            headers: Vec::new(),
+            body,
+        }]);
+        let mut credentials = FakeCredentials::default();
+        credentials
+            .environment
+            .insert("GITHUB_ENTERPRISE_TOKEN".to_owned(), "secret".to_owned());
+        let identity = CanonicalPullRequestId {
+            repository: identity("ghe.example", "base", "project"),
+            number: 42,
+        };
+        let refreshed = GitHubService::new()
+            .fetch_pull_request_with(
+                &credentials,
+                &AuthoredHost {
+                    host: "ghe.example".to_owned(),
+                    graphql_url: format!("{base}/api/graphql"),
+                    credential_anchor: PathBuf::from("/repo"),
+                },
+                &identity,
+            )
+            .unwrap();
+        let request = requests.recv().unwrap();
+        server.join().unwrap();
+        let request_body: Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(request_body["variables"]["owner"], "base");
+        assert_eq!(request_body["variables"]["repository"], "project");
+        assert_eq!(request_body["variables"]["number"], 42);
+        assert_eq!(refreshed.pull_request.state, PullRequestState::Merged);
+        assert_eq!(
+            refreshed.pull_request.head.oid.as_deref(),
+            Some("current-head")
+        );
+    }
+
+    #[test]
+    fn selected_pull_request_refetch_rejects_missing_repository_or_pr() {
+        let body = serde_json::json!({
+            "data": {
+                "repository": null,
+                "rateLimit": {"remaining": 100, "resetAt": "2026-07-30T12:00:00Z"}
+            }
+        })
+        .to_string();
+        let (base, requests, server) = fake_server(vec![FakeResponse {
+            status: "200 OK",
+            headers: Vec::new(),
+            body,
+        }]);
+        let mut credentials = FakeCredentials::default();
+        credentials
+            .environment
+            .insert("GITHUB_ENTERPRISE_TOKEN".to_owned(), "secret".to_owned());
+        let identity = CanonicalPullRequestId {
+            repository: identity("ghe.example", "base", "project"),
+            number: 42,
+        };
+        let result = GitHubService::new().fetch_pull_request_with(
+            &credentials,
+            &AuthoredHost {
+                host: "ghe.example".to_owned(),
+                graphql_url: format!("{base}/api/graphql"),
+                credential_anchor: PathBuf::from("/repo"),
+            },
+            &identity,
+        );
+        requests.recv().unwrap();
+        server.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(GitHubError::PullRequestUnavailable { number: 42, .. })
         ));
     }
 
