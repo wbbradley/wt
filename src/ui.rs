@@ -196,6 +196,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 virtual_repository_index,
                 pull_request_index,
                 mapped_repository_index,
+                stack_depth,
                 ..
             } => {
                 let pull_request = &app.virtual_repositories[*virtual_repository_index]
@@ -203,11 +204,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ListItem::new(Line::from(vec![
                     Span::raw(format!(
                         "{}#{} {} — {} ",
-                        if mapped_repository_index.is_some() {
-                            "    "
-                        } else {
-                            "      "
-                        },
+                        " ".repeat(
+                            if mapped_repository_index.is_some() {
+                                4
+                            } else {
+                                6
+                            } + stack_depth * 2
+                        ),
                         pull_request.identity.number,
                         pull_request.pull_request.head.branch,
                         pull_request.pull_request.title
