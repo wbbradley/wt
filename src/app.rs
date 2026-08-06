@@ -1,11 +1,12 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::github::{GitHubError, PullRequestMapping};
 use crate::model::{
-    CanonicalPullRequestId, GitHubBranchData, RepositoryConfig, Worktree, WorktreeStatus,
+    AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, RepositoryConfig, Worktree,
+    WorktreeStatus,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -31,6 +32,81 @@ pub enum GitHubState {
         previous: Option<GitHubBranchData>,
         error: String,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AuthoredPullRequestState {
+    baseline: BTreeMap<CanonicalPullRequestId, AuthoredPullRequest>,
+    pending: BTreeMap<CanonicalPullRequestId, AuthoredPullRequest>,
+    pub generation: u64,
+    pub loading: bool,
+    pub warnings: Vec<String>,
+    pub stale_error: Option<String>,
+}
+
+impl AuthoredPullRequestState {
+    pub fn begin(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending.clear();
+        self.loading = true;
+        self.warnings.clear();
+        self.stale_error = None;
+        self.generation
+    }
+
+    pub fn apply_page(
+        &mut self,
+        generation: u64,
+        pull_requests: Vec<AuthoredPullRequest>,
+        warnings: Vec<String>,
+    ) -> bool {
+        if generation != self.generation || !self.loading {
+            return false;
+        }
+        for pull_request in pull_requests {
+            self.pending
+                .insert(pull_request.identity.clone(), pull_request);
+        }
+        self.warnings.extend(warnings);
+        true
+    }
+
+    pub fn finish(
+        &mut self,
+        generation: u64,
+        complete: bool,
+        warnings: Vec<String>,
+        error: Option<String>,
+    ) -> bool {
+        if generation != self.generation || !self.loading {
+            return false;
+        }
+        self.loading = false;
+        self.warnings = warnings;
+        if complete {
+            self.baseline = std::mem::take(&mut self.pending);
+            self.stale_error = None;
+        } else {
+            self.pending.clear();
+            self.stale_error = error;
+        }
+        true
+    }
+
+    pub fn visible(&self) -> Vec<AuthoredPullRequest> {
+        let mut visible = self.baseline.clone();
+        if self.loading {
+            visible.extend(self.pending.clone());
+        }
+        visible.into_values().collect()
+    }
+
+    pub fn identities(&self) -> Vec<CanonicalPullRequestId> {
+        self.visible()
+            .into_iter()
+            .map(|pull_request| pull_request.identity)
+            .collect()
+    }
 }
 
 impl GitHubState {
@@ -210,7 +286,8 @@ pub struct App {
     pub github_generation: u64,
     pub github_loading: bool,
     pub github_hosts: BTreeSet<String>,
-    pub authored_pull_requests: Vec<CanonicalPullRequestId>,
+    pub authored_pull_requests: AuthoredPullRequestState,
+    pub active_pull_requests: HashSet<CanonicalPullRequestId>,
     pub authored_mappings: Vec<PullRequestMapping>,
     pub current_directory: PathBuf,
     pub generation: u64,
@@ -238,7 +315,8 @@ impl App {
             github_generation: 0,
             github_loading: false,
             github_hosts: BTreeSet::new(),
-            authored_pull_requests: Vec::new(),
+            authored_pull_requests: AuthoredPullRequestState::default(),
+            active_pull_requests: HashSet::new(),
             authored_mappings: Vec::new(),
             current_directory,
             generation: 0,
@@ -1263,5 +1341,66 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Intent::Cancel
         );
+    }
+
+    #[test]
+    fn authored_snapshot_overlays_pages_then_commits_or_reverts_atomically() {
+        let authored = |number: u64| {
+            let repository =
+                crate::model::GitHubRepositoryIdentity::canonical("github.com", "base", "project");
+            AuthoredPullRequest {
+                identity: CanonicalPullRequestId { repository, number },
+                author: "viewer".to_owned(),
+                pull_request: crate::model::PullRequest {
+                    number,
+                    title: format!("change {number}"),
+                    url: format!("https://example/pull/{number}"),
+                    state: crate::model::PullRequestState::Open,
+                    updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                    review_decision: None,
+                    base: crate::model::PullRequestIdentity {
+                        repository: Some("base/project".to_owned()),
+                        branch: "main".to_owned(),
+                        oid: None,
+                    },
+                    head: crate::model::PullRequestIdentity {
+                        repository: Some("fork/project".to_owned()),
+                        branch: "topic".to_owned(),
+                        oid: Some("head".to_owned()),
+                    },
+                    checks: crate::model::CheckRollup::Pending,
+                },
+            }
+        };
+        let mut state = AuthoredPullRequestState::default();
+        let first = state.begin();
+        assert!(state.apply_page(first, vec![authored(1)], Vec::new()));
+        assert!(state.finish(first, true, Vec::new(), None));
+        assert_eq!(state.identities()[0].number, 1);
+
+        let failed = state.begin();
+        assert!(state.apply_page(failed, vec![authored(2)], vec!["page warning".to_owned()]));
+        assert_eq!(
+            state
+                .identities()
+                .into_iter()
+                .map(|identity| identity.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(!state.apply_page(first, vec![authored(3)], Vec::new()));
+        assert!(state.finish(
+            failed,
+            false,
+            Vec::new(),
+            Some("later page failed".to_owned())
+        ));
+        assert_eq!(state.identities()[0].number, 1);
+        assert_eq!(state.stale_error.as_deref(), Some("later page failed"));
+
+        let replacement = state.begin();
+        state.apply_page(replacement, vec![authored(2)], Vec::new());
+        state.finish(replacement, true, Vec::new(), None);
+        assert_eq!(state.identities()[0].number, 2);
     }
 }

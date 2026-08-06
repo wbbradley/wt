@@ -12,11 +12,14 @@ use thiserror::Error;
 
 use crate::git::{GitRunner, SystemGit};
 use crate::model::{
-    CanonicalPullRequestId, Catalog, CheckRollup, GitHubBranchData, GitHubRepositoryIdentity,
-    PullRequest, PullRequestIdentity, PullRequestState, RateLimit, RepositoryConfig, Worktree,
+    AuthoredPullRequest, CanonicalPullRequestId, Catalog, CheckRollup, GitHubBranchData,
+    GitHubRepositoryIdentity, PullRequest, PullRequestIdentity, PullRequestState, RateLimit,
+    RepositoryConfig, Worktree,
 };
 
 pub const MAX_BRANCHES_PER_BATCH: usize = 20;
+pub const AUTHORED_PULL_REQUESTS_PER_PAGE: usize = 100;
+pub const MAX_AUTHORED_PULL_REQUEST_PAGES: usize = 10;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum WebScheme {
@@ -70,6 +73,43 @@ pub struct RemoteIdentityRefresh {
 pub struct PullRequestMapping {
     pub identity: CanonicalPullRequestId,
     pub repository_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthoredHost {
+    pub host: String,
+    pub graphql_url: String,
+    pub credential_anchor: PathBuf,
+}
+
+impl AuthoredHost {
+    pub fn inferred(host: &str, credential_anchor: PathBuf) -> Self {
+        let graphql_url = if host == "github.com" {
+            "https://api.github.com/graphql".to_owned()
+        } else {
+            format!("https://{host}/api/graphql")
+        };
+        Self {
+            host: host.to_owned(),
+            graphql_url,
+            credential_anchor,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum AuthoredRefreshEvent {
+    Page {
+        host: String,
+        page: usize,
+        pull_requests: Vec<AuthoredPullRequest>,
+        warnings: Vec<String>,
+    },
+    Finished {
+        complete: bool,
+        warnings: Vec<String>,
+        error: Option<String>,
+    },
 }
 
 pub fn refresh_catalog_remote_identities(
@@ -458,6 +498,141 @@ impl GitHubService {
         refresh
     }
 
+    pub fn fetch_authored_with(
+        &self,
+        credentials: &dyn CredentialProvider,
+        hosts: &[AuthoredHost],
+        mut publish: impl FnMut(AuthoredRefreshEvent),
+    ) {
+        let mut complete = true;
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        for host in hosts {
+            let token = match resolve_token(credentials, &host.host, &host.credential_anchor) {
+                Ok(token) => token,
+                Err(error) => {
+                    complete = false;
+                    errors.push(format!("{}: {error}", host.host));
+                    continue;
+                }
+            };
+            if let Some(error) = self.suppressed_error(&host.host) {
+                complete = false;
+                errors.push(format!("{}: {error}", host.host));
+                continue;
+            }
+            let mut cursor = None;
+            for page in 1..=MAX_AUTHORED_PULL_REQUEST_PAGES {
+                match self.fetch_authored_page(host, &token, cursor.as_deref()) {
+                    Ok(result) => {
+                        warnings.extend(result.warnings.clone());
+                        publish(AuthoredRefreshEvent::Page {
+                            host: host.host.clone(),
+                            page,
+                            pull_requests: result.pull_requests,
+                            warnings: result.warnings,
+                        });
+                        if !result.has_next_page {
+                            break;
+                        }
+                        if page == MAX_AUTHORED_PULL_REQUEST_PAGES {
+                            let message = format!(
+                                "{}: authored pull request search was truncated at 1,000 results",
+                                host.host
+                            );
+                            warnings.push(message.clone());
+                            errors.push(message);
+                            complete = false;
+                            break;
+                        }
+                        let Some(next_cursor) = result.end_cursor else {
+                            complete = false;
+                            errors.push(format!(
+                                "{}: authored pull request page lacks a cursor",
+                                host.host
+                            ));
+                            break;
+                        };
+                        cursor = Some(next_cursor);
+                    }
+                    Err(error) => {
+                        if let GitHubError::RateLimited { reset_at } = &error {
+                            self.suppress(&host.host, reset_at, None);
+                        }
+                        complete = false;
+                        errors.push(format!("{} page {page}: {error}", host.host));
+                        break;
+                    }
+                }
+            }
+        }
+        publish(AuthoredRefreshEvent::Finished {
+            complete,
+            warnings: deduplicate(warnings),
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
+        });
+    }
+
+    fn fetch_authored_page(
+        &self,
+        host: &AuthoredHost,
+        token: &ResolvedToken,
+        cursor: Option<&str>,
+    ) -> Result<AuthoredPage, GitHubError> {
+        let mut variables = serde_json::Map::new();
+        variables.insert(
+            "query".to_owned(),
+            Value::String("is:pr is:open author:@me".to_owned()),
+        );
+        variables.insert(
+            "cursor".to_owned(),
+            cursor.map_or(Value::Null, |cursor| Value::String(cursor.to_owned())),
+        );
+        let body = GraphQlRequest {
+            query: authored_pull_request_query(),
+            variables,
+        };
+        let mut response = self
+            .agent
+            .post(&host.graphql_url)
+            .header("Authorization", &format!("Bearer {}", token.expose()))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "wt")
+            .send_json(&body)
+            .map_err(|error| GitHubError::Network(error.to_string()))?;
+        let status = response.status().as_u16();
+        let header_rate = rate_from_headers(response.headers());
+        let response_body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| GitHubError::Network(error.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(classify_http_error(
+                status,
+                &response_body,
+                header_rate.as_ref(),
+            ));
+        }
+        let envelope: GraphQlEnvelope = serde_json::from_str(&response_body)
+            .map_err(|error| GitHubError::Malformed(error.to_string()))?;
+        let response_warnings =
+            deduplicate(envelope.errors.iter().map(|error| error.message.clone()));
+        let data = envelope
+            .data
+            .ok_or_else(|| classify_graphql_errors(&response_warnings))?;
+        let rate = parse_graphql_rate(&data).or(header_rate);
+        if let Some(rate) = &rate
+            && rate.remaining == 0
+        {
+            self.suppress(
+                &host.host,
+                &rate.reset_at,
+                header_reset_epoch(response.headers()),
+            );
+        }
+        parse_authored_page(&host.host, &data, response_warnings)
+    }
+
     fn fetch_batch(
         &self,
         remote: &RemoteRepository,
@@ -537,6 +712,97 @@ impl GitHubService {
                 },
             );
     }
+}
+
+struct AuthoredPage {
+    pull_requests: Vec<AuthoredPullRequest>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+    warnings: Vec<String>,
+}
+
+fn authored_pull_request_query() -> String {
+    format!(
+        r#"query($query: String!, $cursor: String) {{
+      viewer {{ login }}
+      search(query: $query, type: ISSUE, first: {AUTHORED_PULL_REQUESTS_PER_PAGE}, after: $cursor) {{
+        issueCount
+        pageInfo {{ hasNextPage endCursor }}
+        nodes {{
+          ... on PullRequest {{
+            number title url state isDraft mergedAt updatedAt reviewDecision
+            author {{ login }}
+            baseRefName baseRefOid baseRepository {{ nameWithOwner }}
+            headRefName headRefOid headRepository {{ nameWithOwner }}
+            commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state }} }} }} }}
+          }}
+        }}
+      }}
+      rateLimit {{ remaining resetAt }}
+    }}"#
+    )
+}
+
+fn parse_authored_page(
+    host: &str,
+    data: &Value,
+    mut warnings: Vec<String>,
+) -> Result<AuthoredPage, GitHubError> {
+    let viewer = data
+        .pointer("/viewer/login")
+        .and_then(Value::as_str)
+        .ok_or_else(|| GitHubError::Malformed("viewer login is missing".to_owned()))?;
+    let search = data
+        .get("search")
+        .ok_or_else(|| GitHubError::Malformed("authored search data is missing".to_owned()))?;
+    let nodes = search
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| GitHubError::Malformed("authored search nodes are missing".to_owned()))?;
+    let mut pull_requests = Vec::new();
+    for node in nodes {
+        let author = node
+            .pointer("/author/login")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !author.eq_ignore_ascii_case(viewer) {
+            warnings.push(format!(
+                "{host}: ignored search result not authored by viewer {viewer}"
+            ));
+            continue;
+        }
+        match normalize_pull_request(node) {
+            Ok(pull_request) => {
+                let Some(identity) = canonical_pull_request_id(host, &pull_request) else {
+                    warnings.push(format!(
+                        "{host}: ignored pull request {} without a base repository",
+                        pull_request.number
+                    ));
+                    continue;
+                };
+                pull_requests.push(AuthoredPullRequest {
+                    identity,
+                    author: author.to_owned(),
+                    pull_request,
+                });
+            }
+            Err(error) => warnings.push(error.to_string()),
+        }
+    }
+    let has_next_page = search
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| GitHubError::Malformed("authored pageInfo is missing".to_owned()))?;
+    let end_cursor = search
+        .pointer("/pageInfo/endCursor")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(AuthoredPage {
+        pull_requests,
+        has_next_page,
+        end_cursor,
+        warnings: deduplicate(warnings),
+    })
 }
 
 fn canonical_associated_pull_requests(
@@ -1291,6 +1557,45 @@ mod tests {
         .to_string()
     }
 
+    fn authored_node(number: u64, author: &str, draft: bool) -> Value {
+        serde_json::json!({
+            "number": number,
+            "title": format!("change {number}"),
+            "url": format!("https://example/pull/{number}"),
+            "state": "OPEN",
+            "isDraft": draft,
+            "mergedAt": null,
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "reviewDecision": null,
+            "author": {"login": author},
+            "baseRefName": "main",
+            "baseRefOid": "baseoid",
+            "baseRepository": {"nameWithOwner": "base/project"},
+            "headRefName": "topic",
+            "headRefOid": "headoid",
+            "headRepository": {"nameWithOwner": "fork/project"},
+            "commits": {"nodes": []}
+        })
+    }
+
+    fn authored_body(nodes: Vec<Value>, has_next_page: bool, cursor: Option<&str>) -> String {
+        serde_json::json!({
+            "data": {
+                "viewer": {"login": "viewer"},
+                "search": {
+                    "issueCount": 1,
+                    "pageInfo": {
+                        "hasNextPage": has_next_page,
+                        "endCursor": cursor
+                    },
+                    "nodes": nodes
+                },
+                "rateLimit": {"remaining": 4999, "resetAt": "2026-07-30T12:00:00Z"}
+            }
+        })
+        .to_string()
+    }
+
     fn input(branches: usize) -> RepositoryGitHubInput {
         RepositoryGitHubInput {
             repository: RepositoryConfig {
@@ -1377,6 +1682,152 @@ mod tests {
             repository.github_preferred_remote.as_deref(),
             Some("upstream")
         );
+    }
+
+    #[test]
+    fn authored_search_paginates_and_filters_to_the_exact_viewer() {
+        let (base, requests, server) = fake_server(vec![
+            FakeResponse {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: authored_body(
+                    vec![
+                        authored_node(1, "viewer", true),
+                        authored_node(2, "someone-else", false),
+                    ],
+                    true,
+                    Some("cursor-1"),
+                ),
+            },
+            FakeResponse {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: authored_body(vec![authored_node(3, "VIEWER", false)], false, None),
+            },
+        ]);
+        let mut credentials = FakeCredentials::default();
+        credentials
+            .environment
+            .insert("GITHUB_ENTERPRISE_TOKEN".to_owned(), "secret".to_owned());
+        let host = AuthoredHost {
+            host: "ghe.example".to_owned(),
+            graphql_url: format!("{base}/api/graphql"),
+            credential_anchor: PathBuf::from("/repo"),
+        };
+        let mut events = Vec::new();
+        GitHubService::new().fetch_authored_with(&credentials, &[host], |event| events.push(event));
+        let first_request = requests.recv().unwrap();
+        let second_request = requests.recv().unwrap();
+        server.join().unwrap();
+        let request_body = |request: &str| -> Value {
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+        };
+        let first = request_body(&first_request);
+        assert_eq!(first["variables"]["query"], "is:pr is:open author:@me");
+        assert!(first["variables"]["cursor"].is_null());
+        assert!(!first["query"].as_str().unwrap().contains("author:viewer"));
+        let second = request_body(&second_request);
+        assert_eq!(second["variables"]["cursor"], "cursor-1");
+
+        let pages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AuthoredRefreshEvent::Page { pull_requests, .. } => Some(pull_requests),
+                AuthoredRefreshEvent::Finished { .. } => None,
+            })
+            .collect();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].len(), 1);
+        assert_eq!(pages[0][0].pull_request.state, PullRequestState::Draft);
+        assert_eq!(pages[1][0].identity.number, 3);
+        assert!(matches!(
+            events.last(),
+            Some(AuthoredRefreshEvent::Finished {
+                complete: true,
+                error: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn authored_search_reports_later_page_failure_after_publishing_prior_pages() {
+        let (base, requests, server) = fake_server(vec![
+            FakeResponse {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: authored_body(vec![authored_node(1, "viewer", false)], true, Some("next")),
+            },
+            FakeResponse {
+                status: "500 Internal Server Error",
+                headers: Vec::new(),
+                body: r#"{"message":"temporary failure"}"#.to_owned(),
+            },
+        ]);
+        let mut credentials = FakeCredentials::default();
+        credentials
+            .environment
+            .insert("GITHUB_ENTERPRISE_TOKEN".to_owned(), "secret".to_owned());
+        let mut events = Vec::new();
+        GitHubService::new().fetch_authored_with(
+            &credentials,
+            &[AuthoredHost {
+                host: "ghe.example".to_owned(),
+                graphql_url: format!("{base}/api/graphql"),
+                credential_anchor: PathBuf::from("/repo"),
+            }],
+            |event| events.push(event),
+        );
+        requests.recv().unwrap();
+        requests.recv().unwrap();
+        server.join().unwrap();
+        assert!(matches!(events[0], AuthoredRefreshEvent::Page { .. }));
+        assert!(matches!(
+            events.last(),
+            Some(AuthoredRefreshEvent::Finished {
+                complete: false,
+                error: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn authored_search_warns_when_the_thousand_result_ceiling_truncates() {
+        let responses = (0..MAX_AUTHORED_PULL_REQUEST_PAGES)
+            .map(|page| FakeResponse {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: authored_body(Vec::new(), true, Some(&format!("cursor-{page}"))),
+            })
+            .collect();
+        let (base, requests, server) = fake_server(responses);
+        let mut credentials = FakeCredentials::default();
+        credentials
+            .environment
+            .insert("GITHUB_ENTERPRISE_TOKEN".to_owned(), "secret".to_owned());
+        let mut events = Vec::new();
+        GitHubService::new().fetch_authored_with(
+            &credentials,
+            &[AuthoredHost {
+                host: "ghe.example".to_owned(),
+                graphql_url: format!("{base}/api/graphql"),
+                credential_anchor: PathBuf::from("/repo"),
+            }],
+            |event| events.push(event),
+        );
+        for _ in 0..MAX_AUTHORED_PULL_REQUEST_PAGES {
+            requests.recv().unwrap();
+        }
+        server.join().unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(AuthoredRefreshEvent::Finished {
+                complete: false,
+                warnings,
+                ..
+            }) if warnings.iter().any(|warning| warning.contains("truncated at 1,000"))
+        ));
     }
 
     #[test]

@@ -119,6 +119,13 @@ pub struct CanonicalPullRequestId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthoredPullRequest {
+    pub identity: CanonicalPullRequestId,
+    pub author: String,
+    pub pull_request: PullRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryIdentity {
     pub anchor: PathBuf,
     pub common_git_dir: PathBuf,

@@ -12,7 +12,10 @@ use crate::app::{Action, App, FormField, Intent, RepositoryView};
 use crate::background::{StatusPool, StatusTask};
 use crate::config;
 use crate::git::{self, SystemGit};
-use crate::github::{GitHubRefresh, GitHubService, RepositoryGitHubInput};
+use crate::github::{
+    AuthoredHost, AuthoredRefreshEvent, GitHubRefresh, GitHubService, RepositoryGitHubInput,
+    SystemCredentials,
+};
 use crate::model::{Catalog, RepositoryConfig, Worktree};
 use crate::operations::{self, CreateMode};
 use crate::terminal::{InteractiveTerminal, PanicHookGuard};
@@ -21,12 +24,18 @@ use crate::ui;
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const MIN_GITHUB_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-struct GitHubMessage {
-    generation: u64,
-    paths: Vec<PathBuf>,
-    refresh: GitHubRefresh,
-    cache_updates: Vec<RepositoryConfig>,
-    warnings: Vec<String>,
+enum GitHubMessage {
+    Branches {
+        generation: u64,
+        paths: Vec<PathBuf>,
+        refresh: GitHubRefresh,
+        cache_updates: Vec<RepositoryConfig>,
+        warnings: Vec<String>,
+    },
+    Authored {
+        generation: u64,
+        event: AuthoredRefreshEvent,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -215,6 +224,7 @@ struct Controller {
     github_refresh_queued: bool,
     github_refresh_interval: Duration,
     next_github_refresh: Instant,
+    discover_authored_pull_requests: bool,
     pending_action: Option<PendingAction>,
 }
 
@@ -238,6 +248,7 @@ impl Controller {
             github_refresh_queued: false,
             github_refresh_interval,
             next_github_refresh: Instant::now(),
+            discover_authored_pull_requests: true,
             pending_action: None,
         }
     }
@@ -783,32 +794,33 @@ impl Controller {
             .map(|worktree| worktree.path.clone())
             .collect();
         let generation = self.app.begin_github_refresh(&paths);
+        let authored_generation = self.app.authored_pull_requests.begin();
         self.next_github_refresh = Instant::now() + self.github_refresh_interval;
-        if inputs.is_empty() {
-            return;
-        }
 
         self.github_in_flight = true;
         let service = self.github_service.clone();
         let sender = self.github_sender.clone();
         let catalog_path = self.catalog_path.clone();
+        let fallback_catalog = self.catalog.clone();
+        let discover_authored_pull_requests = self.discover_authored_pull_requests;
         std::thread::spawn(move || {
             let mut inputs = inputs;
             let mut cache_updates = Vec::new();
             let mut warnings = Vec::new();
-            match config::acquire_catalog_lock(&catalog_path).and_then(|_lock| {
+            let catalog = match config::acquire_catalog_lock(&catalog_path).and_then(|_lock| {
                 let mut catalog = config::load(&catalog_path)?;
                 let refresh =
                     crate::github::refresh_catalog_remote_identities(&SystemGit, &mut catalog);
                 if refresh.changed {
                     config::save(&catalog_path, &catalog)?;
                 }
-                Ok((catalog.repositories, refresh.warnings))
+                Ok((catalog, refresh.warnings))
             }) {
-                Ok((repositories, refresh_warnings)) => {
+                Ok((catalog, refresh_warnings)) => {
                     warnings.extend(refresh_warnings);
                     for input in &mut inputs {
-                        if let Some(repository) = repositories
+                        if let Some(repository) = catalog
+                            .repositories
                             .iter()
                             .find(|repository| repository.path == input.repository.path)
                         {
@@ -822,20 +834,62 @@ impl Controller {
                             warnings.extend(refresh.warnings);
                         }
                     }
-                    cache_updates = repositories;
+                    cache_updates = catalog.repositories.clone();
+                    catalog
                 }
-                Err(error) => warnings.push(format!(
-                    "unable to persist GitHub remote identities: {error}"
-                )),
-            }
+                Err(error) => {
+                    warnings.push(format!(
+                        "unable to persist GitHub remote identities: {error}"
+                    ));
+                    fallback_catalog
+                }
+            };
             let refresh = service.fetch_catalog(&inputs);
-            let _ = sender.send(GitHubMessage {
+            let _ = sender.send(GitHubMessage::Branches {
                 generation,
                 paths,
                 refresh,
                 cache_updates,
                 warnings,
             });
+            let fallback_anchor = catalog_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_owned();
+            let hosts: Vec<AuthoredHost> = crate::github::inferred_github_hosts(&catalog)
+                .into_iter()
+                .map(|host| {
+                    let anchor = catalog
+                        .repositories
+                        .iter()
+                        .find(|repository| {
+                            repository
+                                .github_remotes
+                                .values()
+                                .any(|identity| identity.host == host)
+                        })
+                        .map(|repository| repository.path.clone())
+                        .unwrap_or_else(|| fallback_anchor.clone());
+                    AuthoredHost::inferred(&host, anchor)
+                })
+                .collect();
+            if discover_authored_pull_requests {
+                service.fetch_authored_with(&SystemCredentials, &hosts, |event| {
+                    let _ = sender.send(GitHubMessage::Authored {
+                        generation: authored_generation,
+                        event,
+                    });
+                });
+            } else {
+                let _ = sender.send(GitHubMessage::Authored {
+                    generation: authored_generation,
+                    event: AuthoredRefreshEvent::Finished {
+                        complete: true,
+                        warnings: Vec::new(),
+                        error: None,
+                    },
+                });
+            }
         });
     }
 
@@ -852,48 +906,87 @@ impl Controller {
             changed = true;
         }
         while let Ok(message) = self.github_receiver.try_recv() {
-            self.github_in_flight = false;
-            for update in message.cache_updates {
-                if let Some(repository) = self
-                    .catalog
-                    .repositories
-                    .iter_mut()
-                    .find(|repository| repository.path == update.path)
-                {
-                    repository.github_remotes = update.github_remotes.clone();
-                    repository.github_preferred_remote = update.github_preferred_remote.clone();
+            match message {
+                GitHubMessage::Branches {
+                    generation,
+                    paths,
+                    refresh,
+                    cache_updates,
+                    warnings,
+                } => {
+                    for update in cache_updates {
+                        if let Some(repository) = self
+                            .catalog
+                            .repositories
+                            .iter_mut()
+                            .find(|repository| repository.path == update.path)
+                        {
+                            repository.github_remotes = update.github_remotes.clone();
+                            repository.github_preferred_remote =
+                                update.github_preferred_remote.clone();
+                        }
+                        if let Some(repository) = self
+                            .app
+                            .repositories
+                            .iter_mut()
+                            .find(|repository| repository.config.path == update.path)
+                        {
+                            repository.config.github_remotes = update.github_remotes;
+                            repository.config.github_preferred_remote =
+                                update.github_preferred_remote;
+                        }
+                    }
+                    if !warnings.is_empty() {
+                        self.app.inline_error =
+                            Some(format!("GitHub remote warning: {}", warnings.join("; ")));
+                        changed = true;
+                    }
+                    self.app.github_hosts = crate::github::inferred_github_hosts(&self.catalog);
+                    self.app.active_pull_requests = refresh.active_pull_requests;
+                    self.app.authored_mappings = crate::github::map_pull_request_identities(
+                        &self.catalog,
+                        self.app.authored_pull_requests.identities(),
+                        &self.app.active_pull_requests,
+                        |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
+                    );
+                    changed |= self
+                        .app
+                        .apply_github_refresh(generation, &paths, refresh.branches);
                 }
-                if let Some(repository) = self
-                    .app
-                    .repositories
-                    .iter_mut()
-                    .find(|repository| repository.config.path == update.path)
-                {
-                    repository.config.github_remotes = update.github_remotes;
-                    repository.config.github_preferred_remote = update.github_preferred_remote;
-                }
-            }
-            if !message.warnings.is_empty() {
-                self.app.inline_error = Some(format!(
-                    "GitHub remote warning: {}",
-                    message.warnings.join("; ")
-                ));
-                changed = true;
-            }
-            self.app.github_hosts = crate::github::inferred_github_hosts(&self.catalog);
-            self.app.authored_mappings = crate::github::map_pull_request_identities(
-                &self.catalog,
-                self.app.authored_pull_requests.clone(),
-                &message.refresh.active_pull_requests,
-                |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
-            );
-            changed |= self.app.apply_github_refresh(
-                message.generation,
-                &message.paths,
-                message.refresh.branches,
-            );
-            if std::mem::take(&mut self.github_refresh_queued) {
-                self.request_github_refresh();
+                GitHubMessage::Authored { generation, event } => match event {
+                    AuthoredRefreshEvent::Page {
+                        host,
+                        page,
+                        pull_requests,
+                        warnings,
+                    } => {
+                        changed |= self.app.authored_pull_requests.apply_page(
+                            generation,
+                            pull_requests,
+                            warnings,
+                        );
+                        self.app.progress = Some(format!(
+                            "loading authored pull requests: {host} page {page}"
+                        ));
+                        self.refresh_authored_mappings();
+                    }
+                    AuthoredRefreshEvent::Finished {
+                        complete,
+                        warnings,
+                        error,
+                    } => {
+                        changed |= self
+                            .app
+                            .authored_pull_requests
+                            .finish(generation, complete, warnings, error);
+                        self.refresh_authored_mappings();
+                        self.github_in_flight = false;
+                        self.app.progress = None;
+                        if std::mem::take(&mut self.github_refresh_queued) {
+                            self.request_github_refresh();
+                        }
+                    }
+                },
             }
         }
         if !self.github_in_flight && Instant::now() >= self.next_github_refresh {
@@ -901,6 +994,15 @@ impl Controller {
             changed |= self.app.github_loading;
         }
         changed
+    }
+
+    fn refresh_authored_mappings(&mut self) {
+        self.app.authored_mappings = crate::github::map_pull_request_identities(
+            &self.catalog,
+            self.app.authored_pull_requests.identities(),
+            &self.app.active_pull_requests,
+            |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
+        );
     }
 }
 
@@ -1136,6 +1238,7 @@ mod tests {
         let views = load_repository_views(&catalog, directory.path());
         let app = App::new(views, directory.path().to_owned());
         let mut controller = Controller::new(catalog_path.clone(), catalog, app);
+        controller.discover_authored_pull_requests = false;
         controller.request_github_refresh();
         let deadline = Instant::now() + Duration::from_secs(2);
         while controller.github_in_flight && Instant::now() < deadline {
