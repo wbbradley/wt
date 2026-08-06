@@ -169,6 +169,58 @@ Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" sectio
 
 If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
 
+## Viewer-authored PR discovery and progressive snapshots
+
+Added host-wide viewer-authored PR discovery to the existing single-flight GitHub worker. It issues variable-only `author:@me` searches, validates each result against `viewer.login`, includes drafts, paginates in 100-item pages, supports Enterprise endpoints, reuses token/error/rate suppression, and treats later failures or the 1,000-result truncation ceiling as non-authoritative. Branch enrichment arrives first and authored pages stream progressively. A generation-aware snapshot reducer overlays pages on the last complete baseline while loading, atomically commits successful replacements/removals, and restores the baseline after any host/page failure. Added fake-server and reducer coverage for exact filtering, cursors, drafts, Enterprise transport, later failures, truncation, progressive overlays, rollback, removal, and stale generations.
+
+## Viewer-authored PR discovery and progressive snapshots
+
+- Extend `src/github.rs` to discover, per configured/inferred host, the authenticated viewer and every open PR authored by that viewer only—include drafts, exclude review-requested and merely team-authored PRs.
+- Paginate in the background through GitHub Search's practical 1,000-result ceiling, publishing pages as they arrive and surfacing truncation and later-page warnings.
+- Coalesce host-wide authored discovery with startup, manual, scheduled, and post-mutation GitHub refreshes while preserving existing rate-limit suppression, classified errors, direct HTTP/token handling, and branch-enrichment semantics.
+- Render local worktrees immediately and retain the last fully successful authored-PR snapshot while loading and after any page/host failure. Show progressive pages during a refresh, revert partial data after failure, and remove disappeared PRs only after every host completes successfully.
+- Cover exact viewer-author filtering, drafts, pagination/cursors/truncation, Enterprise hosts, partial/later-page failures, progressive publication, stale snapshot retention, successful removals, generation rejection, and refresh coalescing.
+
+### Implementation plan
+
+- Add authored-PR/page/outcome models in `src/model.rs` and an authored snapshot reducer in `src/app.rs` that retains a complete baseline, overlays current pages only while loading, rejects stale generations, commits removals only on total success, and reverts partial data on failure.
+- Extend `src/github.rs` with host descriptors, a variable-only GraphQL viewer/search query, exact response-author validation, 100-item cursor pages, a ten-page/1,000-result cap, classified per-host/page failures, rate suppression, and a page callback.
+- Extend `src/tui.rs` so the existing single-flight background refresh publishes branch enrichment first, forwards authored pages incrementally, completes only after every host, and coalesces startup/manual/scheduled/post-mutation requests.
+- Add fake-server and reducer/controller tests for viewer filtering, drafts, cursors, Enterprise URLs, truncation, later failures, progressive data, stale rollback, successful disappearance, and generation/coalescing behavior.
+
+Risks: a partially successful multi-host refresh cannot become authoritative; pages may be displayed transiently, but the reducer must retain a separate complete baseline and restore it if any host or later page fails. Search results must still be checked against `viewer.login` rather than trusting query qualifiers alone.
+
+## Post-Plan Execution Steps
+
+Execute these steps in order:
+
+### Implement
+Execute the plan above.
+
+**Naming gate:** before creating any file, identifier, run-id, or env var, ask "would this name
+make sense to someone who never read the plan?" If it encodes a sequence position (`Stage N` /
+`Phase N` / `stepN`), rename it now — cheap before a checkpoint or downstream reference pins it.
+
+### Verify
+
+1. Run the project's build/lint command. Fix all warnings.
+2. Run the project's test suite.
+3. If tests fail, fix them before proceeding.
+4. If test coverage for the new work is insufficient, add tests.
+
+### Commit
+
+Use Conventional Commits commit message style. If there are pre-existing modified files and they don't look harmful, go ahead and commit them, too.
+
+### Update PLAN.md
+
+Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" section — do not leave it in place with a [DONE] tag, strikethrough, or any other marker. The task and its related subsections should no longer appear in PLAN.md at all. PLAN.md should not have any sort of "Done" section. Then append a new entry to `COMPLETED.md` with two parts, in this order:
+
+1. A brief summary, written now, of what was actually implemented.
+2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
+
+If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
+
 ## Canonical GitHub remote identities and authored-PR mapping
 
 Added backward-compatible canonical GitHub identity caches for every remote and a derived preferred remote. Background refreshes now reconcile and persist caches under the catalog sidecar lock, remove disappeared/unsupported remotes, retain and warn on repointed conflicts, update in-memory views, and infer explicit/cached/default discovery hosts. Added base-repository canonical PR IDs, extraction of every GitHub-associated PR for active worktrees, canonical suppression, deduplication, and deterministic configured-remote/origin/catalog-order mapping that rejects unusable paths. Added focused fake-Git, mapping, fork/base, host, association, serialization compatibility, and background persistence coverage.
