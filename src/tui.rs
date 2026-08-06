@@ -51,6 +51,8 @@ pub enum TuiError {
     GitHub(#[from] crate::github::GitHubError),
     #[error(transparent)]
     Bootstrap(#[from] bootstrap::BootstrapError),
+    #[error(transparent)]
+    Materialize(#[from] crate::materialize::MaterializeError),
     #[error("terminal error: {0}")]
     Terminal(#[from] io::Error),
     #[error("cannot determine the current directory: {0}")]
@@ -299,8 +301,8 @@ impl Controller {
                 Ok(ControlFlow::Continue)
             }
             Intent::MaterializePullRequest(identity) => {
-                self.bootstrap_pull_request_repository(&identity)?;
-                Ok(ControlFlow::Continue)
+                let path = self.bootstrap_pull_request_repository(&identity)?;
+                Ok(exit_with_materialized_worktree(path))
             }
         }
     }
@@ -1017,7 +1019,7 @@ impl Controller {
     fn bootstrap_pull_request_repository(
         &mut self,
         identity: &crate::model::CanonicalPullRequestId,
-    ) -> Result<(), TuiError> {
+    ) -> Result<PathBuf, TuiError> {
         let mapping = self
             .app
             .authored_mappings
@@ -1040,7 +1042,7 @@ impl Controller {
         let refreshed =
             self.github_service
                 .fetch_pull_request_with(&SystemCredentials, &host, identity)?;
-        self.app.authored_pull_requests.update(refreshed);
+        self.app.authored_pull_requests.update(refreshed.clone());
         self.app.rebuild_virtual_repositories();
 
         let token = crate::github::resolve_token(
@@ -1068,12 +1070,21 @@ impl Controller {
         )?;
         config::save(&self.catalog_path, &catalog)?;
         self.catalog = catalog;
-        self.app.progress = Some(format!(
-            "repository ready: {}",
-            result.repository.path.display()
-        ));
-        Ok(())
+        let materialized = crate::materialize::materialize_pull_request(
+            &SystemGit,
+            &crate::materialize::SystemFetchRunner,
+            &result.repository,
+            &repository_root,
+            &refreshed,
+            Some(&token),
+        )?;
+        self.refresh_local()?;
+        Ok(materialized.path)
     }
+}
+
+fn exit_with_materialized_worktree(path: PathBuf) -> ControlFlow {
+    ControlFlow::Exit(Some(path))
 }
 
 fn github_refresh_interval(catalog: &Catalog) -> Duration {
@@ -1250,6 +1261,20 @@ mod tests {
             absolute_path(Path::new("/base"), "relative"),
             PathBuf::from("/base/relative")
         );
+    }
+
+    #[test]
+    fn materialized_worktree_exits_with_the_exact_shell_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(directory.path()).unwrap();
+        let ControlFlow::Exit(Some(selection)) = exit_with_materialized_worktree(path.clone())
+        else {
+            panic!("materialization did not exit with a selection");
+        };
+        assert_eq!(selection, path);
+        let mut output = Vec::new();
+        crate::terminal::write_selection(&mut output, Some(&selection)).unwrap();
+        assert_eq!(output, format!("{}\n", path.display()).as_bytes());
     }
 
     #[test]

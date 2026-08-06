@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod git;
 mod github;
+mod materialize;
 mod model;
 mod operations;
 mod terminal;

@@ -441,7 +441,13 @@ fn filter_unsupported(stderr: &str) -> bool {
 fn redact(message: &str, secret: Option<&str>) -> String {
     secret
         .filter(|secret| !secret.is_empty())
-        .map(|secret| message.replace(secret, "[REDACTED]"))
+        .map(|secret| {
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(format!("x-access-token:{secret}"));
+            message
+                .replace(secret, "[REDACTED]")
+                .replace(&encoded, "[REDACTED]")
+        })
         .unwrap_or_else(|| message.to_owned())
 }
 
