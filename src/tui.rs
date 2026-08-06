@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::app::{Action, App, FormField, Intent, RepositoryView};
 use crate::background::{StatusPool, StatusTask};
+use crate::bootstrap::{self, SystemCloneRunner};
 use crate::config;
 use crate::git::{self, SystemGit};
 use crate::github::{
@@ -46,6 +47,10 @@ pub enum TuiError {
     Git(#[from] git::GitError),
     #[error(transparent)]
     Operation(#[from] operations::OperationError),
+    #[error(transparent)]
+    GitHub(#[from] crate::github::GitHubError),
+    #[error(transparent)]
+    Bootstrap(#[from] bootstrap::BootstrapError),
     #[error("terminal error: {0}")]
     Terminal(#[from] io::Error),
     #[error("cannot determine the current directory: {0}")]
@@ -293,11 +298,8 @@ impl Controller {
                 self.refresh_local()?;
                 Ok(ControlFlow::Continue)
             }
-            Intent::MaterializePullRequest(_) => {
-                self.app.inline_error = Some(
-                    "pull request materialization is not available until bootstrap is configured"
-                        .to_owned(),
-                );
+            Intent::MaterializePullRequest(identity) => {
+                self.bootstrap_pull_request_repository(&identity)?;
                 Ok(ControlFlow::Continue)
             }
         }
@@ -1010,6 +1012,67 @@ impl Controller {
             |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
         );
         self.app.rebuild_virtual_repositories();
+    }
+
+    fn bootstrap_pull_request_repository(
+        &mut self,
+        identity: &crate::model::CanonicalPullRequestId,
+    ) -> Result<(), TuiError> {
+        let mapping = self
+            .app
+            .authored_mappings
+            .iter()
+            .find(|mapping| &mapping.identity == identity)
+            .and_then(|mapping| mapping.repository_index);
+        let mapped_path = mapping
+            .and_then(|index| self.catalog.repositories.get(index))
+            .map(|repository| repository.path.clone());
+        let credential_anchor = mapping
+            .and_then(|index| self.catalog.repositories.get(index))
+            .map(|repository| repository.path.clone())
+            .unwrap_or_else(|| {
+                self.catalog_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_owned()
+            });
+        let host = AuthoredHost::inferred(&identity.repository.host, credential_anchor.clone());
+        let refreshed =
+            self.github_service
+                .fetch_pull_request_with(&SystemCredentials, &host, identity)?;
+        self.app.authored_pull_requests.update(refreshed);
+        self.app.rebuild_virtual_repositories();
+
+        let token = crate::github::resolve_token(
+            &SystemCredentials,
+            &identity.repository.host,
+            &credential_anchor,
+        )?;
+        let _lock = config::acquire_catalog_lock(&self.catalog_path)?;
+        let mut catalog = config::load(&self.catalog_path)?;
+        let fresh_mapping = mapped_path.as_ref().and_then(|path| {
+            catalog
+                .repositories
+                .iter()
+                .position(|repository| &repository.path == path)
+        });
+        let repository_root = config::repository_root(&catalog)?;
+        let result = bootstrap::bootstrap_repository(
+            &SystemGit,
+            &SystemCloneRunner,
+            &mut catalog,
+            &repository_root,
+            &identity.repository,
+            Some(&token),
+            fresh_mapping,
+        )?;
+        config::save(&self.catalog_path, &catalog)?;
+        self.catalog = catalog;
+        self.app.progress = Some(format!(
+            "repository ready: {}",
+            result.repository.path.display()
+        ));
+        Ok(())
     }
 }
 
