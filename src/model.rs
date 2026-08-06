@@ -1,15 +1,21 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 pub const CATALOG_VERSION: u32 = 1;
 pub const DEFAULT_GITHUB_REFRESH_INTERVAL_SECS: u64 = 300;
+pub const DEFAULT_REPOSITORY_ROOT_EXPRESSION: &str = "~/src";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Catalog {
     pub version: u32,
     #[serde(default = "default_github_refresh_interval_secs")]
     pub github_refresh_interval_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub github_hosts: Vec<String>,
     #[serde(default)]
     pub repositories: Vec<RepositoryConfig>,
 }
@@ -19,8 +25,38 @@ impl Default for Catalog {
         Self {
             version: CATALOG_VERSION,
             github_refresh_interval_secs: DEFAULT_GITHUB_REFRESH_INTERVAL_SECS,
+            repository_root: None,
+            github_hosts: Vec::new(),
             repositories: Vec::new(),
         }
+    }
+}
+
+impl Catalog {
+    pub fn repository_root_expression(&self) -> &str {
+        self.repository_root
+            .as_deref()
+            .unwrap_or(DEFAULT_REPOSITORY_ROOT_EXPRESSION)
+    }
+
+    pub fn effective_github_hosts<'a>(
+        &self,
+        inferred_hosts: impl IntoIterator<Item = &'a str>,
+    ) -> BTreeSet<String> {
+        let mut hosts = BTreeSet::from(["github.com".to_owned()]);
+        for host in self.github_hosts.iter().map(String::as_str) {
+            let host = host.trim();
+            if !host.is_empty() {
+                hosts.insert(host.to_ascii_lowercase());
+            }
+        }
+        for host in inferred_hosts {
+            let host = host.trim();
+            if !host.is_empty() {
+                hosts.insert(host.to_ascii_lowercase());
+            }
+        }
+        hosts
     }
 }
 
@@ -181,4 +217,37 @@ pub struct GitHubBranchData {
     pub pull_request: Option<PullRequest>,
     pub warnings: Vec<String>,
     pub rate_limit: Option<RateLimit>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_defaults_repository_root_without_serializing_it() {
+        let catalog = Catalog::default();
+        assert_eq!(
+            catalog.repository_root_expression(),
+            DEFAULT_REPOSITORY_ROOT_EXPRESSION
+        );
+        let encoded = serde_json::to_value(catalog).unwrap();
+        assert!(encoded.get("repository_root").is_none());
+        assert!(encoded.get("github_hosts").is_none());
+    }
+
+    #[test]
+    fn github_hosts_are_normalized_deduplicated_and_include_github_com() {
+        let catalog = Catalog {
+            github_hosts: vec![" GHE.EXAMPLE ".to_owned(), "github.com".to_owned()],
+            ..Catalog::default()
+        };
+        assert_eq!(
+            catalog.effective_github_hosts(["ghe.example", "other.example"]),
+            BTreeSet::from([
+                "ghe.example".to_owned(),
+                "github.com".to_owned(),
+                "other.example".to_owned(),
+            ])
+        );
+    }
 }

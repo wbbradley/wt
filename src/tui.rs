@@ -653,15 +653,17 @@ impl Controller {
                 operations::prune(&SystemGit, &repository)?;
             }
             PendingAction::RegisterRepository { repository } => {
-                if !self
-                    .catalog
+                let _lock = config::acquire_catalog_lock(&self.catalog_path)?;
+                let mut catalog = config::load(&self.catalog_path)?;
+                if !catalog
                     .repositories
                     .iter()
                     .any(|existing| existing.path == repository.path)
                 {
-                    self.catalog.repositories.push(repository);
-                    config::save(&self.catalog_path, &self.catalog)?;
+                    catalog.repositories.push(repository);
+                    config::save(&self.catalog_path, &catalog)?;
                 }
+                self.catalog = catalog;
             }
             PendingAction::EditRepository {
                 repository,
@@ -670,8 +672,9 @@ impl Controller {
                 worktree_root,
                 github_remote,
             } => {
-                let entry = self
-                    .catalog
+                let _lock = config::acquire_catalog_lock(&self.catalog_path)?;
+                let mut catalog = config::load(&self.catalog_path)?;
+                let entry = catalog
                     .repositories
                     .iter_mut()
                     .find(|entry| entry.path == repository)
@@ -680,17 +683,21 @@ impl Controller {
                 entry.label = label;
                 entry.worktree_root = worktree_root;
                 entry.github_remote = github_remote;
-                config::save(&self.catalog_path, &self.catalog)?;
+                config::save(&self.catalog_path, &catalog)?;
+                self.catalog = catalog;
             }
             PendingAction::RemoveRepository { repository } => {
-                let before = self.catalog.repositories.len();
-                self.catalog
+                let _lock = config::acquire_catalog_lock(&self.catalog_path)?;
+                let mut catalog = config::load(&self.catalog_path)?;
+                let before = catalog.repositories.len();
+                catalog
                     .repositories
                     .retain(|entry| entry.path != repository);
-                if self.catalog.repositories.len() == before {
+                if catalog.repositories.len() == before {
                     return Err(TuiError::RepositoryGone);
                 }
-                config::save(&self.catalog_path, &self.catalog)?;
+                config::save(&self.catalog_path, &catalog)?;
+                self.catalog = catalog;
             }
         }
         Ok(())

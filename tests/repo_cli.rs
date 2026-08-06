@@ -139,6 +139,79 @@ fn bare_repository_is_registered_and_classified() {
     assert!(stdout(&list).contains("bare"));
 }
 
+#[test]
+fn config_repository_root_preserves_expression_and_shows_resolution() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config/wt.json");
+    let repository_base = directory.path().join("repository base");
+    let expression = "${WT_TEST_REPOSITORY_BASE}/authored";
+    let set = Command::new(env!("CARGO_BIN_EXE_wt"))
+        .env("WT_CONFIG_PATH", &config)
+        .env("WT_TEST_REPOSITORY_BASE", &repository_base)
+        .args(["config", "set", "repository-root", expression])
+        .output()
+        .unwrap();
+    assert_success(&set);
+    assert!(repository_base.join("authored").is_dir());
+    assert!(stdout(&set).contains(&format!("configured={expression}")));
+    assert!(stdout(&set).contains(&format!(
+        "resolved={}",
+        fs::canonicalize(repository_base.join("authored"))
+            .unwrap()
+            .display()
+    )));
+
+    let stored: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(stored["repository_root"], expression);
+
+    let show = Command::new(env!("CARGO_BIN_EXE_wt"))
+        .env("WT_CONFIG_PATH", &config)
+        .env("WT_TEST_REPOSITORY_BASE", &repository_base)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+    assert_success(&show);
+    assert!(stdout(&show).contains(&format!("configured={expression}")));
+    assert!(stdout(&show).contains("github-host\tgithub.com"));
+}
+
+#[test]
+fn config_rejects_undefined_variables_without_changing_the_catalog() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("wt.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_wt"))
+        .env("WT_CONFIG_PATH", &config)
+        .env_remove("WT_TEST_UNDEFINED_ROOT")
+        .args([
+            "config",
+            "set",
+            "repository-root",
+            "$WT_TEST_UNDEFINED_ROOT/repos",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("is not defined"));
+    assert!(!config.exists());
+}
+
+#[test]
+fn config_commands_are_completed() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("wt.json");
+    let top = wt(&config, &["__complete", "c"]);
+    assert_success(&top);
+    assert!(stdout(&top).lines().any(|line| line == "config"));
+
+    let setting = wt(&config, &["__complete", "config", "set", "r"]);
+    assert_success(&setting);
+    assert!(
+        stdout(&setting)
+            .lines()
+            .any(|line| line == "repository-root")
+    );
+}
+
 fn wt(config: &Path, arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_wt"))
         .env("WT_CONFIG_PATH", config)
