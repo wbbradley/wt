@@ -168,3 +168,57 @@ Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" sectio
 2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
 
 If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
+
+## Canonical GitHub remote identities and authored-PR mapping
+
+Added backward-compatible canonical GitHub identity caches for every remote and a derived preferred remote. Background refreshes now reconcile and persist caches under the catalog sidecar lock, remove disappeared/unsupported remotes, retain and warn on repointed conflicts, update in-memory views, and infer explicit/cached/default discovery hosts. Added base-repository canonical PR IDs, extraction of every GitHub-associated PR for active worktrees, canonical suppression, deduplication, and deterministic configured-remote/origin/catalog-order mapping that rejects unusable paths. Added focused fake-Git, mapping, fork/base, host, association, serialization compatibility, and background persistence coverage.
+
+## Canonical GitHub remote identities and authored-PR mapping
+
+- Extend `RepositoryConfig` with a backward-compatible derived map from every Git remote name to canonical `(host, owner, repository)` identities, plus the preferred remote.
+- Enumerate every remote and refresh the cache opportunistically. Add new identities and remove disappeared remotes, but retain a prior identity and surface a warning when the same remote name now resolves to a conflicting repository rather than silently rewriting it.
+- Infer discovery hosts from all cached/tracked remotes and union them with explicit `github_hosts` and `github.com`.
+- Introduce canonical PR identity `(host, base owner/repository, PR number)`. Derive it from GitHub associated-PR results for active worktrees rather than branch names or commits.
+- Map each authored PR against every GitHub remote, displaying it once: prefer a catalog entry whose configured `github_remote` maps to the base repository, then one whose `origin` maps, then the earliest catalog entry. Treat missing or invalid catalog paths as unmapped even if their cache matches. Group fork PRs by the base identity.
+- Integrate cache refresh/persistence with catalog refresh without blocking or overwriting concurrent catalog mutations, and surface reconciliation warnings.
+- Cover all supported remote forms, cache additions/removals/conflicts/preference and backward compatibility, host inference, canonical active-worktree suppression, all-remotes mapping, duplicate preference, unusable paths, deduplication, and fork/base grouping.
+
+### Implementation plan
+
+- Modify `src/model.rs` with serialized canonical repository identities, cached per-remote identities/preference, and canonical PR IDs.
+- Modify `src/github.rs` with injectable all-remote enumeration, conservative cache reconciliation, preferred-remote selection, host inference, canonical associated-PR extraction, suppression, and deterministic catalog mapping.
+- Modify `src/tui.rs` to reconcile and persist registered repository caches through the sidecar lock/reload transaction before GitHub refreshes, while exposing conflict warnings without discarding local rows.
+- Update all `RepositoryConfig` construction sites and add focused unit/controller/config compatibility tests.
+
+Risks: remote names can be repointed, so overwriting an established canonical identity would silently remap PRs; conflicts must retain the established mapping until the user resolves it. Catalog cache persistence must reload under the sidecar lock to preserve unrelated concurrent edits.
+
+## Post-Plan Execution Steps
+
+Execute these steps in order:
+
+### Implement
+Execute the plan above.
+
+**Naming gate:** before creating any file, identifier, run-id, or env var, ask "would this name
+make sense to someone who never read the plan?" If it encodes a sequence position (`Stage N` /
+`Phase N` / `stepN`), rename it now — cheap before a checkpoint or downstream reference pins it.
+
+### Verify
+
+1. Run the project's build/lint command. Fix all warnings.
+2. Run the project's test suite.
+3. If tests fail, fix them before proceeding.
+4. If test coverage for the new work is insufficient, add tests.
+
+### Commit
+
+Use Conventional Commits commit message style. If there are pre-existing modified files and they don't look harmful, go ahead and commit them, too.
+
+### Update PLAN.md
+
+Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" section — do not leave it in place with a [DONE] tag, strikethrough, or any other marker. The task and its related subsections should no longer appear in PLAN.md at all. PLAN.md should not have any sort of "Done" section. Then append a new entry to `COMPLETED.md` with two parts, in this order:
+
+1. A brief summary, written now, of what was actually implemented.
+2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
+
+If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
