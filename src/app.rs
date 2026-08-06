@@ -5,14 +5,16 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::github::{GitHubError, PullRequestMapping};
 use crate::model::{
-    AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, RepositoryConfig, Worktree,
-    WorktreeStatus,
+    AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, GitHubRepositoryIdentity,
+    RepositoryConfig, Worktree, WorktreeStatus,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RowId {
     Repository(PathBuf),
     Worktree(PathBuf),
+    VirtualRepository(GitHubRepositoryIdentity),
+    VirtualPullRequest(CanonicalPullRequestId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +44,8 @@ pub struct AuthoredPullRequestState {
     pub loading: bool,
     pub warnings: Vec<String>,
     pub stale_error: Option<String>,
+    pub current_host: Option<String>,
+    pub current_page: usize,
 }
 
 impl AuthoredPullRequestState {
@@ -51,12 +55,16 @@ impl AuthoredPullRequestState {
         self.loading = true;
         self.warnings.clear();
         self.stale_error = None;
+        self.current_host = None;
+        self.current_page = 0;
         self.generation
     }
 
     pub fn apply_page(
         &mut self,
         generation: u64,
+        host: String,
+        page: usize,
         pull_requests: Vec<AuthoredPullRequest>,
         warnings: Vec<String>,
     ) -> bool {
@@ -68,6 +76,8 @@ impl AuthoredPullRequestState {
                 .insert(pull_request.identity.clone(), pull_request);
         }
         self.warnings.extend(warnings);
+        self.current_host = Some(host);
+        self.current_page = page;
         true
     }
 
@@ -82,6 +92,8 @@ impl AuthoredPullRequestState {
             return false;
         }
         self.loading = false;
+        self.current_host = None;
+        self.current_page = 0;
         self.warnings = warnings;
         if complete {
             self.baseline = std::mem::take(&mut self.pending);
@@ -133,6 +145,20 @@ impl RepositoryView {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct VirtualRepositoryView {
+    pub identity: GitHubRepositoryIdentity,
+    pub mapped_repository: Option<PathBuf>,
+    pub expanded: bool,
+    pub pull_requests: Vec<AuthoredPullRequest>,
+}
+
+impl VirtualRepositoryView {
+    pub fn id(&self) -> RowId {
+        RowId::VirtualRepository(self.identity.clone())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VisibleRow {
     Repository {
@@ -144,12 +170,24 @@ pub enum VisibleRow {
         worktree_index: usize,
         id: RowId,
     },
+    VirtualRepository {
+        virtual_repository_index: usize,
+        id: RowId,
+    },
+    VirtualPullRequest {
+        virtual_repository_index: usize,
+        pull_request_index: usize,
+        id: RowId,
+    },
 }
 
 impl VisibleRow {
     pub fn id(&self) -> &RowId {
         match self {
-            Self::Repository { id, .. } | Self::Worktree { id, .. } => id,
+            Self::Repository { id, .. }
+            | Self::Worktree { id, .. }
+            | Self::VirtualRepository { id, .. }
+            | Self::VirtualPullRequest { id, .. } => id,
         }
     }
 }
@@ -258,6 +296,7 @@ pub enum Intent {
     BeginAction(Action),
     SubmitForm { action: Action, values: Vec<String> },
     ConfirmAction(Action),
+    MaterializePullRequest(CanonicalPullRequestId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +309,7 @@ pub struct StatusUpdate {
 #[derive(Debug)]
 pub struct App {
     pub repositories: Vec<RepositoryView>,
+    pub virtual_repositories: Vec<VirtualRepositoryView>,
     pub selected: Option<RowId>,
     pub filter: String,
     pub filter_active: bool,
@@ -299,6 +339,7 @@ impl App {
     pub fn new(repositories: Vec<RepositoryView>, current_directory: PathBuf) -> Self {
         let mut app = Self {
             repositories,
+            virtual_repositories: Vec::new(),
             selected: None,
             filter: String::new(),
             filter_active: false,
@@ -353,6 +394,11 @@ impl App {
                 .map(|(index, _)| index)
                 .collect();
             if !repository_matches && matching_worktrees.is_empty() {
+                self.append_virtual_rows(
+                    &mut rows,
+                    &filter,
+                    Some(repository.config.path.as_path()),
+                );
                 continue;
             }
             rows.push(VisibleRow::Repository {
@@ -369,8 +415,62 @@ impl App {
                     });
                 }
             }
+            self.append_virtual_rows(&mut rows, &filter, Some(repository.config.path.as_path()));
         }
+        self.append_virtual_rows(&mut rows, &filter, None);
         rows
+    }
+
+    fn append_virtual_rows(
+        &self,
+        rows: &mut Vec<VisibleRow>,
+        filter: &str,
+        mapped_repository: Option<&Path>,
+    ) {
+        for (virtual_repository_index, repository) in self
+            .virtual_repositories
+            .iter()
+            .enumerate()
+            .filter(|(_, repository)| repository.mapped_repository.as_deref() == mapped_repository)
+        {
+            let repository_matches = filter.is_empty()
+                || repository
+                    .identity
+                    .full_name()
+                    .to_ascii_lowercase()
+                    .contains(filter)
+                || repository
+                    .identity
+                    .host
+                    .to_ascii_lowercase()
+                    .contains(filter);
+            let matching_pull_requests: Vec<usize> = repository
+                .pull_requests
+                .iter()
+                .enumerate()
+                .filter(|(_, pull_request)| {
+                    repository_matches || virtual_pull_request_matches(pull_request, filter)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            if !repository_matches && matching_pull_requests.is_empty() {
+                continue;
+            }
+            rows.push(VisibleRow::VirtualRepository {
+                virtual_repository_index,
+                id: repository.id(),
+            });
+            if repository.expanded || !filter.is_empty() {
+                for pull_request_index in matching_pull_requests {
+                    let pull_request = &repository.pull_requests[pull_request_index];
+                    rows.push(VisibleRow::VirtualPullRequest {
+                        virtual_repository_index,
+                        pull_request_index,
+                        id: RowId::VirtualPullRequest(pull_request.identity.clone()),
+                    });
+                }
+            }
+        }
     }
 
     fn worktree_matches(&self, worktree: &Worktree, filter: &str) -> bool {
@@ -445,7 +545,9 @@ impl App {
                 &self.repositories[repository_index].worktrees[worktree_index],
                 worktree_index,
             )),
-            VisibleRow::Repository { .. } => None,
+            VisibleRow::Repository { .. }
+            | VisibleRow::VirtualRepository { .. }
+            | VisibleRow::VirtualPullRequest { .. } => None,
         }
     }
 
@@ -458,8 +560,28 @@ impl App {
             | VisibleRow::Worktree {
                 repository_index, ..
             } => repository_index,
+            VisibleRow::VirtualRepository { .. } | VisibleRow::VirtualPullRequest { .. } => {
+                return None;
+            }
         };
         Some((&self.repositories[index], index))
+    }
+
+    pub fn selected_virtual_pull_request(
+        &self,
+    ) -> Option<(&VirtualRepositoryView, &AuthoredPullRequest)> {
+        match self.selected_row()? {
+            VisibleRow::VirtualPullRequest {
+                virtual_repository_index,
+                pull_request_index,
+                ..
+            } => Some((
+                &self.virtual_repositories[virtual_repository_index],
+                &self.virtual_repositories[virtual_repository_index].pull_requests
+                    [pull_request_index],
+            )),
+            _ => None,
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Intent {
@@ -682,6 +804,12 @@ impl App {
             enabled: false,
             reason: Some(reason.to_owned()),
         };
+        if matches!(
+            self.selected_row(),
+            Some(VisibleRow::VirtualRepository { .. } | VisibleRow::VirtualPullRequest { .. })
+        ) {
+            return disabled("virtual pull requests support only Enter to create a worktree");
+        }
         let Some((repository, _)) = self.selected_repository() else {
             return disabled("select a repository or worktree first");
         };
@@ -855,6 +983,107 @@ impl App {
         self.ensure_selection_visible();
     }
 
+    pub fn rebuild_virtual_repositories(&mut self) {
+        let previous_rows = self.visible_rows();
+        let previous_selected = self.selected.clone();
+        let previous_index = previous_selected
+            .as_ref()
+            .and_then(|selected| previous_rows.iter().position(|row| row.id() == selected));
+        let previous_expansion: HashMap<GitHubRepositoryIdentity, bool> = self
+            .virtual_repositories
+            .iter()
+            .map(|repository| (repository.identity.clone(), repository.expanded))
+            .collect();
+        let mappings: HashMap<CanonicalPullRequestId, Option<usize>> = self
+            .authored_mappings
+            .iter()
+            .map(|mapping| (mapping.identity.clone(), mapping.repository_index))
+            .collect();
+        let mut grouped: BTreeMap<GitHubRepositoryIdentity, VirtualRepositoryView> =
+            BTreeMap::new();
+        for pull_request in self.authored_pull_requests.visible() {
+            let Some(repository_index) = mappings.get(&pull_request.identity) else {
+                continue;
+            };
+            let mapped_repository = repository_index
+                .and_then(|index| self.repositories.get(index))
+                .map(|repository| repository.config.path.clone());
+            let identity = pull_request.identity.repository.clone();
+            grouped
+                .entry(identity.clone())
+                .or_insert_with(|| VirtualRepositoryView {
+                    identity: identity.clone(),
+                    mapped_repository,
+                    expanded: previous_expansion.get(&identity).copied().unwrap_or(true),
+                    pull_requests: Vec::new(),
+                })
+                .pull_requests
+                .push(pull_request);
+        }
+        let catalog_order: HashMap<PathBuf, usize> = self
+            .repositories
+            .iter()
+            .enumerate()
+            .map(|(index, repository)| (repository.config.path.clone(), index))
+            .collect();
+        self.virtual_repositories = grouped.into_values().collect();
+        self.virtual_repositories.sort_by(|left, right| {
+            let left_order = left
+                .mapped_repository
+                .as_ref()
+                .and_then(|path| catalog_order.get(path))
+                .copied();
+            let right_order = right
+                .mapped_repository
+                .as_ref()
+                .and_then(|path| catalog_order.get(path))
+                .copied();
+            left_order
+                .is_none()
+                .cmp(&right_order.is_none())
+                .then_with(|| left_order.cmp(&right_order))
+                .then_with(|| left.identity.cmp(&right.identity))
+        });
+        for repository in &mut self.virtual_repositories {
+            repository.pull_requests.sort_by(|left, right| {
+                right
+                    .pull_request
+                    .updated_at
+                    .cmp(&left.pull_request.updated_at)
+                    .then_with(|| left.identity.number.cmp(&right.identity.number))
+            });
+        }
+
+        self.selected = previous_selected;
+        let current_rows = self.visible_rows();
+        let selected_exists = self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| current_rows.iter().any(|row| row.id() == selected));
+        if !selected_exists {
+            self.selected = match self.selected.as_ref() {
+                Some(RowId::VirtualPullRequest(identity)) => {
+                    let repository_id = RowId::VirtualRepository(identity.repository.clone());
+                    current_rows
+                        .iter()
+                        .find(|row| row.id() == &repository_id)
+                        .map(|row| row.id().clone())
+                }
+                _ => None,
+            }
+            .or_else(|| {
+                previous_index
+                    .and_then(|index| {
+                        current_rows.get(index.min(current_rows.len().saturating_sub(1)))
+                    })
+                    .map(|row| row.id().clone())
+            })
+            .or_else(|| current_rows.first().map(|row| row.id().clone()));
+            self.detail_scroll = 0;
+        }
+        self.ensure_selected_in_view();
+    }
+
     pub fn set_viewport_height(&mut self, height: usize) {
         self.viewport_height = height.max(1);
         self.ensure_selected_in_view();
@@ -910,6 +1139,24 @@ impl App {
                     Intent::None
                 }
             }
+            Some(VisibleRow::VirtualRepository {
+                virtual_repository_index,
+                ..
+            }) => {
+                self.virtual_repositories[virtual_repository_index].expanded =
+                    !self.virtual_repositories[virtual_repository_index].expanded;
+                Intent::None
+            }
+            Some(VisibleRow::VirtualPullRequest {
+                virtual_repository_index,
+                pull_request_index,
+                ..
+            }) => Intent::MaterializePullRequest(
+                self.virtual_repositories[virtual_repository_index].pull_requests
+                    [pull_request_index]
+                    .identity
+                    .clone(),
+            ),
             None => Intent::None,
         }
     }
@@ -924,6 +1171,20 @@ impl App {
             self.selected = Some(self.repositories[repository_index].id());
             self.detail_scroll = 0;
             self.ensure_selected_in_view();
+        } else if let Some(row) = self.selected_row()
+            && let VisibleRow::VirtualRepository {
+                virtual_repository_index,
+                ..
+            }
+            | VisibleRow::VirtualPullRequest {
+                virtual_repository_index,
+                ..
+            } = row
+        {
+            self.virtual_repositories[virtual_repository_index].expanded = false;
+            self.selected = Some(self.virtual_repositories[virtual_repository_index].id());
+            self.detail_scroll = 0;
+            self.ensure_selected_in_view();
         }
     }
 
@@ -932,6 +1193,12 @@ impl App {
             if let Some((_, index)) = self.selected_repository() {
                 self.repositories[index].expanded = true;
             }
+        } else if let Some(VisibleRow::VirtualRepository {
+            virtual_repository_index,
+            ..
+        }) = self.selected_row()
+        {
+            self.virtual_repositories[virtual_repository_index].expanded = true;
         } else {
             self.pane = Pane::Detail;
         }
@@ -1051,6 +1318,27 @@ fn github_search_text(data: &GitHubBranchData) -> String {
     parts.join(" ")
 }
 
+fn virtual_pull_request_matches(pull_request: &AuthoredPullRequest, filter: &str) -> bool {
+    let pull_request_data = &pull_request.pull_request;
+    pull_request
+        .identity
+        .repository
+        .full_name()
+        .contains(filter)
+        || pull_request_data
+            .head
+            .branch
+            .to_ascii_lowercase()
+            .contains(filter)
+        || pull_request_data
+            .title
+            .to_ascii_lowercase()
+            .contains(filter)
+        || pull_request.identity.number.to_string().contains(filter)
+        || format!("#{}", pull_request.identity.number).contains(filter)
+        || pull_request.author.to_ascii_lowercase().contains(filter)
+}
+
 fn contains_path(worktree: &Path, candidate: &Path) -> bool {
     let worktree = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_owned());
     let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_owned());
@@ -1095,6 +1383,181 @@ mod tests {
             locked: None,
             prunable: None,
         }
+    }
+
+    fn authored(
+        owner: &str,
+        repository: &str,
+        number: u64,
+        updated_at: &str,
+    ) -> AuthoredPullRequest {
+        let repository_identity =
+            GitHubRepositoryIdentity::canonical("github.com", owner, repository);
+        AuthoredPullRequest {
+            identity: CanonicalPullRequestId {
+                repository: repository_identity,
+                number,
+            },
+            author: "viewer".to_owned(),
+            pull_request: crate::model::PullRequest {
+                number,
+                title: format!("feature {number}"),
+                url: format!("https://github.com/{owner}/{repository}/pull/{number}"),
+                state: crate::model::PullRequestState::Open,
+                updated_at: updated_at.to_owned(),
+                review_decision: Some("APPROVED".to_owned()),
+                base: crate::model::PullRequestIdentity {
+                    repository: Some(format!("{owner}/{repository}")),
+                    branch: "main".to_owned(),
+                    oid: Some("base".to_owned()),
+                },
+                head: crate::model::PullRequestIdentity {
+                    repository: Some("viewer/fork".to_owned()),
+                    branch: format!("topic-{number}"),
+                    oid: Some(format!("head-{number}")),
+                },
+                checks: crate::model::CheckRollup::Success,
+            },
+        }
+    }
+
+    fn replace_authored(
+        app: &mut App,
+        pull_requests: Vec<AuthoredPullRequest>,
+        mappings: Vec<(CanonicalPullRequestId, Option<usize>)>,
+    ) {
+        let generation = app.authored_pull_requests.begin();
+        app.authored_pull_requests.apply_page(
+            generation,
+            "github.com".to_owned(),
+            1,
+            pull_requests,
+            Vec::new(),
+        );
+        app.authored_pull_requests
+            .finish(generation, true, Vec::new(), None);
+        app.authored_mappings = mappings
+            .into_iter()
+            .map(|(identity, repository_index)| PullRequestMapping {
+                identity,
+                repository_index,
+            })
+            .collect();
+        app.rebuild_virtual_repositories();
+    }
+
+    #[test]
+    fn virtual_repositories_follow_catalog_order_then_unmapped_and_sort_prs_newest() {
+        let mut app = App::new(
+            vec![repository("/first", true), repository("/second", true)],
+            PathBuf::from("/elsewhere"),
+        );
+        let older = authored("team", "mapped", 1, "2026-01-01T00:00:00Z");
+        let newer = authored("team", "mapped", 2, "2026-02-01T00:00:00Z");
+        let first = authored("alpha", "first", 3, "2026-01-01T00:00:00Z");
+        let unmapped = authored("aardvark", "unmapped", 4, "2026-01-01T00:00:00Z");
+        replace_authored(
+            &mut app,
+            vec![
+                older.clone(),
+                unmapped.clone(),
+                newer.clone(),
+                first.clone(),
+            ],
+            vec![
+                (older.identity.clone(), Some(1)),
+                (newer.identity.clone(), Some(1)),
+                (first.identity.clone(), Some(0)),
+                (unmapped.identity.clone(), None),
+            ],
+        );
+        assert_eq!(
+            app.virtual_repositories
+                .iter()
+                .map(|repository| repository.identity.full_name())
+                .collect::<Vec<_>>(),
+            vec!["alpha/first", "team/mapped", "aardvark/unmapped"]
+        );
+        assert_eq!(
+            app.virtual_repositories[1]
+                .pull_requests
+                .iter()
+                .map(|pull_request| pull_request.identity.number)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(app.virtual_repositories[2].mapped_repository.is_none());
+
+        app.filter = "topic-2".to_owned();
+        let rows = app.visible_rows();
+        assert!(
+            rows.iter()
+                .any(|row| { row.id() == &RowId::VirtualPullRequest(newer.identity.clone()) })
+        );
+        app.filter = "#4".to_owned();
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|row| { row.id() == &RowId::VirtualPullRequest(unmapped.identity.clone()) })
+        );
+        app.filter = "viewer".to_owned();
+        assert_eq!(app.visible_rows().len(), 7);
+    }
+
+    #[test]
+    fn virtual_selection_expansion_and_enter_survive_updates_with_safe_fallback() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let selected = authored("team", "project", 10, "2026-01-01T00:00:00Z");
+        let other = authored("team", "project", 11, "2026-02-01T00:00:00Z");
+        replace_authored(
+            &mut app,
+            vec![selected.clone(), other.clone()],
+            vec![
+                (selected.identity.clone(), Some(0)),
+                (other.identity.clone(), Some(0)),
+            ],
+        );
+        app.selected = Some(RowId::VirtualPullRequest(selected.identity.clone()));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Intent::MaterializePullRequest(selected.identity.clone())
+        );
+        for action in Action::ALL {
+            assert!(!app.action_availability(action).enabled);
+        }
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(
+            app.selected,
+            Some(RowId::VirtualRepository(
+                selected.identity.repository.clone()
+            ))
+        );
+        assert!(!app.virtual_repositories[0].expanded);
+
+        app.virtual_repositories[0].expanded = true;
+        app.selected = Some(RowId::VirtualPullRequest(selected.identity.clone()));
+        replace_authored(
+            &mut app,
+            vec![other.clone(), selected.clone()],
+            vec![
+                (selected.identity.clone(), Some(0)),
+                (other.identity.clone(), Some(0)),
+            ],
+        );
+        assert_eq!(
+            app.selected,
+            Some(RowId::VirtualPullRequest(selected.identity.clone()))
+        );
+
+        replace_authored(
+            &mut app,
+            vec![other.clone()],
+            vec![(other.identity.clone(), Some(0))],
+        );
+        assert_eq!(
+            app.selected,
+            Some(RowId::VirtualRepository(other.identity.repository.clone()))
+        );
     }
 
     #[test]
@@ -1374,12 +1837,24 @@ mod tests {
         };
         let mut state = AuthoredPullRequestState::default();
         let first = state.begin();
-        assert!(state.apply_page(first, vec![authored(1)], Vec::new()));
+        assert!(state.apply_page(
+            first,
+            "github.com".to_owned(),
+            1,
+            vec![authored(1)],
+            Vec::new()
+        ));
         assert!(state.finish(first, true, Vec::new(), None));
         assert_eq!(state.identities()[0].number, 1);
 
         let failed = state.begin();
-        assert!(state.apply_page(failed, vec![authored(2)], vec!["page warning".to_owned()]));
+        assert!(state.apply_page(
+            failed,
+            "github.com".to_owned(),
+            1,
+            vec![authored(2)],
+            vec!["page warning".to_owned()]
+        ));
         assert_eq!(
             state
                 .identities()
@@ -1388,7 +1863,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert!(!state.apply_page(first, vec![authored(3)], Vec::new()));
+        assert!(!state.apply_page(
+            first,
+            "github.com".to_owned(),
+            2,
+            vec![authored(3)],
+            Vec::new()
+        ));
         assert!(state.finish(
             failed,
             false,
@@ -1399,7 +1880,13 @@ mod tests {
         assert_eq!(state.stale_error.as_deref(), Some("later page failed"));
 
         let replacement = state.begin();
-        state.apply_page(replacement, vec![authored(2)], Vec::new());
+        state.apply_page(
+            replacement,
+            "github.com".to_owned(),
+            1,
+            vec![authored(2)],
+            Vec::new(),
+        );
         state.finish(replacement, true, Vec::new(), None);
         assert_eq!(state.identities()[0].number, 2);
     }
