@@ -187,6 +187,7 @@ pub enum VisibleRow {
         virtual_repository_index: usize,
         pull_request_index: usize,
         mapped_repository_index: Option<usize>,
+        stack_depth: usize,
         id: RowId,
     },
 }
@@ -469,16 +470,34 @@ impl App {
             let repository_matches = parent_matches
                 || filter.is_empty()
                 || virtual_repository_matches(repository, filter);
-            let matching_pull_requests: Vec<usize> = repository
-                .pull_requests
-                .iter()
-                .enumerate()
-                .filter(|(_, pull_request)| {
-                    repository_matches || virtual_pull_request_matches(pull_request, filter)
-                })
-                .map(|(index, _)| index)
-                .collect();
-            if !repository_matches && matching_pull_requests.is_empty() {
+            let pull_request_tree = nested_pull_requests(&repository.pull_requests);
+            let mut included_pull_requests: BTreeSet<usize> = if repository_matches {
+                (0..repository.pull_requests.len()).collect()
+            } else {
+                repository
+                    .pull_requests
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, pull_request)| virtual_pull_request_matches(pull_request, filter))
+                    .map(|(index, _)| index)
+                    .collect()
+            };
+            if !repository_matches {
+                let parents: Vec<Option<usize>> = pull_request_tree.iter().fold(
+                    vec![None; repository.pull_requests.len()],
+                    |mut parents, row| {
+                        parents[row.index] = row.parent;
+                        parents
+                    },
+                );
+                for mut index in included_pull_requests.clone() {
+                    while let Some(parent) = parents[index] {
+                        included_pull_requests.insert(parent);
+                        index = parent;
+                    }
+                }
+            }
+            if included_pull_requests.is_empty() {
                 continue;
             }
             if show_repository_header {
@@ -488,12 +507,16 @@ impl App {
                 });
             }
             if !show_repository_header || repository.expanded || !filter.is_empty() {
-                for pull_request_index in matching_pull_requests {
-                    let pull_request = &repository.pull_requests[pull_request_index];
+                for tree_row in pull_request_tree
+                    .iter()
+                    .filter(|row| included_pull_requests.contains(&row.index))
+                {
+                    let pull_request = &repository.pull_requests[tree_row.index];
                     rows.push(VisibleRow::VirtualPullRequest {
                         virtual_repository_index,
-                        pull_request_index,
+                        pull_request_index: tree_row.index,
                         mapped_repository_index,
+                        stack_depth: tree_row.depth,
                         id: RowId::VirtualPullRequest(pull_request.identity.clone()),
                     });
                 }
@@ -1352,6 +1375,97 @@ fn virtual_repository_matches(repository: &VirtualRepositoryView, filter: &str) 
             .contains(filter)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NestedPullRequest {
+    index: usize,
+    depth: usize,
+    parent: Option<usize>,
+}
+
+fn nested_pull_requests(pull_requests: &[AuthoredPullRequest]) -> Vec<NestedPullRequest> {
+    let mut parents = vec![None; pull_requests.len()];
+    for (child_index, child) in pull_requests.iter().enumerate() {
+        let candidates: Vec<usize> = pull_requests
+            .iter()
+            .enumerate()
+            .filter(|(parent_index, parent)| {
+                *parent_index != child_index
+                    && pull_request_identity_matches(
+                        &parent.pull_request.head,
+                        &child.pull_request.base,
+                    )
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if let [parent] = candidates.as_slice() {
+            parents[child_index] = Some(*parent);
+        }
+    }
+
+    let mut cyclic = BTreeSet::new();
+    for start in 0..parents.len() {
+        let mut path = Vec::new();
+        let mut current = Some(start);
+        while let Some(index) = current {
+            if let Some(cycle_start) = path.iter().position(|candidate| *candidate == index) {
+                cyclic.extend(path[cycle_start..].iter().copied());
+                break;
+            }
+            path.push(index);
+            current = parents[index];
+        }
+    }
+    for index in cyclic {
+        parents[index] = None;
+    }
+
+    let mut children = vec![Vec::new(); pull_requests.len()];
+    for (child, parent) in parents.iter().copied().enumerate() {
+        if let Some(parent) = parent {
+            children[parent].push(child);
+        }
+    }
+    let mut result = Vec::with_capacity(pull_requests.len());
+    let mut visited = vec![false; pull_requests.len()];
+    for root in (0..pull_requests.len()).filter(|index| parents[*index].is_none()) {
+        append_pull_request_subtree(root, 0, &parents, &children, &mut visited, &mut result);
+    }
+    result
+}
+
+fn append_pull_request_subtree(
+    index: usize,
+    depth: usize,
+    parents: &[Option<usize>],
+    children: &[Vec<usize>],
+    visited: &mut [bool],
+    result: &mut Vec<NestedPullRequest>,
+) {
+    if std::mem::replace(&mut visited[index], true) {
+        return;
+    }
+    result.push(NestedPullRequest {
+        index,
+        depth,
+        parent: parents[index],
+    });
+    for child in &children[index] {
+        append_pull_request_subtree(*child, depth + 1, parents, children, visited, result);
+    }
+}
+
+fn pull_request_identity_matches(
+    head: &crate::model::PullRequestIdentity,
+    base: &crate::model::PullRequestIdentity,
+) -> bool {
+    head.branch == base.branch
+        && head
+            .repository
+            .as_deref()
+            .zip(base.repository.as_deref())
+            .is_some_and(|(head, base)| head.eq_ignore_ascii_case(base))
+}
+
 fn github_search_text(data: &GitHubBranchData) -> String {
     let mut parts = data.warnings.clone();
     if let Some(pull_request) = &data.pull_request {
@@ -1560,6 +1674,76 @@ mod tests {
         );
         app.filter = "viewer".to_owned();
         assert_eq!(app.visible_rows().len(), 7);
+    }
+
+    #[test]
+    fn stacked_pull_requests_render_parent_first_with_depth_and_filter_ancestors() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let mut parent = authored("team", "project", 10, "2026-01-01T00:00:00Z");
+        parent.pull_request.head.repository = Some("team/project".to_owned());
+        parent.pull_request.head.branch = "stack-parent".to_owned();
+        let mut child = authored("team", "project", 11, "2026-02-01T00:00:00Z");
+        child.pull_request.base.branch = "stack-parent".to_owned();
+        child.pull_request.head.repository = Some("team/project".to_owned());
+        child.pull_request.head.branch = "stack-child".to_owned();
+        let mut grandchild = authored("team", "project", 12, "2026-03-01T00:00:00Z");
+        grandchild.pull_request.base.branch = "stack-child".to_owned();
+        grandchild.pull_request.head.repository = Some("team/project".to_owned());
+        grandchild.pull_request.head.branch = "stack-grandchild".to_owned();
+        let independent = authored("team", "project", 13, "2026-04-01T00:00:00Z");
+        let pull_requests = vec![
+            parent.clone(),
+            child.clone(),
+            grandchild.clone(),
+            independent.clone(),
+        ];
+        replace_authored(
+            &mut app,
+            pull_requests.clone(),
+            pull_requests
+                .iter()
+                .map(|pull_request| (pull_request.identity.clone(), Some(0)))
+                .collect(),
+        );
+
+        let rows = app.visible_rows();
+        let nested = rows
+            .iter()
+            .filter_map(|row| match row {
+                VisibleRow::VirtualPullRequest {
+                    pull_request_index,
+                    stack_depth,
+                    ..
+                } => Some((
+                    app.virtual_repositories[0].pull_requests[*pull_request_index]
+                        .identity
+                        .number,
+                    *stack_depth,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(nested, vec![(13, 0), (10, 0), (11, 1), (12, 2)]);
+
+        app.filter = "stack-grandchild".to_owned();
+        let filtered = app
+            .visible_rows()
+            .iter()
+            .filter_map(|row| match row {
+                VisibleRow::VirtualPullRequest {
+                    pull_request_index,
+                    stack_depth,
+                    ..
+                } => Some((
+                    app.virtual_repositories[0].pull_requests[*pull_request_index]
+                        .identity
+                        .number,
+                    *stack_depth,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(filtered, vec![(10, 0), (11, 1), (12, 2)]);
     }
 
     #[test]
