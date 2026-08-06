@@ -1177,6 +1177,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn pull_request_like_direct_selector_never_materializes() {
+        struct NoWorktrees;
+        impl GitRunner for NoWorktrees {
+            fn run(
+                &self,
+                _directory: &Path,
+                _arguments: &[OsString],
+            ) -> Result<CommandOutput, GitError> {
+                Ok(CommandOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    success: true,
+                })
+            }
+        }
+        let catalog = Catalog {
+            repositories: vec![repository("/repo", "owner/repo")],
+            ..Catalog::default()
+        };
+        assert!(matches!(
+            resolve_navigation(&NoWorktrees, &catalog, "owner/repo:#123"),
+            Err(CliError::NavigationTargetNotFound { .. })
+        ));
+    }
+
     fn repository(path: &str, label: &str) -> RepositoryConfig {
         RepositoryConfig {
             path: PathBuf::from(path),

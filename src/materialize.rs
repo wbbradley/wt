@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 
 use base64::Engine;
@@ -51,8 +52,10 @@ pub trait FetchRunner {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 pub struct SystemFetchRunner;
 
+#[cfg(test)]
 impl FetchRunner for SystemFetchRunner {
     fn run(
         &self,
@@ -99,6 +102,11 @@ pub enum MaterializeError {
     HeadChanged { expected: String, actual: String },
     #[error("cannot canonicalize materialized worktree {path}: {source}")]
     Canonicalize {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to mark incomplete worktree under {path}: {source}")]
+    IncompleteMarker {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -229,19 +237,84 @@ pub fn materialize_pull_request(
             &authored.identity,
             &branch,
         );
-        operations::create(
+        operations::validate_create(
             runner,
             repository,
             &destination,
             &CreateMode::ExistingBranch(branch.clone()),
             false,
         )?;
+        operations::prepare_destination_parent(repository, &destination, false)?;
+        let destination_parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let staging_file = tempfile::Builder::new()
+            .prefix(".wt-incomplete-worktree-")
+            .tempfile_in(destination_parent)
+            .map_err(|source| MaterializeError::IncompleteMarker {
+                path: destination_parent.to_owned(),
+                source,
+            })?;
+        let staging = staging_file.path().to_owned();
+        staging_file
+            .close()
+            .map_err(|source| MaterializeError::IncompleteMarker {
+                path: destination_parent.to_owned(),
+                source,
+            })?;
+        if let Err(error) = operations::create(
+            runner,
+            repository,
+            &staging,
+            &CreateMode::ExistingBranch(branch.clone()),
+            false,
+        ) {
+            cleanup_owned_incomplete_worktree(repository, &staging);
+            return Err(error.into());
+        }
+        if let Err(error) = operations::move_worktree(
+            runner,
+            repository,
+            &staging.to_string_lossy(),
+            &destination,
+            false,
+        ) {
+            cleanup_owned_incomplete_worktree(repository, &staging);
+            return Err(error.into());
+        }
         return Ok(MaterializedPullRequest {
             branch,
             path: canonicalize_worktree(&destination)?,
             reused: false,
         });
     }
+}
+
+fn cleanup_owned_incomplete_worktree(repository: &RepositoryConfig, destination: &Path) {
+    let _ = git::run_git(
+        &git::SystemGit,
+        &repository.path,
+        &[
+            OsString::from("worktree"),
+            OsString::from("remove"),
+            OsString::from("--force"),
+            destination.as_os_str().to_owned(),
+        ],
+    );
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            let _ = fs::remove_dir_all(destination);
+        } else {
+            let _ = fs::remove_file(destination);
+        }
+    }
+    let _ = git::run_git(
+        &git::SystemGit,
+        &repository.path,
+        &[
+            OsString::from("worktree"),
+            OsString::from("prune"),
+            OsString::from("--expire=now"),
+        ],
+    );
 }
 
 fn repository_identity(
@@ -609,6 +682,13 @@ mod tests {
             marker(&repository.path, "feature/topic"),
             "github.com/team/project#42"
         );
+        assert!(!fixture.worktree_root.read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".wt-incomplete-worktree-")
+        }));
 
         let reused = materialize_pull_request(
             &SystemGit,
@@ -714,6 +794,10 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(destination).unwrap(), "unrelated");
         assert!(!fixture.repository_root.join("project-pr-42-2").exists());
+        assert_eq!(
+            branch_head(&repository.path, "pr/42-feature-topic"),
+            fixture.target
+        );
     }
 
     #[test]
@@ -750,6 +834,32 @@ mod tests {
                 .is_some_and(|code| code != 0)
         );
         assert!(!fixture.repository_root.join("project-pr-46").exists());
+    }
+
+    #[test]
+    fn incomplete_worktree_cleanup_removes_only_the_owned_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository_path = directory.path().join("project.git");
+        git(
+            directory.path(),
+            &["init", "--bare", repository_path.to_str().unwrap()],
+        );
+        let destination = directory.path().join(".wt-incomplete-worktree-fixture");
+        let unrelated = directory.path().join("unrelated");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("partial"), "partial").unwrap();
+        fs::write(&unrelated, "safe").unwrap();
+        let repository = RepositoryConfig {
+            path: repository_path,
+            label: None,
+            worktree_root: None,
+            github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
+        };
+        cleanup_owned_incomplete_worktree(&repository, &destination);
+        assert!(!destination.exists());
+        assert_eq!(fs::read_to_string(unrelated).unwrap(), "safe");
     }
 
     #[test]

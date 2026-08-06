@@ -9,8 +9,8 @@ use crossterm::event::{self, Event, KeyEventKind};
 use thiserror::Error;
 
 use crate::app::{Action, App, FormField, Intent, RepositoryView};
-use crate::background::{StatusPool, StatusTask};
-use crate::bootstrap::{self, SystemCloneRunner};
+use crate::background::{BackgroundJob, JobError, JobMessage, StatusPool, StatusTask};
+use crate::bootstrap;
 use crate::config;
 use crate::git::{self, SystemGit};
 use crate::github::{
@@ -168,6 +168,10 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
                 .terminal_mut()
                 .draw(|frame| ui::render(frame, &mut controller.app))?;
         }
+        if let Some(selection) = controller.completed_materialization.take() {
+            terminal.restore()?;
+            return Ok(Some(selection));
+        }
         if !event::poll(EVENT_POLL_INTERVAL)? {
             continue;
         }
@@ -218,6 +222,11 @@ enum ControlFlow {
     Exit(Option<PathBuf>),
 }
 
+struct MaterializationOutcome {
+    path: PathBuf,
+    refreshed: crate::model::AuthoredPullRequest,
+}
+
 struct Controller {
     catalog_path: PathBuf,
     catalog: Catalog,
@@ -233,6 +242,9 @@ struct Controller {
     next_github_refresh: Instant,
     discover_authored_pull_requests: bool,
     pending_action: Option<PendingAction>,
+    materialization_job: Option<BackgroundJob<MaterializationOutcome>>,
+    materialization_progress: Option<String>,
+    completed_materialization: Option<PathBuf>,
 }
 
 impl Controller {
@@ -257,10 +269,29 @@ impl Controller {
             next_github_refresh: Instant::now(),
             discover_authored_pull_requests: true,
             pending_action: None,
+            materialization_job: None,
+            materialization_progress: None,
+            completed_materialization: None,
         }
     }
 
     fn handle_intent(&mut self, intent: Intent) -> Result<ControlFlow, TuiError> {
+        if self.materialization_job.is_some() {
+            return match intent {
+                Intent::None => Ok(ControlFlow::Continue),
+                Intent::Cancel => {
+                    self.cancel_materialization();
+                    Ok(ControlFlow::Continue)
+                }
+                _ => {
+                    self.app.inline_error = Some(
+                        "pull request materialization is in progress; press Ctrl-C to cancel"
+                            .to_owned(),
+                    );
+                    Ok(ControlFlow::Continue)
+                }
+            };
+        }
         match intent {
             Intent::None => Ok(ControlFlow::Continue),
             Intent::Accept(path) => {
@@ -301,8 +332,8 @@ impl Controller {
                 Ok(ControlFlow::Continue)
             }
             Intent::MaterializePullRequest(identity) => {
-                let path = self.bootstrap_pull_request_repository(&identity)?;
-                Ok(exit_with_materialized_worktree(path))
+                self.start_pull_request_materialization(identity)?;
+                Ok(ControlFlow::Continue)
             }
         }
     }
@@ -999,9 +1030,76 @@ impl Controller {
                 },
             }
         }
+        changed |= self.pump_materialization();
         if !self.github_in_flight && Instant::now() >= self.next_github_refresh {
             self.request_github_refresh();
             changed |= self.app.github_loading;
+        }
+        changed
+    }
+
+    fn pump_materialization(&mut self) -> bool {
+        let mut messages = Vec::new();
+        if let Some(job) = self.materialization_job.as_ref() {
+            while let Some(message) = job.try_recv() {
+                messages.push(message);
+            }
+        }
+        if messages.is_empty() {
+            if self.materialization_job.is_some() {
+                self.app.progress = self.materialization_progress.clone();
+            }
+            return false;
+        }
+        let mut changed = false;
+        for message in messages {
+            match message {
+                JobMessage::Progress(progress) => {
+                    self.materialization_progress = Some(progress);
+                    changed = true;
+                }
+                JobMessage::Finished(result) => {
+                    if let Some(mut job) = self.materialization_job.take() {
+                        job.join();
+                    }
+                    self.materialization_progress = None;
+                    self.app.progress = None;
+                    match result {
+                        Ok(outcome) => {
+                            self.app.authored_pull_requests.update(outcome.refreshed);
+                            self.app.rebuild_virtual_repositories();
+                            match self.refresh_local() {
+                                Ok(()) => self.completed_materialization = Some(outcome.path),
+                                Err(error) => self.app.inline_error = Some(error.to_string()),
+                            }
+                        }
+                        Err(JobError::Cancelled) => {
+                            self.app.inline_error = Some(
+                                "pull request materialization cancelled; completed safe stages were retained"
+                                    .to_owned(),
+                            );
+                            if let Err(error) = self.refresh_local() {
+                                self.app.inline_error = Some(format!(
+                                    "materialization cancelled; refresh failed: {error}"
+                                ));
+                            }
+                        }
+                        Err(JobError::Failed(error)) => {
+                            self.app.inline_error = Some(error);
+                            if let Err(refresh_error) = self.refresh_local() {
+                                let message = self.app.inline_error.take().unwrap_or_default();
+                                self.app.inline_error = Some(format!(
+                                    "{message}; refresh also failed: {refresh_error}"
+                                ));
+                            }
+                        }
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if self.materialization_job.is_some() {
+            self.app.progress = self.materialization_progress.clone();
         }
         changed
     }
@@ -1016,15 +1114,15 @@ impl Controller {
         self.app.rebuild_virtual_repositories();
     }
 
-    fn bootstrap_pull_request_repository(
+    fn start_pull_request_materialization(
         &mut self,
-        identity: &crate::model::CanonicalPullRequestId,
-    ) -> Result<PathBuf, TuiError> {
+        identity: crate::model::CanonicalPullRequestId,
+    ) -> Result<(), TuiError> {
         let mapping = self
             .app
             .authored_mappings
             .iter()
-            .find(|mapping| &mapping.identity == identity)
+            .find(|mapping| mapping.identity == identity)
             .and_then(|mapping| mapping.repository_index);
         let mapped_path = mapping
             .and_then(|index| self.catalog.repositories.get(index))
@@ -1038,53 +1136,82 @@ impl Controller {
                     .unwrap_or_else(|| Path::new("."))
                     .to_owned()
             });
-        let host = AuthoredHost::inferred(&identity.repository.host, credential_anchor.clone());
-        let refreshed =
-            self.github_service
-                .fetch_pull_request_with(&SystemCredentials, &host, identity)?;
-        self.app.authored_pull_requests.update(refreshed.clone());
-        self.app.rebuild_virtual_repositories();
-
-        let token = crate::github::resolve_token(
-            &SystemCredentials,
-            &identity.repository.host,
-            &credential_anchor,
-        )?;
-        let _lock = config::acquire_catalog_lock(&self.catalog_path)?;
-        let mut catalog = config::load(&self.catalog_path)?;
-        let fresh_mapping = mapped_path.as_ref().and_then(|path| {
-            catalog
-                .repositories
-                .iter()
-                .position(|repository| &repository.path == path)
-        });
-        let repository_root = config::repository_root(&catalog)?;
-        let result = bootstrap::bootstrap_repository(
-            &SystemGit,
-            &SystemCloneRunner,
-            &mut catalog,
-            &repository_root,
-            &identity.repository,
-            Some(&token),
-            fresh_mapping,
-        )?;
-        config::save(&self.catalog_path, &catalog)?;
-        self.catalog = catalog;
-        let materialized = crate::materialize::materialize_pull_request(
-            &SystemGit,
-            &crate::materialize::SystemFetchRunner,
-            &result.repository,
-            &repository_root,
-            &refreshed,
-            Some(&token),
-        )?;
-        self.refresh_local()?;
-        Ok(materialized.path)
+        let catalog_path = self.catalog_path.clone();
+        let service = self.github_service.clone();
+        let job = BackgroundJob::spawn("wt-pr-materialization", move |context| {
+            context.progress("refreshing selected pull request");
+            let host = AuthoredHost::inferred(&identity.repository.host, credential_anchor.clone());
+            let refreshed = service
+                .fetch_pull_request_with(&SystemCredentials, &host, &identity)
+                .map_err(|error| error.to_string())?;
+            if context.is_cancelled() {
+                return Err("materialization cancelled".to_owned());
+            }
+            let token = crate::github::resolve_token(
+                &SystemCredentials,
+                &identity.repository.host,
+                &credential_anchor,
+            )
+            .map_err(|error| error.to_string())?;
+            context.progress("acquiring catalog lock");
+            let _lock = config::acquire_catalog_lock_with(
+                &catalog_path,
+                || context.is_cancelled(),
+                || context.progress("waiting for catalog lock"),
+            )
+            .map_err(|error| error.to_string())?;
+            let mut catalog = config::load(&catalog_path).map_err(|error| error.to_string())?;
+            let fresh_mapping = mapped_path.as_ref().and_then(|path| {
+                catalog
+                    .repositories
+                    .iter()
+                    .position(|repository| &repository.path == path)
+            });
+            let repository_root =
+                config::repository_root(&catalog).map_err(|error| error.to_string())?;
+            let runner = context.git_runner();
+            let result = bootstrap::bootstrap_repository(
+                &runner,
+                &runner,
+                &mut catalog,
+                &repository_root,
+                &identity.repository,
+                Some(&token),
+                fresh_mapping,
+            )
+            .map_err(|error| error.to_string())?;
+            config::save(&catalog_path, &catalog).map_err(|error| error.to_string())?;
+            if context.is_cancelled() {
+                return Err("materialization cancelled".to_owned());
+            }
+            let materialized = crate::materialize::materialize_pull_request(
+                &runner,
+                &runner,
+                &result.repository,
+                &repository_root,
+                &refreshed,
+                Some(&token),
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(MaterializationOutcome {
+                path: materialized.path,
+                refreshed,
+            })
+        })?;
+        self.materialization_progress = Some("refreshing selected pull request".to_owned());
+        self.app.progress = self.materialization_progress.clone();
+        self.materialization_job = Some(job);
+        Ok(())
     }
-}
 
-fn exit_with_materialized_worktree(path: PathBuf) -> ControlFlow {
-    ControlFlow::Exit(Some(path))
+    fn cancel_materialization(&mut self) {
+        if let Some(job) = self.materialization_job.as_ref() {
+            job.cancel();
+            self.materialization_progress =
+                Some("cancelling pull request materialization".to_owned());
+            self.app.progress = self.materialization_progress.clone();
+        }
+    }
 }
 
 fn github_refresh_interval(catalog: &Catalog) -> Duration {
@@ -1264,20 +1391,6 @@ mod tests {
     }
 
     #[test]
-    fn materialized_worktree_exits_with_the_exact_shell_selection() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = std::fs::canonicalize(directory.path()).unwrap();
-        let ControlFlow::Exit(Some(selection)) = exit_with_materialized_worktree(path.clone())
-        else {
-            panic!("materialization did not exit with a selection");
-        };
-        assert_eq!(selection, path);
-        let mut output = Vec::new();
-        crate::terminal::write_selection(&mut output, Some(&selection)).unwrap();
-        assert_eq!(output, format!("{}\n", path.display()).as_bytes());
-    }
-
-    #[test]
     fn github_refresh_interval_has_a_thirty_second_floor() {
         let mut catalog = Catalog {
             github_refresh_interval_secs: 1,
@@ -1298,6 +1411,111 @@ mod tests {
         controller.request_github_refresh();
         controller.request_github_refresh();
         assert!(controller.github_refresh_queued);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_materialization_without_producing_a_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            App::new(Vec::new(), directory.path().to_owned()),
+        );
+        controller.discover_authored_pull_requests = false;
+        controller.materialization_job = Some(
+            BackgroundJob::spawn("controller-cancel-test", |context| {
+                while !context.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err("cancelled".to_owned())
+            })
+            .unwrap(),
+        );
+        controller.materialization_progress = Some("creating linked worktree".to_owned());
+        assert!(matches!(
+            controller.handle_intent(Intent::Cancel).unwrap(),
+            ControlFlow::Continue
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.materialization_job.is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "controller did not observe cancellation"
+            );
+            controller.pump_materialization();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(controller.completed_materialization.is_none());
+        assert!(
+            controller
+                .app
+                .inline_error
+                .as_deref()
+                .is_some_and(|message| message.contains("cancelled"))
+        );
+    }
+
+    #[test]
+    fn successful_background_materialization_returns_the_exact_path() {
+        use crate::model::{
+            AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, GitHubRepositoryIdentity,
+            PullRequest, PullRequestIdentity, PullRequestState,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(directory.path()).unwrap();
+        let refreshed = AuthoredPullRequest {
+            identity: CanonicalPullRequestId {
+                repository: GitHubRepositoryIdentity::canonical("github.com", "team", "project"),
+                number: 42,
+            },
+            author: "viewer".to_owned(),
+            pull_request: PullRequest {
+                number: 42,
+                title: "Test".to_owned(),
+                url: "https://github.com/team/project/pull/42".to_owned(),
+                state: PullRequestState::Open,
+                updated_at: "2026-08-06T00:00:00Z".to_owned(),
+                review_decision: None,
+                base: PullRequestIdentity {
+                    repository: Some("team/project".to_owned()),
+                    branch: "main".to_owned(),
+                    oid: None,
+                },
+                head: PullRequestIdentity {
+                    repository: Some("team/project".to_owned()),
+                    branch: "topic".to_owned(),
+                    oid: Some("abc".to_owned()),
+                },
+                checks: CheckRollup::Success,
+            },
+        };
+        let mut controller = Controller::new(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            App::new(Vec::new(), directory.path().to_owned()),
+        );
+        controller.discover_authored_pull_requests = false;
+        let expected = path.clone();
+        controller.materialization_job = Some(
+            BackgroundJob::spawn("controller-success-test", move |_context| {
+                Ok(MaterializationOutcome {
+                    path: expected,
+                    refreshed,
+                })
+            })
+            .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.completed_materialization.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "controller did not observe success"
+            );
+            controller.pump_materialization();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(controller.completed_materialization, Some(path));
     }
 
     #[test]

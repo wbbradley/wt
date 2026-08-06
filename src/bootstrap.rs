@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 
 use base64::Engine;
@@ -41,22 +42,6 @@ pub struct CloneOutput {
 
 pub trait CloneRunner {
     fn run(&self, request: &CloneRequest) -> Result<CloneOutput, std::io::Error>;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemCloneRunner;
-
-impl CloneRunner for SystemCloneRunner {
-    fn run(&self, request: &CloneRequest) -> Result<CloneOutput, std::io::Error> {
-        let output = Command::new("git")
-            .args(&request.arguments)
-            .envs(request.environment.iter().cloned())
-            .output()?;
-        Ok(CloneOutput {
-            success: output.status.success(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
