@@ -41,10 +41,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let rows = app.visible_rows();
     app.set_viewport_height(area.height.saturating_sub(2) as usize);
     if rows.is_empty() {
-        let message = if app.repositories.is_empty() {
-            "No repositories registered. Run `wt repo add`, or launch from inside a Git repository and press a to register it."
-        } else if !app.filter.is_empty() {
+        let message = if !app.filter.is_empty() {
             "No repositories or worktrees match the filter."
+        } else if app.repositories.is_empty() {
+            "No repositories or authored pull requests are available. Run `wt repo add`, or authenticate GitHub to discover authored PRs."
         } else {
             "Catalog entries are unavailable. Select a stale repository to relink or unregister it."
         };
@@ -169,6 +169,48 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     ),
                 ]))
             }
+            VisibleRow::VirtualRepository {
+                virtual_repository_index,
+                ..
+            } => {
+                let repository = &app.virtual_repositories[*virtual_repository_index];
+                let arrow = if repository.expanded { "▾" } else { "▸" };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("  {arrow} {}", repository.identity.full_name()),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        if repository.mapped_repository.is_none() {
+                            " [no local repo]"
+                        } else {
+                            ""
+                        },
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            }
+            VisibleRow::VirtualPullRequest {
+                virtual_repository_index,
+                pull_request_index,
+                ..
+            } => {
+                let pull_request = &app.virtual_repositories[*virtual_repository_index]
+                    .pull_requests[*pull_request_index];
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!(
+                        "      #{} {} — {} ",
+                        pull_request.identity.number,
+                        pull_request.pull_request.head.branch,
+                        pull_request.pull_request.title
+                    )),
+                    Span::styled("[virtual]", Style::default().fg(Color::Magenta)),
+                    Span::styled(
+                        format!(" [{}]", pull_request.pull_request.checks),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]))
+            }
         })
         .collect();
     let selected = app
@@ -191,7 +233,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn list_block(app: &App) -> Block<'static> {
     Block::default()
-        .title(" Repositories / Worktrees ")
+        .title(" Repositories / Worktrees / Authored PRs ")
         .borders(Borders::ALL)
         .border_style(if app.pane == Pane::List {
             Style::default().fg(Color::Cyan)
@@ -202,7 +244,64 @@ fn list_block(app: &App) -> Block<'static> {
 
 fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut lines = Vec::new();
-    if let Some((repository, worktree, _)) = app.selected_worktree() {
+    if let Some((repository, authored)) = app.selected_virtual_pull_request() {
+        let pull_request = &authored.pull_request;
+        lines.push(field("repository", repository.identity.full_name()));
+        lines.push(field(
+            "local repo",
+            repository
+                .mapped_repository
+                .as_ref()
+                .map(|path| display_path(path))
+                .unwrap_or_else(|| "[no local repo]".to_owned()),
+        ));
+        lines.push(field(
+            "pull request",
+            format!("#{}", authored.identity.number),
+        ));
+        lines.push(field("title", pull_request.title.clone()));
+        lines.push(field("author", authored.author.clone()));
+        lines.push(field(
+            "base",
+            format!(
+                "{}:{}",
+                pull_request.base.repository.as_deref().unwrap_or("unknown"),
+                pull_request.base.branch
+            ),
+        ));
+        lines.push(field(
+            "head",
+            format!(
+                "{}:{}",
+                pull_request.head.repository.as_deref().unwrap_or("unknown"),
+                pull_request.head.branch
+            ),
+        ));
+        lines.push(field(
+            "head SHA",
+            pull_request
+                .head
+                .oid
+                .clone()
+                .unwrap_or_else(|| "-".to_owned()),
+        ));
+        lines.push(field("state", pull_request.state.to_string()));
+        lines.push(field("checks", pull_request.checks.to_string()));
+        lines.push(field(
+            "review",
+            pull_request
+                .review_decision
+                .clone()
+                .unwrap_or_else(|| "-".to_owned()),
+        ));
+        lines.push(field("URL", pull_request.url.clone()));
+        lines.push(Line::styled(
+            "Enter to create worktree",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some((repository, worktree, _)) = app.selected_worktree() {
         lines.push(Line::from(vec![
             Span::styled("repository  ", Style::default().fg(Color::DarkGray)),
             Span::raw(repository.config.display_label()),
@@ -285,6 +384,26 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 Style::default().fg(Color::Red),
             ));
         }
+    } else if let Some(VisibleRow::VirtualRepository {
+        virtual_repository_index,
+        ..
+    }) = app.selected_row()
+    {
+        let repository = &app.virtual_repositories[virtual_repository_index];
+        lines.push(field("repository", repository.identity.full_name()));
+        lines.push(field("host", repository.identity.host.clone()));
+        lines.push(field(
+            "local repo",
+            repository
+                .mapped_repository
+                .as_ref()
+                .map(|path| display_path(path))
+                .unwrap_or_else(|| "[no local repo]".to_owned()),
+        ));
+        lines.push(field(
+            "authored PRs",
+            repository.pull_requests.len().to_string(),
+        ));
     } else {
         lines.push(Line::from("Select a repository or worktree."));
     }
@@ -320,7 +439,8 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else if !app.filter.is_empty() {
         format!("filter: {}", app.filter)
     } else {
-        "j/k move  h/l panes  / filter  r refresh  ? actions  Enter select  q/Esc cancel".to_owned()
+        "j/k move  h/l panes  / filter  r refresh  ? actions  Enter select/create  q/Esc cancel"
+            .to_owned()
     };
     let bottom = app
         .inline_error
@@ -471,6 +591,22 @@ fn header_progress(app: &App) -> String {
     if app.github_loading {
         progress.push("loading GitHub PRs".to_owned());
     }
+    if app.authored_pull_requests.loading {
+        progress.push(
+            app.authored_pull_requests
+                .current_host
+                .as_ref()
+                .map(|host| {
+                    format!(
+                        "loading authored PRs: {host} page {}",
+                        app.authored_pull_requests.current_page
+                    )
+                })
+                .unwrap_or_else(|| "loading authored PRs".to_owned()),
+        );
+    } else if app.authored_pull_requests.stale_error.is_some() {
+        progress.push("authored PRs stale".to_owned());
+    }
     if progress.is_empty() {
         String::new()
     } else {
@@ -603,8 +739,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{GitHubState, RepositoryView, RowId};
-    use crate::model::{GitHubBranchData, RateLimit, RepositoryConfig, Worktree};
+    use crate::app::{GitHubState, RepositoryView, RowId, VirtualRepositoryView};
+    use crate::model::{
+        AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, GitHubBranchData,
+        GitHubRepositoryIdentity, PullRequest, PullRequestIdentity, PullRequestState, RateLimit,
+        RepositoryConfig, Worktree,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
@@ -646,11 +786,60 @@ mod tests {
     }
 
     #[test]
+    fn renders_virtual_rows_no_local_marker_and_pull_request_details() {
+        let identity = GitHubRepositoryIdentity::canonical("github.com", "base", "project");
+        let pull_request_id = CanonicalPullRequestId {
+            repository: identity.clone(),
+            number: 42,
+        };
+        let authored = AuthoredPullRequest {
+            identity: pull_request_id.clone(),
+            author: "viewer".to_owned(),
+            pull_request: PullRequest {
+                number: 42,
+                title: "virtual feature".to_owned(),
+                url: "https://github.com/base/project/pull/42".to_owned(),
+                state: PullRequestState::Draft,
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                review_decision: Some("CHANGES_REQUESTED".to_owned()),
+                base: PullRequestIdentity {
+                    repository: Some("base/project".to_owned()),
+                    branch: "main".to_owned(),
+                    oid: Some("base-sha".to_owned()),
+                },
+                head: PullRequestIdentity {
+                    repository: Some("viewer/fork".to_owned()),
+                    branch: "topic".to_owned(),
+                    oid: Some("head-sha".to_owned()),
+                },
+                checks: CheckRollup::Failure,
+            },
+        };
+        let mut app = App::new(Vec::new(), PathBuf::from("/outside"));
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity,
+            mapped_repository: None,
+            expanded: true,
+            pull_requests: vec![authored],
+        }];
+        app.selected = Some(RowId::VirtualPullRequest(pull_request_id));
+        let mut terminal = Terminal::new(TestBackend::new(120, 50)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("base/project [no local repo]"));
+        assert!(content.contains("#42 topic — virtual feature [virtual] [failure]"));
+        assert!(content.contains("viewer/fork:topic"));
+        assert!(content.contains("head-sha"));
+        assert!(content.contains("CHANGES_REQUESTED"));
+        assert!(content.contains("Enter to create worktree"));
+    }
+
+    #[test]
     fn renders_empty_stale_and_action_palette_states() {
         let mut empty = App::new(Vec::new(), PathBuf::from("/outside"));
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal.draw(|frame| render(frame, &mut empty)).unwrap();
-        assert!(buffer_text(terminal.backend().buffer()).contains("No repositories registered"));
+        assert!(buffer_text(terminal.backend().buffer()).contains("No repositories or authored"));
 
         empty.modal = Some(Modal::Palette { selected: 0 });
         terminal.draw(|frame| render(frame, &mut empty)).unwrap();

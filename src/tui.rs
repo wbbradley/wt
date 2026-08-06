@@ -293,6 +293,13 @@ impl Controller {
                 self.refresh_local()?;
                 Ok(ControlFlow::Continue)
             }
+            Intent::MaterializePullRequest(_) => {
+                self.app.inline_error = Some(
+                    "pull request materialization is not available until bootstrap is configured"
+                        .to_owned(),
+                );
+                Ok(ControlFlow::Continue)
+            }
         }
     }
 
@@ -962,12 +969,11 @@ impl Controller {
                     } => {
                         changed |= self.app.authored_pull_requests.apply_page(
                             generation,
+                            host,
+                            page,
                             pull_requests,
                             warnings,
                         );
-                        self.app.progress = Some(format!(
-                            "loading authored pull requests: {host} page {page}"
-                        ));
                         self.refresh_authored_mappings();
                     }
                     AuthoredRefreshEvent::Finished {
@@ -1003,6 +1009,7 @@ impl Controller {
             &self.app.active_pull_requests,
             |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
         );
+        self.app.rebuild_virtual_repositories();
     }
 }
 
