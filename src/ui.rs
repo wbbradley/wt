@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{App, GitHubState, Modal, Pane, StatusState, VisibleRow};
+use crate::model::CheckRollup;
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -125,6 +126,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     None => (String::new(), Color::DarkGray),
                 };
                 let github = github_summary(app.github.get(&worktree.path));
+                let github_color = github_summary_color(app.github.get(&worktree.path));
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         if current { "  ● " } else { "    " },
@@ -165,7 +167,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         } else {
                             format!(" {github}")
                         },
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(github_color),
                     ),
                 ]))
             }
@@ -193,13 +195,19 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             VisibleRow::VirtualPullRequest {
                 virtual_repository_index,
                 pull_request_index,
+                mapped_repository_index,
                 ..
             } => {
                 let pull_request = &app.virtual_repositories[*virtual_repository_index]
                     .pull_requests[*pull_request_index];
                 ListItem::new(Line::from(vec![
                     Span::raw(format!(
-                        "      #{} {} — {} ",
+                        "{}#{} {} — {} ",
+                        if mapped_repository_index.is_some() {
+                            "    "
+                        } else {
+                            "      "
+                        },
                         pull_request.identity.number,
                         pull_request.pull_request.head.branch,
                         pull_request.pull_request.title
@@ -207,7 +215,15 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     Span::styled("[virtual]", Style::default().fg(Color::Magenta)),
                     Span::styled(
                         format!(" [{}]", pull_request.pull_request.checks),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(check_color(pull_request.pull_request.checks)),
+                    ),
+                    Span::styled(
+                        if pull_request.pull_request.auto_merge {
+                            " [auto-merge]"
+                        } else {
+                            ""
+                        },
+                        Style::default().fg(Color::LightBlue),
                     ),
                 ]))
             }
@@ -286,7 +302,20 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .unwrap_or_else(|| "-".to_owned()),
         ));
         lines.push(field("state", pull_request.state.to_string()));
-        lines.push(field("checks", pull_request.checks.to_string()));
+        lines.push(styled_field(
+            "checks",
+            pull_request.checks.to_string(),
+            check_color(pull_request.checks),
+        ));
+        lines.push(field(
+            "auto-merge",
+            if pull_request.auto_merge {
+                "enabled"
+            } else {
+                "not enabled"
+            }
+            .to_owned(),
+        ));
         lines.push(field(
             "review",
             pull_request
@@ -586,6 +615,13 @@ fn field(label: &str, value: String) -> Line<'static> {
     ])
 }
 
+fn styled_field(label: &str, value: String, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<11}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(value, Style::default().fg(color)),
+    ])
+}
+
 fn header_progress(app: &App) -> String {
     let mut progress = app.progress.clone().into_iter().collect::<Vec<_>>();
     if app.github_loading {
@@ -629,13 +665,42 @@ fn github_summary(state: Option<&GitHubState>) -> String {
     }
 }
 
+fn github_summary_color(state: Option<&GitHubState>) -> Color {
+    let data = match state {
+        Some(GitHubState::Loading { previous }) => previous.as_ref(),
+        Some(GitHubState::Ready(data)) => Some(data),
+        Some(GitHubState::Stale { previous, .. }) => previous.as_ref(),
+        None => None,
+    };
+    data.and_then(|data| data.pull_request.as_ref())
+        .map(|pull_request| check_color(pull_request.checks))
+        .unwrap_or(Color::Cyan)
+}
+
+fn check_color(checks: CheckRollup) -> Color {
+    match checks {
+        CheckRollup::Success => Color::Green,
+        CheckRollup::Failure | CheckRollup::Error => Color::Red,
+        CheckRollup::Pending | CheckRollup::Expected => Color::Yellow,
+        CheckRollup::Unknown => Color::DarkGray,
+    }
+}
+
 fn pull_request_summary(data: &crate::model::GitHubBranchData) -> String {
     data.pull_request
         .as_ref()
         .map(|pull_request| {
             format!(
-                "PR #{} {} · {} · {}",
-                pull_request.number, pull_request.state, pull_request.checks, pull_request.title
+                "PR #{} {} · {}{} · {}",
+                pull_request.number,
+                pull_request.state,
+                pull_request.checks,
+                if pull_request.auto_merge {
+                    " · auto-merge"
+                } else {
+                    ""
+                },
+                pull_request.title
             )
         })
         .unwrap_or_else(|| "no PR".to_owned())
@@ -672,7 +737,20 @@ fn append_github_details(lines: &mut Vec<Line<'static>>, data: &crate::model::Gi
                 .clone()
                 .unwrap_or_else(|| "-".to_owned()),
         ));
-        lines.push(field("checks", pull_request.checks.to_string()));
+        lines.push(styled_field(
+            "checks",
+            pull_request.checks.to_string(),
+            check_color(pull_request.checks),
+        ));
+        lines.push(field(
+            "auto-merge",
+            if pull_request.auto_merge {
+                "enabled"
+            } else {
+                "not enabled"
+            }
+            .to_owned(),
+        ));
         lines.push(field("PR updated", pull_request.updated_at.clone()));
     } else {
         lines.push(field("GitHub", "no associated PR".to_owned()));
@@ -802,6 +880,7 @@ mod tests {
                 state: PullRequestState::Draft,
                 updated_at: "2026-01-01T00:00:00Z".to_owned(),
                 review_decision: Some("CHANGES_REQUESTED".to_owned()),
+                auto_merge: true,
                 base: PullRequestIdentity {
                     repository: Some("base/project".to_owned()),
                     branch: "main".to_owned(),
@@ -828,10 +907,20 @@ mod tests {
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("base/project [no local repo]"));
         assert!(content.contains("#42 topic — virtual feature [virtual] [failure]"));
+        assert!(content.contains("[auto-merge]"));
         assert!(content.contains("viewer/fork:topic"));
         assert!(content.contains("head-sha"));
         assert!(content.contains("CHANGES_REQUESTED"));
+        assert!(content.contains("auto-merge enabled"));
         assert!(content.contains("Enter to create worktree"));
+    }
+
+    #[test]
+    fn check_states_use_semantic_colors() {
+        assert_eq!(check_color(CheckRollup::Success), Color::Green);
+        assert_eq!(check_color(CheckRollup::Failure), Color::Red);
+        assert_eq!(check_color(CheckRollup::Error), Color::Red);
+        assert_eq!(check_color(CheckRollup::Pending), Color::Yellow);
     }
 
     #[test]

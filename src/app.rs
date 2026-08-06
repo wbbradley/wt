@@ -186,6 +186,7 @@ pub enum VisibleRow {
     VirtualPullRequest {
         virtual_repository_index: usize,
         pull_request_index: usize,
+        mapped_repository_index: Option<usize>,
         id: RowId,
     },
 }
@@ -402,12 +403,25 @@ impl App {
                 })
                 .map(|(index, _)| index)
                 .collect();
-            if !repository_matches && matching_worktrees.is_empty() {
-                self.append_virtual_rows(
-                    &mut rows,
-                    &filter,
-                    Some(repository.config.path.as_path()),
-                );
+            let mapped_virtual_repositories: Vec<usize> = self
+                .virtual_repositories
+                .iter()
+                .enumerate()
+                .filter(|(_, virtual_repository)| {
+                    virtual_repository.mapped_repository.as_deref()
+                        == Some(repository.config.path.as_path())
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let mapped_virtual_matches = mapped_virtual_repositories.iter().any(|index| {
+                let virtual_repository = &self.virtual_repositories[*index];
+                virtual_repository_matches(virtual_repository, &filter)
+                    || virtual_repository
+                        .pull_requests
+                        .iter()
+                        .any(|pull_request| virtual_pull_request_matches(pull_request, &filter))
+            });
+            if !repository_matches && matching_worktrees.is_empty() && !mapped_virtual_matches {
                 continue;
             }
             rows.push(VisibleRow::Repository {
@@ -423,10 +437,17 @@ impl App {
                         id: RowId::Worktree(worktree.path.clone()),
                     });
                 }
+                self.append_virtual_rows(
+                    &mut rows,
+                    &filter,
+                    Some(repository.config.path.as_path()),
+                    mapped_virtual_repositories.len() > 1,
+                    (mapped_virtual_repositories.len() == 1).then_some(repository_index),
+                    repository_matches,
+                );
             }
-            self.append_virtual_rows(&mut rows, &filter, Some(repository.config.path.as_path()));
         }
-        self.append_virtual_rows(&mut rows, &filter, None);
+        self.append_virtual_rows(&mut rows, &filter, None, true, None, false);
         rows
     }
 
@@ -435,6 +456,9 @@ impl App {
         rows: &mut Vec<VisibleRow>,
         filter: &str,
         mapped_repository: Option<&Path>,
+        show_repository_header: bool,
+        mapped_repository_index: Option<usize>,
+        parent_matches: bool,
     ) {
         for (virtual_repository_index, repository) in self
             .virtual_repositories
@@ -442,17 +466,9 @@ impl App {
             .enumerate()
             .filter(|(_, repository)| repository.mapped_repository.as_deref() == mapped_repository)
         {
-            let repository_matches = filter.is_empty()
-                || repository
-                    .identity
-                    .full_name()
-                    .to_ascii_lowercase()
-                    .contains(filter)
-                || repository
-                    .identity
-                    .host
-                    .to_ascii_lowercase()
-                    .contains(filter);
+            let repository_matches = parent_matches
+                || filter.is_empty()
+                || virtual_repository_matches(repository, filter);
             let matching_pull_requests: Vec<usize> = repository
                 .pull_requests
                 .iter()
@@ -465,16 +481,19 @@ impl App {
             if !repository_matches && matching_pull_requests.is_empty() {
                 continue;
             }
-            rows.push(VisibleRow::VirtualRepository {
-                virtual_repository_index,
-                id: repository.id(),
-            });
-            if repository.expanded || !filter.is_empty() {
+            if show_repository_header {
+                rows.push(VisibleRow::VirtualRepository {
+                    virtual_repository_index,
+                    id: repository.id(),
+                });
+            }
+            if !show_repository_header || repository.expanded || !filter.is_empty() {
                 for pull_request_index in matching_pull_requests {
                     let pull_request = &repository.pull_requests[pull_request_index];
                     rows.push(VisibleRow::VirtualPullRequest {
                         virtual_repository_index,
                         pull_request_index,
+                        mapped_repository_index,
                         id: RowId::VirtualPullRequest(pull_request.identity.clone()),
                     });
                 }
@@ -1180,18 +1199,28 @@ impl App {
             self.selected = Some(self.repositories[repository_index].id());
             self.detail_scroll = 0;
             self.ensure_selected_in_view();
-        } else if let Some(row) = self.selected_row()
-            && let VisibleRow::VirtualRepository {
-                virtual_repository_index,
-                ..
+        } else if let Some(row) = self.selected_row() {
+            match row {
+                VisibleRow::VirtualPullRequest {
+                    mapped_repository_index: Some(repository_index),
+                    ..
+                } => {
+                    self.repositories[repository_index].expanded = false;
+                    self.selected = Some(self.repositories[repository_index].id());
+                }
+                VisibleRow::VirtualRepository {
+                    virtual_repository_index,
+                    ..
+                }
+                | VisibleRow::VirtualPullRequest {
+                    virtual_repository_index,
+                    ..
+                } => {
+                    self.virtual_repositories[virtual_repository_index].expanded = false;
+                    self.selected = Some(self.virtual_repositories[virtual_repository_index].id());
+                }
+                VisibleRow::Repository { .. } | VisibleRow::Worktree { .. } => return,
             }
-            | VisibleRow::VirtualPullRequest {
-                virtual_repository_index,
-                ..
-            } = row
-        {
-            self.virtual_repositories[virtual_repository_index].expanded = false;
-            self.selected = Some(self.virtual_repositories[virtual_repository_index].id());
             self.detail_scroll = 0;
             self.ensure_selected_in_view();
         }
@@ -1310,6 +1339,19 @@ impl App {
     }
 }
 
+fn virtual_repository_matches(repository: &VirtualRepositoryView, filter: &str) -> bool {
+    repository
+        .identity
+        .full_name()
+        .to_ascii_lowercase()
+        .contains(filter)
+        || repository
+            .identity
+            .host
+            .to_ascii_lowercase()
+            .contains(filter)
+}
+
 fn github_search_text(data: &GitHubBranchData) -> String {
     let mut parts = data.warnings.clone();
     if let Some(pull_request) = &data.pull_request {
@@ -1322,6 +1364,11 @@ fn github_search_text(data: &GitHubBranchData) -> String {
             pull_request.head.branch.clone(),
             pull_request.review_decision.clone().unwrap_or_default(),
             pull_request.checks.to_string(),
+            if pull_request.auto_merge {
+                "auto-merge".to_owned()
+            } else {
+                String::new()
+            },
         ]);
     }
     parts.join(" ")
@@ -1346,6 +1393,7 @@ fn virtual_pull_request_matches(pull_request: &AuthoredPullRequest, filter: &str
         || pull_request.identity.number.to_string().contains(filter)
         || format!("#{}", pull_request.identity.number).contains(filter)
         || pull_request.author.to_ascii_lowercase().contains(filter)
+        || (pull_request_data.auto_merge && "auto-merge".contains(filter))
 }
 
 fn contains_path(worktree: &Path, candidate: &Path) -> bool {
@@ -1415,6 +1463,7 @@ mod tests {
                 state: crate::model::PullRequestState::Open,
                 updated_at: updated_at.to_owned(),
                 review_decision: Some("APPROVED".to_owned()),
+                auto_merge: false,
                 base: crate::model::PullRequestIdentity {
                     repository: Some(format!("{owner}/{repository}")),
                     branch: "main".to_owned(),
@@ -1537,12 +1586,11 @@ mod tests {
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(
             app.selected,
-            Some(RowId::VirtualRepository(
-                selected.identity.repository.clone()
-            ))
+            Some(RowId::Repository(PathBuf::from("/repo")))
         );
-        assert!(!app.virtual_repositories[0].expanded);
+        assert!(!app.repositories[0].expanded);
 
+        app.repositories[0].expanded = true;
         app.virtual_repositories[0].expanded = true;
         app.selected = Some(RowId::VirtualPullRequest(selected.identity.clone()));
         replace_authored(
@@ -1565,8 +1613,74 @@ mod tests {
         );
         assert_eq!(
             app.selected,
-            Some(RowId::VirtualRepository(other.identity.repository.clone()))
+            Some(RowId::VirtualPullRequest(other.identity.clone()))
         );
+    }
+
+    #[test]
+    fn singly_mapped_virtual_repository_folds_into_local_repository() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let pull_request = authored("team", "project", 10, "2026-01-01T00:00:00Z");
+        replace_authored(
+            &mut app,
+            vec![pull_request.clone()],
+            vec![(pull_request.identity.clone(), Some(0))],
+        );
+
+        let rows = app.visible_rows();
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, VisibleRow::VirtualRepository { .. }))
+        );
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            VisibleRow::VirtualPullRequest {
+                mapped_repository_index: Some(0),
+                ..
+            }
+        )));
+
+        app.repositories[0].expanded = false;
+        app.filter = "auto-merge".to_owned();
+        app.virtual_repositories[0].pull_requests[0]
+            .pull_request
+            .auto_merge = true;
+        assert!(
+            app.visible_rows().iter().any(|row| {
+                row.id() == &RowId::VirtualPullRequest(pull_request.identity.clone())
+            })
+        );
+    }
+
+    #[test]
+    fn multiple_github_identities_mapped_to_one_local_repository_keep_headers() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let first = authored("alpha", "project", 10, "2026-01-01T00:00:00Z");
+        let second = authored("beta", "project", 11, "2026-01-01T00:00:00Z");
+        replace_authored(
+            &mut app,
+            vec![first.clone(), second.clone()],
+            vec![
+                (first.identity.clone(), Some(0)),
+                (second.identity.clone(), Some(0)),
+            ],
+        );
+
+        let rows = app.visible_rows();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, VisibleRow::VirtualRepository { .. }))
+                .count(),
+            2
+        );
+        assert!(rows.iter().all(|row| !matches!(
+            row,
+            VisibleRow::VirtualPullRequest {
+                mapped_repository_index: Some(_),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -1706,6 +1820,7 @@ mod tests {
                     state: crate::model::PullRequestState::Open,
                     updated_at: "2026-07-30T00:00:00Z".to_owned(),
                     review_decision: Some("APPROVED".to_owned()),
+                    auto_merge: true,
                     base: crate::model::PullRequestIdentity {
                         repository: Some("team/repo".to_owned()),
                         branch: "main".to_owned(),
@@ -1830,6 +1945,7 @@ mod tests {
                     state: crate::model::PullRequestState::Open,
                     updated_at: "2026-01-01T00:00:00Z".to_owned(),
                     review_decision: None,
+                    auto_merge: false,
                     base: crate::model::PullRequestIdentity {
                         repository: Some("base/project".to_owned()),
                         branch: "main".to_owned(),

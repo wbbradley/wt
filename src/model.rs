@@ -239,6 +239,7 @@ pub struct PullRequest {
     pub state: PullRequestState,
     pub updated_at: String,
     pub review_decision: Option<String>,
+    pub auto_merge: bool,
     pub base: PullRequestIdentity,
     pub head: PullRequestIdentity,
     pub checks: CheckRollup,
