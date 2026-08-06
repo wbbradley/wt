@@ -979,6 +979,8 @@ fn add(
         label: arguments.label,
         worktree_root: arguments.worktree_root.map(absolute_path).transpose()?,
         github_remote: arguments.github_remote,
+        github_remotes: Default::default(),
+        github_preferred_remote: None,
     };
     catalog.repositories.push(repository);
     config::save(catalog_path, catalog)?;
@@ -1181,6 +1183,8 @@ mod tests {
             label: Some(label.to_owned()),
             worktree_root: None,
             github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
         }
     }
 }

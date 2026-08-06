@@ -620,6 +620,8 @@ mod tests {
             label: None,
             worktree_root: Some(PathBuf::from("/trees")),
             github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
         };
         assert_eq!(
             suggested_destination(
@@ -637,6 +639,8 @@ mod tests {
             label: None,
             worktree_root: Some(PathBuf::from("/trees")),
             github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
         };
         let unconfigured = RepositoryConfig {
             worktree_root: None,
@@ -673,6 +677,8 @@ mod tests {
             label: None,
             worktree_root: Some(root.clone()),
             github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
         };
         let destination = root.join("team/topic");
         ensure_destination_parent(&repository, &destination, false).unwrap();

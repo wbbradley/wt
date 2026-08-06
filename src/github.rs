@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::git::{GitRunner, SystemGit};
 use crate::model::{
-    CheckRollup, GitHubBranchData, PullRequest, PullRequestIdentity, PullRequestState, RateLimit,
-    RepositoryConfig, Worktree,
+    CanonicalPullRequestId, Catalog, CheckRollup, GitHubBranchData, GitHubRepositoryIdentity,
+    PullRequest, PullRequestIdentity, PullRequestState, RateLimit, RepositoryConfig, Worktree,
 };
 
 pub const MAX_BRANCHES_PER_BATCH: usize = 20;
@@ -54,6 +54,172 @@ impl RemoteRepository {
             format!("{}://{}/api/graphql", self.scheme.as_str(), self.host)
         }
     }
+
+    pub fn identity(&self) -> GitHubRepositoryIdentity {
+        GitHubRepositoryIdentity::canonical(&self.host, &self.owner, &self.name)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteIdentityRefresh {
+    pub changed: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestMapping {
+    pub identity: CanonicalPullRequestId,
+    pub repository_index: Option<usize>,
+}
+
+pub fn refresh_catalog_remote_identities(
+    runner: &dyn GitRunner,
+    catalog: &mut Catalog,
+) -> RemoteIdentityRefresh {
+    let mut refresh = RemoteIdentityRefresh::default();
+    for repository in &mut catalog.repositories {
+        match refresh_repository_remote_identities(runner, repository) {
+            Ok(repository_refresh) => {
+                refresh.changed |= repository_refresh.changed;
+                refresh.warnings.extend(repository_refresh.warnings);
+            }
+            Err(error) => refresh.warnings.push(format!(
+                "{}: unable to refresh GitHub remotes: {error}",
+                repository.display_label()
+            )),
+        }
+    }
+    refresh
+}
+
+pub fn refresh_repository_remote_identities(
+    runner: &dyn GitRunner,
+    repository: &mut RepositoryConfig,
+) -> Result<RemoteIdentityRefresh, GitHubError> {
+    let names = required_git_value(runner, &repository.path, &["remote"])?;
+    let remote_names: Vec<String> = names
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let mut identities = BTreeMap::new();
+    let mut warnings = Vec::new();
+    for name in remote_names {
+        let Some(url) =
+            optional_git_value(runner, &repository.path, &["remote", "get-url", &name])?
+        else {
+            warnings.push(format!(
+                "{}: remote {name:?} has no fetch URL",
+                repository.display_label()
+            ));
+            continue;
+        };
+        let Ok(observed) = parse_remote_url(&url).map(|remote| remote.identity()) else {
+            continue;
+        };
+        match repository.github_remotes.get(&name) {
+            Some(existing) if existing != &observed => {
+                warnings.push(format!(
+                    "{}: remote {name:?} now resolves to {}/{} but the catalog retains {}/{}",
+                    repository.display_label(),
+                    observed.host,
+                    observed.full_name(),
+                    existing.host,
+                    existing.full_name()
+                ));
+                identities.insert(name, existing.clone());
+            }
+            _ => {
+                identities.insert(name, observed);
+            }
+        }
+    }
+    let preferred = repository
+        .github_remote
+        .as_ref()
+        .filter(|name| identities.contains_key(*name))
+        .cloned()
+        .or_else(|| {
+            identities
+                .contains_key("origin")
+                .then(|| "origin".to_owned())
+        })
+        .or_else(|| identities.keys().next().cloned());
+    let changed =
+        identities != repository.github_remotes || preferred != repository.github_preferred_remote;
+    repository.github_remotes = identities;
+    repository.github_preferred_remote = preferred;
+    Ok(RemoteIdentityRefresh { changed, warnings })
+}
+
+pub fn inferred_github_hosts(catalog: &Catalog) -> BTreeSet<String> {
+    catalog.effective_github_hosts(
+        catalog
+            .repositories
+            .iter()
+            .flat_map(|repository| repository.github_remotes.values())
+            .map(|identity| identity.host.as_str()),
+    )
+}
+
+pub fn canonical_pull_request_id(
+    host: &str,
+    pull_request: &PullRequest,
+) -> Option<CanonicalPullRequestId> {
+    let full_name = pull_request.base.repository.as_deref()?;
+    let (owner, repository) = full_name.split_once('/')?;
+    Some(CanonicalPullRequestId {
+        repository: GitHubRepositoryIdentity::canonical(host, owner, repository),
+        number: pull_request.number,
+    })
+}
+
+pub fn map_pull_request_identities(
+    catalog: &Catalog,
+    pull_requests: impl IntoIterator<Item = CanonicalPullRequestId>,
+    active: &HashSet<CanonicalPullRequestId>,
+    usable: impl Fn(&RepositoryConfig) -> bool,
+) -> Vec<PullRequestMapping> {
+    let unique: BTreeSet<CanonicalPullRequestId> = pull_requests.into_iter().collect();
+    unique
+        .into_iter()
+        .filter(|identity| !active.contains(identity))
+        .map(|identity| {
+            let mut configured = None;
+            let mut origin = None;
+            let mut earliest = None;
+            for (index, repository) in catalog.repositories.iter().enumerate() {
+                if !usable(repository) {
+                    continue;
+                }
+                let matches = |remote: &str| {
+                    repository
+                        .github_remotes
+                        .get(remote)
+                        .is_some_and(|candidate| candidate == &identity.repository)
+                };
+                if !repository
+                    .github_remotes
+                    .values()
+                    .any(|candidate| candidate == &identity.repository)
+                {
+                    continue;
+                }
+                earliest.get_or_insert(index);
+                if repository.github_remote.as_deref().is_some_and(matches) {
+                    configured.get_or_insert(index);
+                }
+                if matches("origin") {
+                    origin.get_or_insert(index);
+                }
+            }
+            PullRequestMapping {
+                identity,
+                repository_index: configured.or(origin).or(earliest),
+            }
+        })
+        .collect()
 }
 
 impl WebScheme {
@@ -169,6 +335,7 @@ pub struct RepositoryGitHubInput {
 #[derive(Clone, Debug, Default)]
 pub struct GitHubRefresh {
     pub branches: HashMap<PathBuf, Result<GitHubBranchData, GitHubError>>,
+    pub active_pull_requests: HashSet<CanonicalPullRequestId>,
 }
 
 #[derive(Clone)]
@@ -187,6 +354,11 @@ struct Suppression {
 struct BranchTarget {
     worktree: PathBuf,
     branch: String,
+}
+
+struct BranchBatchRefresh {
+    branches: Vec<Result<GitHubBranchData, GitHubError>>,
+    active_pull_requests: HashSet<CanonicalPullRequestId>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -266,8 +438,11 @@ impl GitHubService {
             }
             for chunk in targets.chunks(MAX_BRANCHES_PER_BATCH) {
                 match self.fetch_batch(&key.remote, &token, chunk) {
-                    Ok(outcomes) => {
-                        for (target, outcome) in chunk.iter().zip(outcomes) {
+                    Ok(batch) => {
+                        refresh
+                            .active_pull_requests
+                            .extend(batch.active_pull_requests);
+                        for (target, outcome) in chunk.iter().zip(batch.branches) {
                             refresh.branches.insert(target.worktree.clone(), outcome);
                         }
                     }
@@ -288,7 +463,7 @@ impl GitHubService {
         remote: &RemoteRepository,
         token: &ResolvedToken,
         targets: &[BranchTarget],
-    ) -> Result<Vec<Result<GitHubBranchData, GitHubError>>, GitHubError> {
+    ) -> Result<BranchBatchRefresh, GitHubError> {
         let (query, variables) = build_query(remote, targets);
         let body = GraphQlRequest { query, variables };
         let mut response = self
@@ -324,7 +499,13 @@ impl GitHubService {
                 header_reset_epoch(response.headers()),
             );
         }
-        parse_batch_data(&data, targets, &envelope.errors, &warnings, rate)
+        let active_pull_requests =
+            canonical_associated_pull_requests(&data, targets.len(), &remote.host);
+        let outcomes = parse_batch_data(&data, targets, &envelope.errors, &warnings, rate)?;
+        Ok(BranchBatchRefresh {
+            branches: outcomes,
+            active_pull_requests,
+        })
     }
 
     fn suppressed_error(&self, host: &str) -> Option<GitHubError> {
@@ -356,6 +537,25 @@ impl GitHubService {
                 },
             );
     }
+}
+
+fn canonical_associated_pull_requests(
+    data: &Value,
+    target_count: usize,
+    host: &str,
+) -> HashSet<CanonicalPullRequestId> {
+    (0..target_count)
+        .flat_map(|index| {
+            data.pointer(&format!(
+                "/repository/branch{index}/target/associatedPullRequests/nodes"
+            ))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        })
+        .filter_map(|node| normalize_pull_request(node).ok())
+        .filter_map(|pull_request| canonical_pull_request_id(host, &pull_request))
+        .collect()
 }
 
 impl Default for GitHubService {
@@ -545,6 +745,23 @@ fn optional_git_value(
         return Ok(None);
     }
     Ok(nonempty_lossy(&output.stdout))
+}
+
+fn required_git_value(
+    runner: &dyn GitRunner,
+    anchor: &Path,
+    arguments: &[&str],
+) -> Result<String, GitHubError> {
+    let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+    let output = runner
+        .run(anchor, &arguments)
+        .map_err(|error| GitHubError::LocalGit(error.to_string()))?;
+    if !output.success {
+        return Err(GitHubError::LocalGit(
+            nonempty_lossy(&output.stderr).unwrap_or_else(|| "Git command failed".to_owned()),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn nonempty_lossy(bytes: &[u8]) -> Option<String> {
@@ -953,7 +1170,11 @@ mod tests {
                 .iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect();
-            let value = if arguments
+            let value = if arguments.as_slice() == ["remote"] {
+                let mut names: Vec<&str> = self.remotes.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                Some(names.join("\n"))
+            } else if arguments
                 .first()
                 .is_some_and(|argument| argument == "config")
             {
@@ -1077,6 +1298,8 @@ mod tests {
                 label: None,
                 worktree_root: None,
                 github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
             },
             worktrees: (0..branches)
                 .map(|index| Worktree {
@@ -1090,6 +1313,217 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn repository_with_remotes(
+        path: &str,
+        configured: Option<&str>,
+        remotes: impl IntoIterator<Item = (&'static str, GitHubRepositoryIdentity)>,
+    ) -> RepositoryConfig {
+        RepositoryConfig {
+            path: PathBuf::from(path),
+            label: None,
+            worktree_root: None,
+            github_remote: configured.map(str::to_owned),
+            github_remotes: remotes
+                .into_iter()
+                .map(|(name, identity)| (name.to_owned(), identity))
+                .collect(),
+            github_preferred_remote: None,
+        }
+    }
+
+    fn identity(host: &str, owner: &str, repository: &str) -> GitHubRepositoryIdentity {
+        GitHubRepositoryIdentity::canonical(host, owner, repository)
+    }
+
+    #[test]
+    fn remote_cache_reconciles_additions_removals_conflicts_and_preference() {
+        let retained = identity("github.com", "original", "project");
+        let mut repository = repository_with_remotes(
+            "/repo",
+            Some("upstream"),
+            [
+                ("upstream", retained.clone()),
+                ("removed", identity("github.com", "old", "gone")),
+            ],
+        );
+        let git = FakeGit {
+            upstream: None,
+            remotes: HashMap::from([
+                (
+                    "origin".to_owned(),
+                    "git@github.com:team/project.git".to_owned(),
+                ),
+                (
+                    "upstream".to_owned(),
+                    "https://ghe.example/new/project.git".to_owned(),
+                ),
+                ("local".to_owned(), "file:///tmp/project.git".to_owned()),
+            ]),
+        };
+        let refresh = refresh_repository_remote_identities(&git, &mut repository).unwrap();
+        assert!(refresh.changed);
+        assert_eq!(refresh.warnings.len(), 1);
+        assert!(refresh.warnings[0].contains("retains github.com/original/project"));
+        assert_eq!(repository.github_remotes["upstream"], retained);
+        assert_eq!(
+            repository.github_remotes["origin"],
+            identity("github.com", "team", "project")
+        );
+        assert!(!repository.github_remotes.contains_key("removed"));
+        assert!(!repository.github_remotes.contains_key("local"));
+        assert_eq!(
+            repository.github_preferred_remote.as_deref(),
+            Some("upstream")
+        );
+    }
+
+    #[test]
+    fn inferred_hosts_union_explicit_cached_and_github_com() {
+        let catalog = Catalog {
+            github_hosts: vec!["Explicit.Example".to_owned()],
+            repositories: vec![repository_with_remotes(
+                "/repo",
+                None,
+                [("origin", identity("GHE.EXAMPLE", "team", "project"))],
+            )],
+            ..Catalog::default()
+        };
+        assert_eq!(
+            inferred_github_hosts(&catalog),
+            BTreeSet::from([
+                "explicit.example".to_owned(),
+                "ghe.example".to_owned(),
+                "github.com".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn canonical_ids_use_the_base_repository_and_mapping_obeys_precedence() {
+        let pull_request = PullRequest {
+            number: 42,
+            title: "fork change".to_owned(),
+            url: "https://github.com/base/project/pull/42".to_owned(),
+            state: PullRequestState::Open,
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            review_decision: None,
+            base: PullRequestIdentity {
+                repository: Some("Base/Project".to_owned()),
+                branch: "main".to_owned(),
+                oid: Some("base".to_owned()),
+            },
+            head: PullRequestIdentity {
+                repository: Some("Contributor/Fork".to_owned()),
+                branch: "topic".to_owned(),
+                oid: Some("head".to_owned()),
+            },
+            checks: CheckRollup::Pending,
+        };
+        let canonical = canonical_pull_request_id("GitHub.COM", &pull_request).unwrap();
+        assert_eq!(
+            canonical.repository,
+            identity("github.com", "base", "project")
+        );
+
+        let catalog = Catalog {
+            repositories: vec![
+                repository_with_remotes(
+                    "/earliest",
+                    None,
+                    [("upstream", canonical.repository.clone())],
+                ),
+                repository_with_remotes(
+                    "/origin",
+                    None,
+                    [("origin", canonical.repository.clone())],
+                ),
+                repository_with_remotes(
+                    "/configured",
+                    Some("base"),
+                    [("base", canonical.repository.clone())],
+                ),
+            ],
+            ..Catalog::default()
+        };
+        let mappings = map_pull_request_identities(
+            &catalog,
+            [canonical.clone(), canonical.clone()],
+            &HashSet::new(),
+            |_| true,
+        );
+        assert_eq!(mappings.len(), 1, "a PR is displayed only once");
+        assert_eq!(mappings[0].repository_index, Some(2));
+
+        let active = HashSet::from([canonical.clone()]);
+        assert!(
+            map_pull_request_identities(&catalog, [canonical], &active, |_| true).is_empty(),
+            "only canonical associated-PR identity suppresses a virtual PR"
+        );
+    }
+
+    #[test]
+    fn every_associated_pr_identity_marks_an_active_worktree() {
+        let pull_request = |number: u64, owner: &str| {
+            serde_json::json!({
+                "number": number,
+                "title": "change",
+                "url": format!("https://github.com/{owner}/project/pull/{number}"),
+                "state": "OPEN",
+                "isDraft": false,
+                "mergedAt": null,
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "reviewDecision": null,
+                "baseRefName": "main",
+                "baseRefOid": "base",
+                "baseRepository": {"nameWithOwner": format!("{owner}/project")},
+                "headRefName": "topic",
+                "headRefOid": "head",
+                "headRepository": {"nameWithOwner": "contributor/fork"},
+                "commits": {"nodes": []}
+            })
+        };
+        let data = serde_json::json!({
+            "repository": {
+                "branch0": {
+                    "target": {
+                        "associatedPullRequests": {
+                            "nodes": [pull_request(1, "base"), pull_request(2, "other")]
+                        }
+                    }
+                }
+            }
+        });
+        let identities = canonical_associated_pull_requests(&data, 1, "github.com");
+        assert_eq!(identities.len(), 2);
+        assert!(identities.contains(&CanonicalPullRequestId {
+            repository: identity("github.com", "base", "project"),
+            number: 1,
+        }));
+        assert!(identities.contains(&CanonicalPullRequestId {
+            repository: identity("github.com", "other", "project"),
+            number: 2,
+        }));
+    }
+
+    #[test]
+    fn mapping_skips_unusable_cached_repositories() {
+        let pull_request = CanonicalPullRequestId {
+            repository: identity("github.com", "base", "project"),
+            number: 7,
+        };
+        let catalog = Catalog {
+            repositories: vec![repository_with_remotes(
+                "/missing",
+                Some("origin"),
+                [("origin", pull_request.repository.clone())],
+            )],
+            ..Catalog::default()
+        };
+        let mappings =
+            map_pull_request_identities(&catalog, [pull_request], &HashSet::new(), |_| false);
+        assert_eq!(mappings[0].repository_index, None);
     }
 
     #[test]
@@ -1159,6 +1593,8 @@ mod tests {
             label: None,
             worktree_root: None,
             github_remote: Some("configured".to_owned()),
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
         };
         let upstream = FakeGit {
             upstream: Some("fork".to_owned()),

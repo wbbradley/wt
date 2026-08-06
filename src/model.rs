@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,10 @@ pub struct RepositoryConfig {
     pub worktree_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_remote: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub github_remotes: BTreeMap<String, GitHubRepositoryIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_preferred_remote: Option<String>,
 }
 
 impl RepositoryConfig {
@@ -85,6 +89,33 @@ impl RepositoryConfig {
                 .unwrap_or_else(|| self.path.to_string_lossy().into_owned())
         })
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Hash, Ord, PartialEq, PartialOrd, Eq, Serialize)]
+pub struct GitHubRepositoryIdentity {
+    pub host: String,
+    pub owner: String,
+    pub repository: String,
+}
+
+impl GitHubRepositoryIdentity {
+    pub fn canonical(host: &str, owner: &str, repository: &str) -> Self {
+        Self {
+            host: host.to_ascii_lowercase(),
+            owner: owner.to_ascii_lowercase(),
+            repository: repository.to_ascii_lowercase(),
+        }
+    }
+
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.repository)
+    }
+}
+
+#[derive(Clone, Debug, Hash, Ord, PartialEq, PartialOrd, Eq)]
+pub struct CanonicalPullRequestId {
+    pub repository: GitHubRepositoryIdentity,
+    pub number: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

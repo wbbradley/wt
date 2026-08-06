@@ -448,12 +448,16 @@ mod tests {
                     label: Some("valid".to_owned()),
                     worktree_root: None,
                     github_remote: None,
+                    github_remotes: Default::default(),
+                    github_preferred_remote: None,
                 },
                 RepositoryConfig {
                     path: directory.path().join("missing"),
                     label: Some("stale".to_owned()),
                     worktree_root: None,
                     github_remote: None,
+                    github_remotes: Default::default(),
+                    github_preferred_remote: None,
                 },
             ],
             ..Catalog::default()
