@@ -1,14 +1,62 @@
 # Next Up
 
-## GitHub authored-PR discovery and remote identity cache
+## Canonical GitHub remote identities and authored-PR mapping
 
-- Extend `RepositoryConfig` with a backward-compatible derived map from every Git remote name to canonical `(host, owner, repository)` identities, plus the preferred remote. Refresh this cache opportunistically; warn rather than silently rewriting conflicting identities.
-- Infer configured GitHub hosts from every tracked remote and union them with explicit hosts and `github.com`.
-- Extend `src/github.rs` to discover, per configured/inferred host, the authenticated viewer and all open PRs authored by that viewer only—include drafts, exclude review-requested and merely team-authored PRs. Paginate in the background through GitHub Search's practical 1,000-result ceiling, surface truncation and later-page warnings, and coalesce this work with startup, manual, scheduled, and post-mutation GitHub refreshes.
-- Render local worktrees immediately and publish authored-PR pages progressively. Keep the last fully successful authored-PR snapshot while loading or after any page/host failure; only remove disappeared PRs after a complete successful refresh. Preserve existing rate-limit suppression, classified errors, direct HTTP/token handling, and stale-data semantics.
-- Canonically identify a PR as `(host, base owner/repository, PR number)`. Suppress it only when GitHub associated-PR data ties an active local worktree to that identity; group fork PRs under their base repository.
-- Map against every GitHub remote: prefer configured `github_remote`, then `origin`, then catalog order; display once, and treat missing/invalid catalog paths as unmapped.
-- Cover viewer filtering, pagination/truncation, Enterprise hosts, progressive/stale snapshots, canonical suppression, all-remotes mapping, duplicate preference, and fork/base grouping.
+- Extend `RepositoryConfig` with a backward-compatible derived map from every Git remote name to canonical `(host, owner, repository)` identities, plus the preferred remote.
+- Enumerate every remote and refresh the cache opportunistically. Add new identities and remove disappeared remotes, but retain a prior identity and surface a warning when the same remote name now resolves to a conflicting repository rather than silently rewriting it.
+- Infer discovery hosts from all cached/tracked remotes and union them with explicit `github_hosts` and `github.com`.
+- Introduce canonical PR identity `(host, base owner/repository, PR number)`. Derive it from GitHub associated-PR results for active worktrees rather than branch names or commits.
+- Map each authored PR against every GitHub remote, displaying it once: prefer a catalog entry whose configured `github_remote` maps to the base repository, then one whose `origin` maps, then the earliest catalog entry. Treat missing or invalid catalog paths as unmapped even if their cache matches. Group fork PRs by the base identity.
+- Integrate cache refresh/persistence with catalog refresh without blocking or overwriting concurrent catalog mutations, and surface reconciliation warnings.
+- Cover all supported remote forms, cache additions/removals/conflicts/preference and backward compatibility, host inference, canonical active-worktree suppression, all-remotes mapping, duplicate preference, unusable paths, deduplication, and fork/base grouping.
+
+### Implementation plan
+
+- Modify `src/model.rs` with serialized canonical repository identities, cached per-remote identities/preference, and canonical PR IDs.
+- Modify `src/github.rs` with injectable all-remote enumeration, conservative cache reconciliation, preferred-remote selection, host inference, canonical associated-PR extraction, suppression, and deterministic catalog mapping.
+- Modify `src/tui.rs` to reconcile and persist registered repository caches through the sidecar lock/reload transaction before GitHub refreshes, while exposing conflict warnings without discarding local rows.
+- Update all `RepositoryConfig` construction sites and add focused unit/controller/config compatibility tests.
+
+Risks: remote names can be repointed, so overwriting an established canonical identity would silently remap PRs; conflicts must retain the established mapping until the user resolves it. Catalog cache persistence must reload under the sidecar lock to preserve unrelated concurrent edits.
+
+## Post-Plan Execution Steps
+
+Execute these steps in order:
+
+### Implement
+Execute the plan above.
+
+**Naming gate:** before creating any file, identifier, run-id, or env var, ask "would this name
+make sense to someone who never read the plan?" If it encodes a sequence position (`Stage N` /
+`Phase N` / `stepN`), rename it now — cheap before a checkpoint or downstream reference pins it.
+
+### Verify
+
+1. Run the project's build/lint command. Fix all warnings.
+2. Run the project's test suite.
+3. If tests fail, fix them before proceeding.
+4. If test coverage for the new work is insufficient, add tests.
+
+### Commit
+
+Use Conventional Commits commit message style. If there are pre-existing modified files and they don't look harmful, go ahead and commit them, too.
+
+### Update PLAN.md
+
+Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" section — do not leave it in place with a [DONE] tag, strikethrough, or any other marker. The task and its related subsections should no longer appear in PLAN.md at all. PLAN.md should not have any sort of "Done" section. Then append a new entry to `COMPLETED.md` with two parts, in this order:
+
+1. A brief summary, written now, of what was actually implemented.
+2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
+
+If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
+
+## Viewer-authored PR discovery and progressive snapshots
+
+- Extend `src/github.rs` to discover, per configured/inferred host, the authenticated viewer and every open PR authored by that viewer only—include drafts, exclude review-requested and merely team-authored PRs.
+- Paginate in the background through GitHub Search's practical 1,000-result ceiling, publishing pages as they arrive and surfacing truncation and later-page warnings.
+- Coalesce host-wide authored discovery with startup, manual, scheduled, and post-mutation GitHub refreshes while preserving existing rate-limit suppression, classified errors, direct HTTP/token handling, and branch-enrichment semantics.
+- Render local worktrees immediately and retain the last fully successful authored-PR snapshot while loading and after any page/host failure. Show progressive pages during a refresh, revert partial data after failure, and remove disappeared PRs only after every host completes successfully.
+- Cover exact viewer-author filtering, drafts, pagination/cursors/truncation, Enterprise hosts, partial/later-page failures, progressive publication, stale snapshot retention, successful removals, generation rejection, and refresh coalescing.
 
 ## Virtual authored-PR repository and row models
 

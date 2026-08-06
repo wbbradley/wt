@@ -365,6 +365,8 @@ mod tests {
             label: None,
             worktree_root: None,
             github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
         });
         save(&path, &catalog).unwrap();
         assert_eq!(load(&path).unwrap(), catalog);

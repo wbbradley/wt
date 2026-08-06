@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::github::GitHubError;
-use crate::model::{GitHubBranchData, RepositoryConfig, Worktree, WorktreeStatus};
+use crate::github::{GitHubError, PullRequestMapping};
+use crate::model::{
+    CanonicalPullRequestId, GitHubBranchData, RepositoryConfig, Worktree, WorktreeStatus,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RowId {
@@ -207,6 +209,9 @@ pub struct App {
     pub github: HashMap<PathBuf, GitHubState>,
     pub github_generation: u64,
     pub github_loading: bool,
+    pub github_hosts: BTreeSet<String>,
+    pub authored_pull_requests: Vec<CanonicalPullRequestId>,
+    pub authored_mappings: Vec<PullRequestMapping>,
     pub current_directory: PathBuf,
     pub generation: u64,
     pending_status: usize,
@@ -232,6 +237,9 @@ impl App {
             github: HashMap::new(),
             github_generation: 0,
             github_loading: false,
+            github_hosts: BTreeSet::new(),
+            authored_pull_requests: Vec::new(),
+            authored_mappings: Vec::new(),
             current_directory,
             generation: 0,
             pending_status: 0,
@@ -986,6 +994,8 @@ mod tests {
                 label: Some(path.trim_start_matches('/').to_owned()),
                 worktree_root: None,
                 github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
             },
             session_only: false,
             stale_error: None,

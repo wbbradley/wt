@@ -25,6 +25,8 @@ struct GitHubMessage {
     generation: u64,
     paths: Vec<PathBuf>,
     refresh: GitHubRefresh,
+    cache_updates: Vec<RepositoryConfig>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -782,19 +784,57 @@ impl Controller {
             .collect();
         let generation = self.app.begin_github_refresh(&paths);
         self.next_github_refresh = Instant::now() + self.github_refresh_interval;
-        if paths.is_empty() {
+        if inputs.is_empty() {
             return;
         }
 
         self.github_in_flight = true;
         let service = self.github_service.clone();
         let sender = self.github_sender.clone();
+        let catalog_path = self.catalog_path.clone();
         std::thread::spawn(move || {
+            let mut inputs = inputs;
+            let mut cache_updates = Vec::new();
+            let mut warnings = Vec::new();
+            match config::acquire_catalog_lock(&catalog_path).and_then(|_lock| {
+                let mut catalog = config::load(&catalog_path)?;
+                let refresh =
+                    crate::github::refresh_catalog_remote_identities(&SystemGit, &mut catalog);
+                if refresh.changed {
+                    config::save(&catalog_path, &catalog)?;
+                }
+                Ok((catalog.repositories, refresh.warnings))
+            }) {
+                Ok((repositories, refresh_warnings)) => {
+                    warnings.extend(refresh_warnings);
+                    for input in &mut inputs {
+                        if let Some(repository) = repositories
+                            .iter()
+                            .find(|repository| repository.path == input.repository.path)
+                        {
+                            input.repository = repository.clone();
+                        } else if let Ok(refresh) =
+                            crate::github::refresh_repository_remote_identities(
+                                &SystemGit,
+                                &mut input.repository,
+                            )
+                        {
+                            warnings.extend(refresh.warnings);
+                        }
+                    }
+                    cache_updates = repositories;
+                }
+                Err(error) => warnings.push(format!(
+                    "unable to persist GitHub remote identities: {error}"
+                )),
+            }
             let refresh = service.fetch_catalog(&inputs);
             let _ = sender.send(GitHubMessage {
                 generation,
                 paths,
                 refresh,
+                cache_updates,
+                warnings,
             });
         });
     }
@@ -813,6 +853,40 @@ impl Controller {
         }
         while let Ok(message) = self.github_receiver.try_recv() {
             self.github_in_flight = false;
+            for update in message.cache_updates {
+                if let Some(repository) = self
+                    .catalog
+                    .repositories
+                    .iter_mut()
+                    .find(|repository| repository.path == update.path)
+                {
+                    repository.github_remotes = update.github_remotes.clone();
+                    repository.github_preferred_remote = update.github_preferred_remote.clone();
+                }
+                if let Some(repository) = self
+                    .app
+                    .repositories
+                    .iter_mut()
+                    .find(|repository| repository.config.path == update.path)
+                {
+                    repository.config.github_remotes = update.github_remotes;
+                    repository.config.github_preferred_remote = update.github_preferred_remote;
+                }
+            }
+            if !message.warnings.is_empty() {
+                self.app.inline_error = Some(format!(
+                    "GitHub remote warning: {}",
+                    message.warnings.join("; ")
+                ));
+                changed = true;
+            }
+            self.app.github_hosts = crate::github::inferred_github_hosts(&self.catalog);
+            self.app.authored_mappings = crate::github::map_pull_request_identities(
+                &self.catalog,
+                self.app.authored_pull_requests.clone(),
+                &message.refresh.active_pull_requests,
+                |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
+            );
             changed |= self.app.apply_github_refresh(
                 message.generation,
                 &message.paths,
@@ -870,6 +944,8 @@ fn load_repository_views(catalog: &Catalog, current_directory: &Path) -> Vec<Rep
                 label: None,
                 worktree_root: None,
                 github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
             };
             match git::discover_worktrees(&SystemGit, &identity.anchor) {
                 Ok(worktrees) => views.push(RepositoryView {
@@ -1028,6 +1104,57 @@ mod tests {
     }
 
     #[test]
+    fn background_github_refresh_persists_remote_identity_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project.git");
+        run_git_command(
+            directory.path(),
+            &["init", "--bare", repository.to_str().unwrap()],
+        );
+        run_git_command(
+            &repository,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:Team/Project.git",
+            ],
+        );
+        let catalog_path = directory.path().join("config/wt.json");
+        let catalog = Catalog {
+            repositories: vec![RepositoryConfig {
+                path: std::fs::canonicalize(&repository).unwrap(),
+                label: Some("project".to_owned()),
+                worktree_root: None,
+                github_remote: Some("upstream".to_owned()),
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            }],
+            ..Catalog::default()
+        };
+        config::save(&catalog_path, &catalog).unwrap();
+        let views = load_repository_views(&catalog, directory.path());
+        let app = App::new(views, directory.path().to_owned());
+        let mut controller = Controller::new(catalog_path.clone(), catalog, app);
+        controller.request_github_refresh();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.github_in_flight && Instant::now() < deadline {
+            controller.pump_background_results();
+            std::thread::yield_now();
+        }
+        assert!(!controller.github_in_flight);
+        let stored = config::load(&catalog_path).unwrap();
+        assert_eq!(
+            stored.repositories[0].github_remotes["upstream"],
+            crate::model::GitHubRepositoryIdentity::canonical("github.com", "team", "project")
+        );
+        assert_eq!(
+            stored.repositories[0].github_preferred_remote.as_deref(),
+            Some("upstream")
+        );
+    }
+
+    #[test]
     fn controller_registers_edits_and_unregisters_session_repository() {
         let directory = tempfile::tempdir().unwrap();
         let repository = directory.path().join("project");
@@ -1085,6 +1212,8 @@ mod tests {
             label: Some("project".to_owned()),
             worktree_root: None,
             github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
         };
         let catalog = Catalog {
             repositories: vec![repository_config],
@@ -1125,6 +1254,8 @@ mod tests {
                 label: Some("stale".to_owned()),
                 worktree_root: None,
                 github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
             }],
             ..Catalog::default()
         };
