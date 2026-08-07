@@ -62,6 +62,7 @@ Navigation keys:
 
 Direct action shortcuts:
 
+- `C`: copy an agent-ready prompt for the selected check, feedback item, section, PR stack, or repository
 - `c`: advanced create; `n`: new tracked worktree; `m`: move; `L`/`U`: lock/unlock; `d`: remove
 - `R`: repair; `p`: prune; `a`: register; `e`: edit/relink; `x`: unregister
 
@@ -81,6 +82,18 @@ Compact status legend:
 - `↻` means GitHub data is refreshing and `stale` means the last usable snapshot is retained after an error. Red PR numbers have actionable attention; yellow waiting indicators alone are not actionable.
 
 Press `n` on a repository or one of its worktrees for the common new-worktree flow. The form pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk branch. The new local branch tracks that remote branch; after creation `wt` caches the worktree, exits, and changes the invoking shell into it.
+
+Press `C` to copy a focused repair prompt. On a check or feedback detail it includes only that item; on a Checks or Feedback heading it includes actionable items of that class; on a PR it includes that PR and its stacked descendants; and on a repository it includes every represented actionable PR. Prompts group work by branch and PR, label optional failures, preserve comment/review IDs and paths, and include GitHub investigation commands when database IDs are available. Empty scopes report `nothing to address here` without changing the clipboard.
+
+```text
+## feature/login — PR #42: Fix login race
+Repository: acme/web (github.com)
+PR: https://github.com/acme/web/pull/42
+
+### Failing checks
+- integration [optional; not merge-required; Failure]
+  URL: https://github.com/acme/web/actions/runs/123
+```
 
 Local worktrees are nested by nearest commit ancestry. Local ancestry takes precedence over pull-request stack metadata, and each branch is rendered only once. Worktrees are always enumerated from each tracked repository's centralized `git worktree list --porcelain` data, including linked worktrees outside configured roots.
 

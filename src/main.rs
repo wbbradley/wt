@@ -11,6 +11,7 @@ mod github;
 mod materialize;
 mod model;
 mod operations;
+mod prompt;
 mod terminal;
 mod tui;
 mod ui;

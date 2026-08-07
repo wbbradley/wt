@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::env;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -245,6 +245,47 @@ trait UrlOpener: Send + Sync {
     fn open(&self, url: &str) -> Result<(), String>;
 }
 
+trait Clipboard: Send + Sync {
+    fn copy(&self, contents: &str) -> Result<(), String>;
+}
+
+struct SystemClipboard;
+
+impl Clipboard for SystemClipboard {
+    fn copy(&self, contents: &str) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        let mut child = Command::new("pbcopy");
+        #[cfg(target_os = "windows")]
+        let mut child = {
+            let mut command = Command::new("clip");
+            command
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let mut child = {
+            let mut command = Command::new("wl-copy");
+            command
+        };
+        let mut child = child
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("cannot launch clipboard command: {error}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "clipboard command has no stdin".to_owned())?
+            .write_all(contents.as_bytes())
+            .map_err(|error| format!("cannot write clipboard contents: {error}"))?;
+        let status = child
+            .wait()
+            .map_err(|error| format!("cannot wait for clipboard command: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("clipboard command exited with {status}"))
+        }
+    }
+}
+
 struct SystemUrlOpener;
 
 impl UrlOpener for SystemUrlOpener {
@@ -289,6 +330,7 @@ struct Controller {
     completed_materialization: Option<PathBuf>,
     completed_creation: Option<PathBuf>,
     url_opener: Arc<dyn UrlOpener>,
+    clipboard: Arc<dyn Clipboard>,
 }
 
 impl Controller {
@@ -320,6 +362,7 @@ impl Controller {
             completed_materialization: None,
             completed_creation: None,
             url_opener: Arc::new(SystemUrlOpener),
+            clipboard: Arc::new(SystemClipboard),
         }
     }
 
@@ -332,6 +375,18 @@ impl Controller {
     ) -> Self {
         let mut controller = Self::new(catalog_path, catalog, app);
         controller.url_opener = url_opener;
+        controller
+    }
+
+    #[cfg(test)]
+    fn with_clipboard(
+        catalog_path: PathBuf,
+        catalog: Catalog,
+        app: App,
+        clipboard: Arc<dyn Clipboard>,
+    ) -> Self {
+        let mut controller = Self::new(catalog_path, catalog, app);
+        controller.clipboard = clipboard;
         controller
     }
 
@@ -502,12 +557,28 @@ impl Controller {
     }
 
     fn begin_action(&mut self, action: Action) -> Result<(), TuiError> {
+        if action == Action::CopyAgentPrompt {
+            self.app.progress = None;
+            if let Some(prompt) = self.app.agent_prompt() {
+                match self.clipboard.copy(&prompt) {
+                    Ok(()) => self.app.progress = Some("agent prompt copied".to_owned()),
+                    Err(error) => {
+                        self.app.inline_error =
+                            Some(format!("unable to copy agent prompt: {error}"));
+                    }
+                }
+            } else {
+                self.app.progress = Some("nothing to address here".to_owned());
+            }
+            return Ok(());
+        }
         let (repository, _) = self
             .app
             .selected_repository()
             .ok_or(TuiError::RepositoryGone)?;
         let repository_path = repository.config.path.clone();
         match action {
+            Action::CopyAgentPrompt => unreachable!("handled before repository resolution"),
             Action::Create => self.app.open_form(
                 action,
                 vec![
@@ -1739,13 +1810,137 @@ fn absolute_path(current_directory: &Path, value: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Modal;
+    use crate::app::{Modal, RowId, VirtualRepositoryView};
+    use crate::model::{
+        AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, CheckState,
+        GitHubRepositoryIdentity, PullRequest, PullRequestCheck, PullRequestDetails,
+        PullRequestIdentity, PullRequestState,
+    };
     use std::process::Command;
     use std::sync::Mutex;
 
     struct FakeUrlOpener {
         opened: Mutex<Vec<String>>,
         error: Option<String>,
+    }
+
+    struct FakeClipboard {
+        copied: Mutex<Vec<String>>,
+        error: Option<String>,
+    }
+
+    impl Clipboard for FakeClipboard {
+        fn copy(&self, contents: &str) -> Result<(), String> {
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            self.copied.lock().unwrap().push(contents.to_owned());
+            Ok(())
+        }
+    }
+
+    fn prompt_app() -> App {
+        let repository = GitHubRepositoryIdentity::canonical("github.com", "team", "project");
+        let identity = CanonicalPullRequestId {
+            repository: repository.clone(),
+            number: 42,
+        };
+        let pull_request = PullRequest {
+            number: 42,
+            title: "Fix CI".to_owned(),
+            url: "https://github.com/team/project/pull/42".to_owned(),
+            state: PullRequestState::Open,
+            updated_at: "2026-08-07".to_owned(),
+            review_decision: None,
+            auto_merge: false,
+            base: PullRequestIdentity {
+                repository: Some("team/project".to_owned()),
+                branch: "main".to_owned(),
+                oid: None,
+            },
+            head: PullRequestIdentity {
+                repository: Some("team/project".to_owned()),
+                branch: "fix-ci".to_owned(),
+                oid: None,
+            },
+            checks: CheckRollup::Failure,
+        };
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: repository,
+            mapped_repository: None,
+            expanded: true,
+            pull_requests: vec![AuthoredPullRequest {
+                identity: identity.clone(),
+                author: "viewer".to_owned(),
+                pull_request,
+            }],
+        }];
+        app.pull_request_details.insert(
+            identity.clone(),
+            PullRequestDetails {
+                checks: vec![PullRequestCheck {
+                    name: "test".to_owned(),
+                    state: CheckState::Failure,
+                    target_url: None,
+                    required: true,
+                    source_order: 0,
+                    completed_at: None,
+                }],
+                ..PullRequestDetails::default()
+            },
+        );
+        app.selected = Some(RowId::VirtualPullRequest(identity));
+        app
+    }
+
+    #[test]
+    fn injected_clipboard_handles_success_empty_scope_and_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let clipboard = Arc::new(FakeClipboard {
+            copied: Mutex::new(Vec::new()),
+            error: None,
+        });
+        let mut controller = Controller::with_clipboard(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            prompt_app(),
+            clipboard.clone(),
+        );
+        controller
+            .handle_intent(Intent::BeginAction(Action::CopyAgentPrompt))
+            .unwrap();
+        assert_eq!(clipboard.copied.lock().unwrap().len(), 1);
+        assert_eq!(
+            controller.app.progress.as_deref(),
+            Some("agent prompt copied")
+        );
+
+        controller.app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        controller
+            .handle_intent(Intent::BeginAction(Action::CopyAgentPrompt))
+            .unwrap();
+        assert_eq!(clipboard.copied.lock().unwrap().len(), 1);
+        assert_eq!(
+            controller.app.progress.as_deref(),
+            Some("nothing to address here")
+        );
+
+        controller.app = prompt_app();
+        controller.clipboard = Arc::new(FakeClipboard {
+            copied: Mutex::new(Vec::new()),
+            error: Some("clipboard unavailable".to_owned()),
+        });
+        controller
+            .handle_intent(Intent::BeginAction(Action::CopyAgentPrompt))
+            .unwrap();
+        assert!(
+            controller
+                .app
+                .inline_error
+                .as_deref()
+                .is_some_and(|error| error.contains("clipboard unavailable"))
+        );
     }
 
     impl UrlOpener for FakeUrlOpener {
