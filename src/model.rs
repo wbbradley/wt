@@ -112,13 +112,13 @@ impl GitHubRepositoryIdentity {
     }
 }
 
-#[derive(Clone, Debug, Hash, Ord, PartialEq, PartialOrd, Eq)]
+#[derive(Clone, Debug, Deserialize, Hash, Ord, PartialEq, PartialOrd, Eq, Serialize)]
 pub struct CanonicalPullRequestId {
     pub repository: GitHubRepositoryIdentity,
     pub number: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct AuthoredPullRequest {
     pub identity: CanonicalPullRequestId,
     pub author: String,
@@ -182,7 +182,8 @@ pub struct RepositoryDiscovery {
     pub result: Result<Vec<Worktree>, String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PullRequestState {
     Draft,
     Open,
@@ -201,7 +202,8 @@ impl std::fmt::Display for PullRequestState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckRollup {
     Success,
     Failure,
@@ -224,14 +226,14 @@ impl std::fmt::Display for CheckRollup {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PullRequestIdentity {
     pub repository: Option<String>,
     pub branch: String,
     pub oid: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PullRequest {
     pub number: u64,
     pub title: String,
@@ -245,13 +247,13 @@ pub struct PullRequest {
     pub checks: CheckRollup,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RateLimit {
     pub remaining: u64,
     pub reset_at: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct GitHubBranchData {
     pub pull_request: Option<PullRequest>,
     pub warnings: Vec<String>,
