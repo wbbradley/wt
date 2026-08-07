@@ -5,7 +5,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{App, GitHubState, Modal, Pane, StatusState, VisibleRow};
-use crate::model::CheckRollup;
+use crate::model::{
+    CheckRollup, MergeConflictState, PullRequestDetails, PullRequestState, RequiredCheckReadiness,
+    ReviewReadiness,
+};
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -80,16 +83,17 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .flatten()
                 .map(|state| format!(" [{state}]"))
                 .collect::<String>();
+                let available = area.width.saturating_sub(7) as usize;
+                let label = truncate_label(
+                    &repository.config.display_label(),
+                    available.saturating_sub(state.chars().count()),
+                );
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        format!("{arrow} {}", repository.config.display_label()),
+                        format!("{arrow} {label}"),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(state, Style::default().fg(Color::Yellow)),
-                    Span::styled(
-                        format!("  {}", display_path(&repository.config.path)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
                 ]))
             }
             VisibleRow::Worktree {
@@ -98,7 +102,8 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 stack_depth,
                 ..
             } => {
-                let worktree = &app.repositories[*repository_index].worktrees[*worktree_index];
+                let repository = &app.repositories[*repository_index];
+                let worktree = &repository.worktrees[*worktree_index];
                 let current = path_contains(&worktree.path, &app.current_directory);
                 let identity = worktree
                     .branch
@@ -112,31 +117,28 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             .map(|head| format!("detached:{}", short(head)))
                     })
                     .unwrap_or_else(|| if worktree.bare { "bare" } else { "unknown" }.to_owned());
-                let flags = [
-                    worktree.locked.as_ref().map(|_| "locked"),
-                    worktree.prunable.as_ref().map(|_| "prunable"),
-                    worktree.bare.then_some("anchor"),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(",");
-                let (local, local_color) = match app.statuses.get(&worktree.path) {
-                    Some(StatusState::Pending) => ("[…]".to_owned(), Color::DarkGray),
-                    Some(StatusState::Ready(status)) => (
-                        status.compact(),
-                        if status.is_dirty() {
-                            Color::Red
-                        } else {
-                            Color::Green
-                        },
-                    ),
-                    Some(StatusState::Error(_)) => ("[!]".to_owned(), Color::Yellow),
-                    None => (String::new(), Color::DarkGray),
-                };
-                let github = github_summary(app.github.get(&worktree.path));
-                let github_color = github_summary_color(app.github.get(&worktree.path));
-                ListItem::new(Line::from(vec![
+                let github_state = app.github.get(&worktree.path);
+                let pull_request = github_state
+                    .and_then(GitHubState::data)
+                    .and_then(|data| data.pull_request.as_ref());
+                let details = pull_request.and_then(|pull_request| {
+                    app.pull_request_details_for(repository, pull_request)
+                        .map(|(_, details)| details)
+                });
+                let mut suffix = pull_request
+                    .map(|pull_request| compact_pull_request_spans(pull_request, details, false))
+                    .unwrap_or_default();
+                suffix.extend(github_freshness_spans(github_state));
+                suffix.extend(local_state_spans(
+                    app.statuses.get(&worktree.path),
+                    worktree,
+                ));
+                let prefix_width = stack_depth * 2 + 4;
+                let suffix_width: usize = suffix.iter().map(|span| span.width()).sum();
+                let label_width = (area.width.saturating_sub(4) as usize)
+                    .saturating_sub(prefix_width + suffix_width)
+                    .max(4);
+                let mut spans = vec![
                     Span::styled(
                         format!(
                             "{}{}",
@@ -145,44 +147,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         ),
                         Style::default().fg(Color::Green),
                     ),
-                    Span::raw(identity),
-                    Span::styled(
-                        worktree
-                            .head
-                            .as_deref()
-                            .map(|head| format!(" {}", short(head)))
-                            .unwrap_or_default(),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        if flags.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" [{flags}]")
-                        },
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(
-                        format!(" {}", display_path(&worktree.path)),
-                        Style::default().fg(Color::Blue),
-                    ),
-                    Span::styled(
-                        if local.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {local}")
-                        },
-                        Style::default().fg(local_color),
-                    ),
-                    Span::styled(
-                        if github.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" {github}")
-                        },
-                        Style::default().fg(github_color),
-                    ),
-                ]))
+                    Span::raw(truncate_label(&identity, label_width)),
+                ];
+                spans.extend(suffix);
+                ListItem::new(Line::from(spans))
             }
             VisibleRow::VirtualRepository {
                 virtual_repository_index,
@@ -190,19 +158,21 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } => {
                 let repository = &app.virtual_repositories[*virtual_repository_index];
                 let arrow = if repository.expanded { "▾" } else { "▸" };
+                let marker = if repository.mapped_repository.is_none() {
+                    " [no local repo]"
+                } else {
+                    ""
+                };
+                let label = truncate_label(
+                    &repository.identity.full_name(),
+                    (area.width.saturating_sub(9) as usize).saturating_sub(marker.chars().count()),
+                );
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        format!("  {arrow} {}", repository.identity.full_name()),
+                        format!("  {arrow} {label}"),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        if repository.mapped_repository.is_none() {
-                            " [no local repo]"
-                        } else {
-                            ""
-                        },
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(marker, Style::default().fg(Color::DarkGray)),
                 ]))
             }
             VisibleRow::VirtualPullRequest {
@@ -214,36 +184,26 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } => {
                 let pull_request = &app.virtual_repositories[*virtual_repository_index]
                     .pull_requests[*pull_request_index];
-                ListItem::new(Line::from(vec![
-                    Span::raw(" ".repeat(
-                        if mapped_repository_index.is_some() {
-                            4
-                        } else {
-                            6
-                        } + stack_depth * 2,
-                    )),
+                let indent = if mapped_repository_index.is_some() {
+                    4
+                } else {
+                    6
+                } + stack_depth * 2;
+                let details = app.pull_request_details.get(&pull_request.identity);
+                let suffix = compact_pull_request_spans(&pull_request.pull_request, details, true);
+                let suffix_width: usize = suffix.iter().map(|span| span.width()).sum();
+                let label_width = (area.width.saturating_sub(4) as usize)
+                    .saturating_sub(indent + suffix_width)
+                    .max(4);
+                let mut spans = vec![
+                    Span::raw(" ".repeat(indent)),
                     Span::styled(
-                        &pull_request.pull_request.head.branch,
+                        truncate_label(&pull_request.pull_request.head.branch, label_width),
                         Style::default().fg(Color::LightMagenta),
                     ),
-                    Span::raw(format!(
-                        " #{} — {} ",
-                        pull_request.identity.number, pull_request.pull_request.title
-                    )),
-                    Span::styled("[virtual]", Style::default().fg(Color::Magenta)),
-                    Span::styled(
-                        format!(" [{}]", pull_request.pull_request.checks),
-                        Style::default().fg(check_color(pull_request.pull_request.checks)),
-                    ),
-                    Span::styled(
-                        if pull_request.pull_request.auto_merge {
-                            " [auto-merge]"
-                        } else {
-                            ""
-                        },
-                        Style::default().fg(Color::LightBlue),
-                    ),
-                ]))
+                ];
+                spans.extend(suffix);
+                ListItem::new(Line::from(spans))
             }
         })
         .collect();
@@ -274,6 +234,118 @@ fn list_block(app: &App) -> Block<'static> {
         } else {
             Style::default()
         })
+}
+
+fn compact_pull_request_spans(
+    pull_request: &crate::model::PullRequest,
+    details: Option<&PullRequestDetails>,
+    virtual_row: bool,
+) -> Vec<Span<'static>> {
+    let summary = details.map(PullRequestDetails::attention_summary);
+    let number_style = if summary.is_some_and(|summary| summary.is_actionable()) {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let mut spans = vec![Span::styled(
+        format!(" #{}", pull_request.number),
+        number_style,
+    )];
+    match pull_request.state {
+        PullRequestState::Draft => spans.push(badge("draft", Color::LightBlue)),
+        PullRequestState::Merged => spans.push(badge("merged", Color::Green)),
+        PullRequestState::Closed => spans.push(badge("closed", Color::DarkGray)),
+        PullRequestState::Open => {}
+    }
+    let required_checks = summary
+        .map(|summary| summary.required_checks)
+        .unwrap_or(RequiredCheckReadiness::Unknown);
+    spans.push(match required_checks {
+        RequiredCheckReadiness::Ready => badge("C✓", Color::Green),
+        RequiredCheckReadiness::Failure => badge("C✗", Color::Red),
+        RequiredCheckReadiness::Pending => badge("C…", Color::Yellow),
+        RequiredCheckReadiness::Unknown => badge("C?", Color::DarkGray),
+    });
+    if let Some(optional_failures) = summary
+        .map(|summary| summary.optional_failures)
+        .filter(|failures| *failures > 0)
+    {
+        spans.push(badge(&format!("O!{optional_failures}"), Color::LightRed));
+    }
+    let review = summary
+        .map(|summary| summary.review)
+        .unwrap_or(ReviewReadiness::Unknown);
+    spans.push(match review {
+        ReviewReadiness::Approved => badge("R✓", Color::Green),
+        ReviewReadiness::ChangesRequested => badge("R✗", Color::Red),
+        ReviewReadiness::Waiting => badge("R…", Color::Yellow),
+        ReviewReadiness::Unknown => badge("R?", Color::DarkGray),
+    });
+    if let Some(feedback) = summary
+        .map(|summary| summary.unresolved_feedback)
+        .filter(|feedback| *feedback > 0)
+    {
+        spans.push(badge(&format!("F{feedback}"), Color::Red));
+    }
+    match summary.map(|summary| summary.merge_conflict) {
+        Some(MergeConflictState::Conflicting) => spans.push(badge("X", Color::Red)),
+        Some(MergeConflictState::Unknown) | None => {
+            spans.push(badge("X?", Color::DarkGray));
+        }
+        Some(MergeConflictState::Clean) => {}
+    }
+    if virtual_row {
+        spans.push(badge("V", Color::Magenta));
+    }
+    spans
+}
+
+fn github_freshness_spans(state: Option<&GitHubState>) -> Vec<Span<'static>> {
+    match state {
+        Some(GitHubState::Loading { .. }) => vec![badge("↻", Color::Yellow)],
+        Some(GitHubState::Stale { .. }) => vec![badge("stale", Color::Yellow)],
+        Some(GitHubState::Ready(_)) | None => Vec::new(),
+    }
+}
+
+fn local_state_spans(
+    state: Option<&StatusState>,
+    worktree: &crate::model::Worktree,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    match state {
+        Some(StatusState::Pending) => spans.push(badge("local…", Color::DarkGray)),
+        Some(StatusState::Ready(status)) if status.is_dirty() => spans.push(badge(
+            &format!("D{}", status.staged + status.modified + status.untracked),
+            Color::Red,
+        )),
+        Some(StatusState::Error(_)) => spans.push(badge("local!", Color::Yellow)),
+        Some(StatusState::Ready(_)) | None => {}
+    }
+    if worktree.locked.is_some() {
+        spans.push(badge("L", Color::Yellow));
+    }
+    if worktree.prunable.is_some() {
+        spans.push(badge("P", Color::Yellow));
+    }
+    spans
+}
+
+fn badge(text: &str, color: Color) -> Span<'static> {
+    Span::styled(format!(" {text}"), Style::default().fg(color))
+}
+
+fn truncate_label(label: &str, width: usize) -> String {
+    let length = label.chars().count();
+    if length <= width {
+        return label.to_owned();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut truncated: String = label.chars().take(width - 1).collect();
+    truncated.push('…');
+    truncated
 }
 
 fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -677,33 +749,6 @@ fn header_progress(app: &App) -> String {
     }
 }
 
-fn github_summary(state: Option<&GitHubState>) -> String {
-    match state {
-        Some(GitHubState::Loading { previous }) => previous
-            .as_ref()
-            .map(|data| format!("{} (refreshing)", pull_request_summary(data)))
-            .unwrap_or_else(|| "PR …".to_owned()),
-        Some(GitHubState::Ready(data)) => pull_request_summary(data),
-        Some(GitHubState::Stale { previous, .. }) => previous
-            .as_ref()
-            .map(|data| format!("{} (stale)", pull_request_summary(data)))
-            .unwrap_or_else(|| "GitHub error".to_owned()),
-        None => String::new(),
-    }
-}
-
-fn github_summary_color(state: Option<&GitHubState>) -> Color {
-    let data = match state {
-        Some(GitHubState::Loading { previous }) => previous.as_ref(),
-        Some(GitHubState::Ready(data)) => Some(data),
-        Some(GitHubState::Stale { previous, .. }) => previous.as_ref(),
-        None => None,
-    };
-    data.and_then(|data| data.pull_request.as_ref())
-        .map(|pull_request| check_color(pull_request.checks))
-        .unwrap_or(Color::Cyan)
-}
-
 fn check_color(checks: CheckRollup) -> Color {
     match checks {
         CheckRollup::Success => Color::Green,
@@ -711,26 +756,6 @@ fn check_color(checks: CheckRollup) -> Color {
         CheckRollup::Pending | CheckRollup::Expected => Color::Yellow,
         CheckRollup::Unknown => Color::DarkGray,
     }
-}
-
-fn pull_request_summary(data: &crate::model::GitHubBranchData) -> String {
-    data.pull_request
-        .as_ref()
-        .map(|pull_request| {
-            format!(
-                "PR #{} {} · {}{} · {}",
-                pull_request.number,
-                pull_request.state,
-                pull_request.checks,
-                if pull_request.auto_merge {
-                    " · auto-merge"
-                } else {
-                    ""
-                },
-                pull_request.title
-            )
-        })
-        .unwrap_or_else(|| "no PR".to_owned())
 }
 
 fn append_github_details(lines: &mut Vec<Line<'static>>, data: &crate::model::GitHubBranchData) {
@@ -846,9 +871,11 @@ mod tests {
     use super::*;
     use crate::app::{GitHubState, RepositoryView, RowId, VirtualRepositoryView};
     use crate::model::{
-        AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, GitHubBranchData,
-        GitHubRepositoryIdentity, PullRequest, PullRequestIdentity, PullRequestState, RateLimit,
-        RepositoryConfig, Worktree,
+        AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, CheckState, FeedbackKind,
+        GitHubBranchData, GitHubRepositoryIdentity, MergeConflictState, PullRequest,
+        PullRequestCheck, PullRequestDetails, PullRequestFeedback, PullRequestIdentity,
+        PullRequestState, RateLimit, RepositoryConfig, ReviewerReview, SubmittedReviewState,
+        Worktree, WorktreeStatus,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -874,11 +901,19 @@ mod tests {
                 branch: Some("refs/heads/main".to_owned()),
                 detached: false,
                 bare: false,
-                locked: None,
-                prunable: None,
+                locked: Some("in use".to_owned()),
+                prunable: Some("missing".to_owned()),
             }],
         };
         let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        app.statuses.insert(
+            PathBuf::from("/repo"),
+            StatusState::Ready(WorktreeStatus {
+                staged: 1,
+                modified: 2,
+                ..WorktreeStatus::default()
+            }),
+        );
         app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -886,8 +921,24 @@ mod tests {
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("project [session-only]"));
         assert!(content.contains("branch"));
-        terminal.resize(Rect::new(0, 0, 42, 12)).unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let row = buffer_lines(terminal.backend().buffer())
+            .into_iter()
+            .find(|line| line.contains("main"))
+            .unwrap();
+        assert!(row.contains("main D3 L P"));
+        assert!(!row.contains("/repo"));
+        assert!(!row.contains("12345678"));
+        let mut narrow_terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        narrow_terminal
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let narrow_row = buffer_lines(narrow_terminal.backend().buffer())
+            .into_iter()
+            .find(|line| line.contains("main"))
+            .unwrap();
+        assert!(narrow_row.contains("main D3 L P"));
+        assert!(!narrow_row.contains("/repo"));
+        assert!(!narrow_row.contains("12345678"));
     }
 
     #[test]
@@ -962,7 +1013,7 @@ mod tests {
                 },
                 head: PullRequestIdentity {
                     repository: Some("viewer/fork".to_owned()),
-                    branch: "topic".to_owned(),
+                    branch: "feature/compact-attention-indicators-with-a-very-long-name".to_owned(),
                     oid: Some("head-sha".to_owned()),
                 },
                 checks: CheckRollup::Failure,
@@ -975,28 +1026,101 @@ mod tests {
             expanded: true,
             pull_requests: vec![authored],
         }];
+        app.pull_request_details.insert(
+            pull_request_id.clone(),
+            PullRequestDetails {
+                checks: vec![
+                    PullRequestCheck {
+                        name: "required".to_owned(),
+                        state: CheckState::Success,
+                        target_url: None,
+                        required: true,
+                        source_order: 0,
+                        completed_at: None,
+                    },
+                    PullRequestCheck {
+                        name: "optional".to_owned(),
+                        state: CheckState::Failure,
+                        target_url: None,
+                        required: false,
+                        source_order: 1,
+                        completed_at: None,
+                    },
+                ],
+                check_contexts_complete: true,
+                reviewer_reviews: vec![ReviewerReview {
+                    id: "review".to_owned(),
+                    database_id: Some(9),
+                    reviewer: "reviewer".to_owned(),
+                    state: SubmittedReviewState::ChangesRequested,
+                    submitted_at: None,
+                }],
+                reviews_complete: true,
+                feedback: vec![PullRequestFeedback {
+                    id: "comment".to_owned(),
+                    database_id: Some(10),
+                    thread_id: Some("thread".to_owned()),
+                    kind: FeedbackKind::InlineThread,
+                    author: "reviewer".to_owned(),
+                    body: "fix this".to_owned(),
+                    path: Some("src/lib.rs".to_owned()),
+                    permalink: None,
+                    outdated: false,
+                }],
+                feedback_complete: true,
+                merge_conflict: MergeConflictState::Conflicting,
+                warnings: Vec::new(),
+                ..PullRequestDetails::default()
+            },
+        );
         app.selected = Some(RowId::VirtualPullRequest(pull_request_id));
         let mut terminal = Terminal::new(TestBackend::new(120, 50)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
-        assert!(content.contains("topic #42 — virtual feature [virtual] [failure]"));
+        let row = buffer_lines(buffer)
+            .into_iter()
+            .find(|line| line.contains("#42"))
+            .unwrap();
+        assert!(row.contains(
+            "feature/compact-attention-indicators-with-a-very-long-name #42 draft C✓ O!1 R✗ F1 X V"
+        ));
+        assert!(!row.contains("virtual feature"));
+        assert!(!row.contains("head-sha"));
         assert_eq!(
-            buffer
-                .content()
-                .iter()
-                .filter(|cell| cell.fg == Color::LightMagenta)
-                .map(|cell| cell.symbol())
-                .collect::<String>(),
-            "topic"
+            colored_text(buffer, Color::LightMagenta),
+            "feature/compact-attention-indicators-with-a-very-long-name"
         );
-        assert!(content.contains("[auto-merge]"));
-        assert!(content.contains("viewer/fork:topic"));
+        assert!(colored_text(buffer, Color::Green).contains("C✓"));
+        assert!(colored_text(buffer, Color::LightRed).contains("O!1"));
+        let red = colored_text(buffer, Color::Red);
+        assert!(red.contains("R✗"));
+        assert!(red.contains("F1"));
+        assert!(red.contains('X'));
+        assert!(!row.contains("auto-merge"));
+        assert!(
+            content
+                .contains("viewer/fork:feature/compact-attention-indicators-with-a-very-long-name")
+        );
         assert!(content.contains("head-sha"));
         assert!(content.contains("CHANGES_REQUESTED"));
         assert!(content.contains("auto-merge enabled"));
         assert!(content.contains("Enter to create worktree"));
+
+        let mut narrow_terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        narrow_terminal
+            .draw(|frame| render(frame, &mut app))
+            .unwrap();
+        let narrow_buffer = narrow_terminal.backend().buffer();
+        let narrow_row = buffer_lines(narrow_buffer)
+            .into_iter()
+            .find(|line| line.contains("#42"))
+            .unwrap();
+        assert!(narrow_row.contains('…'), "narrow row: {narrow_row:?}");
+        assert!(narrow_row.contains("#42 draft C✓ O!1 R✗ F1 X V"));
+        assert!(!narrow_row.contains("virtual feature"));
+        assert!(!narrow_row.contains("head-sha"));
     }
 
     #[test]
@@ -1089,7 +1213,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let loading = buffer_text(terminal.backend().buffer());
         assert!(loading.contains("loading GitHub PRs"));
-        assert!(loading.contains("PR …"));
+        assert!(loading.contains("↻"));
 
         let previous = GitHubBranchData {
             pull_request: None,
@@ -1205,5 +1329,24 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn colored_text(buffer: &ratatui::buffer::Buffer, color: Color) -> String {
+        buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == color)
+            .map(|cell| cell.symbol())
+            .collect()
     }
 }
