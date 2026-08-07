@@ -509,3 +509,45 @@ Reconciled the remote cache immediately after a virtual pull request becomes a l
 This task was supplied directly by the user while `PLAN.md` contained no queued entry:
 
 > I also noticed that on boot, if on the last time we ran, we converted a virtual branch to a local worktree, then that branch appears twice because of the cache. We should probably invalidate the cache when we create a new worktree that makes a branch no longer virtual.
+
+
+## Hydrate canonical PR attention data
+
+Implemented a canonical, host-aware PR attention store shared by local, authored, cached, and virtual representations. Added normalized required and optional checks, deterministic rerun folding, review requests and latest reviewer states, unresolved thread comments and review summaries with stable IDs, conflict/readiness summaries, bounded direct-PR context pagination, partial-data unknown semantics, per-host suppression, generation-safe stale fallback, and backward-compatible first-frame cache hydration.
+
+## Hydrate canonical PR attention data
+
+Build a detailed GitHub payload keyed by `CanonicalPullRequestId` so every local, authored, cached, or virtual representation of the same PR shares one authoritative record.
+
+Requires no other planned task.
+
+Affected areas: `src/model.rs`, `src/github.rs`, `src/cache.rs`, `src/tui.rs`, and focused fixtures/tests in those modules.
+
+- Model individual check runs and status contexts with name, normalized state, target URL, and whether they are required.
+- Model current review requests and each user/team reviewer's latest submitted state.
+- Model unresolved inline review threads and non-empty review summaries with stable GitHub IDs, author, body, path, permalink, and outdated status. Store REST/database IDs directly where GitHub exposes them; do not recover IDs from URL fragments.
+- Model merge conflicts and compute separate summaries for required-check readiness, review state, and unresolved actionable feedback.
+- Treat only required checks as merge-blocking. A failed optional check remains visible and prompt-actionable without making required-check readiness red.
+- Normalize duplicate check runs deterministically, preferring the current/newest run for a check name.
+- Discover canonical PR identities first, deduplicate them across branch and authored searches, and hydrate each distinct PR once per refresh.
+- Fetch complete check-context connections with bounded pagination and `isRequired(pullRequestNumber:)`. Missing, partial, truncated, or still-computing data must produce `Unknown`, not a false green.
+- Preserve progressive authored results, per-host credentials/rate-limit suppression, stale-data fallback, and branch warnings.
+- Extend the machine-local GitHub cache with backward-compatible defaults so detailed data is available in the first frame and older cache files remain readable.
+- Never serialize tokens or fail local navigation because detailed GitHub data is unavailable.
+
+Complete when:
+
+- A PR discovered through multiple local branches and authored search has one detailed record and one hydration alias.
+- Required success plus optional failure reports merge-ready while retaining the optional failure.
+- Failed required checks, pending required checks, unknown/truncated contexts, requested reviewers, changes requested, unresolved threads, review summaries, and conflicts normalize correctly.
+- Local and virtual rows resolve to the same detailed record before and after cache reload.
+- Existing GitHub Enterprise, partial-error, refresh-coalescing, and materialization behavior remains intact.
+
+Verification:
+
+- Add unit tests for normalization, reviewer folding, duplicate checks, required-only rollups, attention summaries, and canonical deduplication.
+- Add mocked HTTP tests for variables, aliases, pagination bounds, partial GraphQL responses, rate limits, and one-hydration-per-identity behavior.
+- Add cache compatibility and round-trip tests.
+- Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+
+Risks: `isRequired` needs a literal PR number and cannot be finalized reliably inside the broad search query, so keep a bounded direct-PR hydration path. Large repositories can exceed a single 100-context page; truncation must remain visibly unknown. Deleted users, bots, teams, inaccessible threads, and null GraphQL actors must degrade gracefully.
