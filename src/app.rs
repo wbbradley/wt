@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::github::{GitHubError, PullRequestMapping};
 use crate::model::{
     AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, GitHubRepositoryIdentity,
-    RepositoryConfig, Worktree, WorktreeStatus,
+    PullRequestDetails, RepositoryConfig, Worktree, WorktreeStatus,
 };
 
 const LIST_SCROLL_MARGIN: usize = 5;
@@ -353,6 +353,8 @@ pub struct App {
     pub github_hosts: BTreeSet<String>,
     pub authored_pull_requests: AuthoredPullRequestState,
     pub active_pull_requests: HashSet<CanonicalPullRequestId>,
+    pub pull_request_details: BTreeMap<CanonicalPullRequestId, PullRequestDetails>,
+    pub pull_request_detail_errors: BTreeMap<CanonicalPullRequestId, String>,
     pub authored_mappings: Vec<PullRequestMapping>,
     pub current_directory: PathBuf,
     pub generation: u64,
@@ -385,6 +387,8 @@ impl App {
             github_hosts: BTreeSet::new(),
             authored_pull_requests: AuthoredPullRequestState::default(),
             active_pull_requests: HashSet::new(),
+            pull_request_details: BTreeMap::new(),
+            pull_request_detail_errors: BTreeMap::new(),
             authored_mappings: Vec::new(),
             current_directory,
             generation: 0,
@@ -1063,6 +1067,30 @@ impl App {
             self.github.insert(path.clone(), state);
         }
         self.github_loading = false;
+        true
+    }
+
+    pub fn apply_pull_request_details(
+        &mut self,
+        generation: u64,
+        results: BTreeMap<CanonicalPullRequestId, Result<PullRequestDetails, GitHubError>>,
+    ) -> bool {
+        if generation != self.github_generation {
+            return false;
+        }
+        for (identity, result) in results {
+            match result {
+                Ok(details) => {
+                    let _ = details.attention_summary();
+                    self.pull_request_detail_errors.remove(&identity);
+                    self.pull_request_details.insert(identity, details);
+                }
+                Err(error) => {
+                    self.pull_request_detail_errors
+                        .insert(identity, error.to_string());
+                }
+            }
+        }
         true
     }
 
@@ -2226,6 +2254,36 @@ mod tests {
                 error,
             }) if previous == &data && error.contains("authentication")
         ));
+    }
+
+    #[test]
+    fn canonical_detail_refresh_retains_data_on_error_and_rejects_old_generation() {
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        let identity = CanonicalPullRequestId {
+            repository: GitHubRepositoryIdentity::canonical("github.com", "team", "project"),
+            number: 42,
+        };
+        let first = app.begin_github_refresh(&[]);
+        let details = PullRequestDetails {
+            check_contexts_complete: true,
+            ..PullRequestDetails::default()
+        };
+        assert!(app.apply_pull_request_details(
+            first,
+            BTreeMap::from([(identity.clone(), Ok(details.clone()))]),
+        ));
+        let second = app.begin_github_refresh(&[]);
+        assert!(!app.apply_pull_request_details(
+            first,
+            BTreeMap::from([(identity.clone(), Ok(PullRequestDetails::default()))]),
+        ));
+        assert!(app.apply_pull_request_details(
+            second,
+            BTreeMap::from([(identity.clone(), Err(GitHubError::Unauthorized))]),
+        ));
+
+        assert_eq!(app.pull_request_details[&identity], details);
+        assert!(app.pull_request_detail_errors[&identity].contains("authentication"));
     }
 
     #[test]

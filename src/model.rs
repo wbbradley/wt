@@ -118,6 +118,266 @@ pub struct CanonicalPullRequestId {
     pub number: u64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    Success,
+    Failure,
+    Pending,
+    Expected,
+    Error,
+    Neutral,
+    Skipped,
+    Unknown,
+}
+
+impl CheckState {
+    pub fn is_actionable(self) -> bool {
+        matches!(self, Self::Failure | Self::Error)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PullRequestCheck {
+    pub name: String,
+    pub state: CheckState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_url: Option<String>,
+    pub required: bool,
+    #[serde(default)]
+    pub source_order: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredCheckReadiness {
+    Ready,
+    Failure,
+    Pending,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerKind {
+    User,
+    Team,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ReviewRequest {
+    pub id: String,
+    pub name: String,
+    pub kind: ReviewerKind,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmittedReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+    Pending,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ReviewerReview {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_id: Option<u64>,
+    pub reviewer: String,
+    pub state: SubmittedReviewState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewReadiness {
+    Approved,
+    ChangesRequested,
+    Waiting,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackKind {
+    InlineThread,
+    ReviewSummary,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PullRequestFeedback {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub kind: FeedbackKind,
+    pub author: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permalink: Option<String>,
+    #[serde(default)]
+    pub outdated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeConflictState {
+    Clean,
+    Conflicting,
+    #[default]
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PullRequestDetails {
+    #[serde(default)]
+    pub checks: Vec<PullRequestCheck>,
+    #[serde(default)]
+    pub check_contexts_complete: bool,
+    #[serde(default)]
+    pub review_requests: Vec<ReviewRequest>,
+    #[serde(default)]
+    pub reviewer_reviews: Vec<ReviewerReview>,
+    #[serde(default)]
+    pub reviews_complete: bool,
+    #[serde(default)]
+    pub feedback: Vec<PullRequestFeedback>,
+    #[serde(default)]
+    pub feedback_complete: bool,
+    #[serde(default)]
+    pub merge_conflict: MergeConflictState,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PullRequestAttentionSummary {
+    pub required_checks: RequiredCheckReadiness,
+    pub review: ReviewReadiness,
+    pub unresolved_feedback: usize,
+    pub optional_failures: usize,
+    pub merge_conflict: MergeConflictState,
+}
+
+impl PullRequestDetails {
+    pub fn normalize_checks(&mut self) {
+        let mut checks = BTreeMap::<String, PullRequestCheck>::new();
+        for check in std::mem::take(&mut self.checks) {
+            let key = check.name.to_ascii_lowercase();
+            match checks.get(&key) {
+                Some(current) if !newer_check(&check, current) => {}
+                _ => {
+                    checks.insert(key, check);
+                }
+            }
+        }
+        self.checks = checks.into_values().collect();
+        self.checks.sort_by_key(|check| check.source_order);
+    }
+
+    pub fn fold_latest_reviews(&mut self) {
+        let mut reviews = BTreeMap::<String, ReviewerReview>::new();
+        for review in std::mem::take(&mut self.reviewer_reviews) {
+            let key = review.reviewer.to_ascii_lowercase();
+            match reviews.get(&key) {
+                Some(current) if !newer_review(&review, current) => {}
+                _ => {
+                    reviews.insert(key, review);
+                }
+            }
+        }
+        self.reviewer_reviews = reviews.into_values().collect();
+    }
+
+    pub fn required_check_readiness(&self) -> RequiredCheckReadiness {
+        if !self.check_contexts_complete {
+            return RequiredCheckReadiness::Unknown;
+        }
+        let required: Vec<_> = self.checks.iter().filter(|check| check.required).collect();
+        if required
+            .iter()
+            .any(|check| matches!(check.state, CheckState::Failure | CheckState::Error))
+        {
+            RequiredCheckReadiness::Failure
+        } else if required
+            .iter()
+            .any(|check| matches!(check.state, CheckState::Pending | CheckState::Expected))
+        {
+            RequiredCheckReadiness::Pending
+        } else if required
+            .iter()
+            .any(|check| matches!(check.state, CheckState::Unknown))
+        {
+            RequiredCheckReadiness::Unknown
+        } else {
+            RequiredCheckReadiness::Ready
+        }
+    }
+
+    pub fn review_readiness(&self) -> ReviewReadiness {
+        if !self.reviews_complete {
+            return ReviewReadiness::Unknown;
+        }
+        if self
+            .reviewer_reviews
+            .iter()
+            .any(|review| review.state == SubmittedReviewState::ChangesRequested)
+        {
+            ReviewReadiness::ChangesRequested
+        } else if !self.review_requests.is_empty() {
+            ReviewReadiness::Waiting
+        } else if self
+            .reviewer_reviews
+            .iter()
+            .any(|review| review.state == SubmittedReviewState::Approved)
+        {
+            ReviewReadiness::Approved
+        } else {
+            ReviewReadiness::Unknown
+        }
+    }
+
+    pub fn attention_summary(&self) -> PullRequestAttentionSummary {
+        PullRequestAttentionSummary {
+            required_checks: self.required_check_readiness(),
+            review: self.review_readiness(),
+            unresolved_feedback: self
+                .feedback
+                .iter()
+                .filter(|feedback| feedback.kind == FeedbackKind::InlineThread)
+                .count(),
+            optional_failures: self
+                .checks
+                .iter()
+                .filter(|check| !check.required && check.state.is_actionable())
+                .count(),
+            merge_conflict: self.merge_conflict,
+        }
+    }
+}
+
+fn newer_check(candidate: &PullRequestCheck, current: &PullRequestCheck) -> bool {
+    candidate.completed_at > current.completed_at
+        || (candidate.completed_at == current.completed_at
+            && candidate.source_order > current.source_order)
+}
+
+fn newer_review(candidate: &ReviewerReview, current: &ReviewerReview) -> bool {
+    candidate.submitted_at > current.submitted_at
+        || (candidate.submitted_at == current.submitted_at && candidate.id > current.id)
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct AuthoredPullRequest {
     pub identity: CanonicalPullRequestId,
@@ -290,5 +550,99 @@ mod tests {
                 "other.example".to_owned(),
             ])
         );
+    }
+
+    fn check(name: &str, state: CheckState, required: bool, order: usize) -> PullRequestCheck {
+        PullRequestCheck {
+            name: name.to_owned(),
+            state,
+            target_url: None,
+            required,
+            source_order: order,
+            completed_at: Some(format!("2026-01-{order:02}T00:00:00Z")),
+        }
+    }
+
+    #[test]
+    fn check_normalization_prefers_newest_duplicate_and_required_only_rollup() {
+        let mut details = PullRequestDetails {
+            checks: vec![
+                check("build", CheckState::Failure, true, 1),
+                check("lint", CheckState::Failure, false, 2),
+                check("Build", CheckState::Success, true, 3),
+            ],
+            check_contexts_complete: true,
+            ..PullRequestDetails::default()
+        };
+
+        details.normalize_checks();
+
+        assert_eq!(details.checks.len(), 2);
+        assert_eq!(details.checks[1].name, "Build");
+        let summary = details.attention_summary();
+        assert_eq!(summary.required_checks, RequiredCheckReadiness::Ready);
+        assert_eq!(summary.optional_failures, 1);
+    }
+
+    #[test]
+    fn incomplete_pending_and_failed_required_checks_do_not_report_ready() {
+        let mut details = PullRequestDetails {
+            checks: vec![check("build", CheckState::Pending, true, 1)],
+            ..PullRequestDetails::default()
+        };
+        assert_eq!(
+            details.required_check_readiness(),
+            RequiredCheckReadiness::Unknown
+        );
+        details.check_contexts_complete = true;
+        assert_eq!(
+            details.required_check_readiness(),
+            RequiredCheckReadiness::Pending
+        );
+        details.checks[0].state = CheckState::Error;
+        assert_eq!(
+            details.required_check_readiness(),
+            RequiredCheckReadiness::Failure
+        );
+    }
+
+    #[test]
+    fn reviewer_folding_keeps_latest_state_and_attention_counts_threads() {
+        let review = |id: &str, state, submitted_at: &str| ReviewerReview {
+            id: id.to_owned(),
+            database_id: None,
+            reviewer: "octocat".to_owned(),
+            state,
+            submitted_at: Some(submitted_at.to_owned()),
+        };
+        let mut details = PullRequestDetails {
+            reviewer_reviews: vec![
+                review("old", SubmittedReviewState::Approved, "2026-01-01"),
+                review("new", SubmittedReviewState::ChangesRequested, "2026-01-02"),
+            ],
+            reviews_complete: true,
+            feedback: vec![PullRequestFeedback {
+                id: "comment".to_owned(),
+                database_id: Some(7),
+                thread_id: Some("thread".to_owned()),
+                kind: FeedbackKind::InlineThread,
+                author: "octocat".to_owned(),
+                body: "please fix".to_owned(),
+                path: Some("src/lib.rs".to_owned()),
+                permalink: None,
+                outdated: false,
+            }],
+            feedback_complete: true,
+            merge_conflict: MergeConflictState::Conflicting,
+            ..PullRequestDetails::default()
+        };
+
+        details.fold_latest_reviews();
+
+        assert_eq!(details.reviewer_reviews.len(), 1);
+        let summary = details.attention_summary();
+        assert_eq!(summary.review, ReviewReadiness::ChangesRequested);
+        assert_eq!(summary.unresolved_feedback, 1);
+        assert_eq!(summary.merge_conflict, MergeConflictState::Conflicting);
     }
 }

@@ -12,14 +12,17 @@ use thiserror::Error;
 
 use crate::git::{GitRunner, SystemGit};
 use crate::model::{
-    AuthoredPullRequest, CanonicalPullRequestId, Catalog, CheckRollup, GitHubBranchData,
-    GitHubRepositoryIdentity, PullRequest, PullRequestIdentity, PullRequestState, RateLimit,
-    RepositoryConfig, Worktree,
+    AuthoredPullRequest, CanonicalPullRequestId, Catalog, CheckRollup, CheckState, FeedbackKind,
+    GitHubBranchData, GitHubRepositoryIdentity, MergeConflictState, PullRequest, PullRequestCheck,
+    PullRequestDetails, PullRequestFeedback, PullRequestIdentity, PullRequestState, RateLimit,
+    RepositoryConfig, ReviewRequest, ReviewerKind, ReviewerReview, SubmittedReviewState, Worktree,
 };
 
 pub const MAX_BRANCHES_PER_BATCH: usize = 20;
 pub const AUTHORED_PULL_REQUESTS_PER_PAGE: usize = 100;
 pub const MAX_AUTHORED_PULL_REQUEST_PAGES: usize = 10;
+pub const CHECK_CONTEXTS_PER_PAGE: usize = 100;
+pub const MAX_CHECK_CONTEXT_PAGES: usize = 10;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum WebScheme {
@@ -588,6 +591,57 @@ impl GitHubService {
         });
     }
 
+    pub fn hydrate_pull_requests_with(
+        &self,
+        credentials: &dyn CredentialProvider,
+        hosts: &[AuthoredHost],
+        identities: impl IntoIterator<Item = CanonicalPullRequestId>,
+    ) -> BTreeMap<CanonicalPullRequestId, Result<PullRequestDetails, GitHubError>> {
+        let unique: BTreeSet<_> = identities.into_iter().collect();
+        let mut hydrated = BTreeMap::new();
+        let mut by_host = BTreeMap::<String, Vec<CanonicalPullRequestId>>::new();
+        for identity in unique {
+            by_host
+                .entry(identity.repository.host.clone())
+                .or_default()
+                .push(identity);
+        }
+        for (host_name, identities) in by_host {
+            let Some(host) = hosts.iter().find(|host| host.host == host_name) else {
+                let error = GitHubError::Malformed(format!(
+                    "no API endpoint is configured for {host_name}"
+                ));
+                for identity in identities {
+                    hydrated.insert(identity, Err(error.clone()));
+                }
+                continue;
+            };
+            let token = match resolve_token(credentials, &host.host, &host.credential_anchor) {
+                Ok(token) => token,
+                Err(error) => {
+                    for identity in identities {
+                        hydrated.insert(identity, Err(error.clone()));
+                    }
+                    continue;
+                }
+            };
+            if let Some(error) = self.suppressed_error(&host.host) {
+                for identity in identities {
+                    hydrated.insert(identity, Err(error.clone()));
+                }
+                continue;
+            }
+            for identity in identities {
+                let result = self.fetch_pull_request_details(host, &token, &identity);
+                if let Err(GitHubError::RateLimited { reset_at }) = &result {
+                    self.suppress(&host.host, reset_at, None);
+                }
+                hydrated.insert(identity, result);
+            }
+        }
+        hydrated
+    }
+
     pub fn fetch_pull_request_with(
         &self,
         credentials: &dyn CredentialProvider,
@@ -746,6 +800,157 @@ impl GitHubService {
         parse_authored_page(&host.host, &data, response_warnings)
     }
 
+    fn fetch_pull_request_details(
+        &self,
+        host: &AuthoredHost,
+        token: &ResolvedToken,
+        identity: &CanonicalPullRequestId,
+    ) -> Result<PullRequestDetails, GitHubError> {
+        let mut details = PullRequestDetails::default();
+        let mut cursor = None;
+        let mut requiredness_complete = true;
+        for page in 1..=MAX_CHECK_CONTEXT_PAGES {
+            let response =
+                self.fetch_pull_request_detail_page(host, token, identity, cursor.as_deref())?;
+            let pull_request = response.data.pointer("/repository/pr0").ok_or_else(|| {
+                GitHubError::PullRequestUnavailable {
+                    repository: identity.repository.full_name(),
+                    number: identity.number,
+                }
+            })?;
+            if pull_request.is_null() {
+                return Err(GitHubError::PullRequestUnavailable {
+                    repository: identity.repository.full_name(),
+                    number: identity.number,
+                });
+            }
+            if page == 1 {
+                parse_pull_request_attention(pull_request, &mut details);
+                details.warnings.extend(response.warnings.clone());
+            }
+            let contexts =
+                pull_request.pointer("/commits/nodes/0/commit/statusCheckRollup/contexts");
+            let Some(contexts) = contexts.filter(|contexts| !contexts.is_null()) else {
+                details.check_contexts_complete = false;
+                details
+                    .warnings
+                    .push("check contexts are missing or still computing".to_owned());
+                break;
+            };
+            requiredness_complete &= parse_check_contexts(contexts, &mut details.checks);
+            let has_next = contexts
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool);
+            match has_next {
+                Some(false) => {
+                    details.check_contexts_complete = requiredness_complete;
+                    if !requiredness_complete {
+                        details.warnings.push(
+                            "one or more check contexts lack required-check metadata".to_owned(),
+                        );
+                    }
+                    break;
+                }
+                Some(true) if page == MAX_CHECK_CONTEXT_PAGES => {
+                    details.check_contexts_complete = false;
+                    details.warnings.push(format!(
+                        "check contexts were truncated after {} entries",
+                        CHECK_CONTEXTS_PER_PAGE * MAX_CHECK_CONTEXT_PAGES
+                    ));
+                    break;
+                }
+                Some(true) => {
+                    let Some(end_cursor) = contexts
+                        .pointer("/pageInfo/endCursor")
+                        .and_then(Value::as_str)
+                    else {
+                        details.check_contexts_complete = false;
+                        details
+                            .warnings
+                            .push("check contexts page lacks a cursor".to_owned());
+                        break;
+                    };
+                    cursor = Some(end_cursor.to_owned());
+                }
+                None => {
+                    details.check_contexts_complete = false;
+                    details
+                        .warnings
+                        .push("check contexts pageInfo is missing".to_owned());
+                    break;
+                }
+            }
+        }
+        details.normalize_checks();
+        details.fold_latest_reviews();
+        details.warnings = deduplicate(details.warnings);
+        Ok(details)
+    }
+
+    fn fetch_pull_request_detail_page(
+        &self,
+        host: &AuthoredHost,
+        token: &ResolvedToken,
+        identity: &CanonicalPullRequestId,
+        contexts_cursor: Option<&str>,
+    ) -> Result<DetailPage, GitHubError> {
+        let mut variables = serde_json::Map::new();
+        variables.insert(
+            "owner".to_owned(),
+            Value::String(identity.repository.owner.clone()),
+        );
+        variables.insert(
+            "repository".to_owned(),
+            Value::String(identity.repository.repository.clone()),
+        );
+        variables.insert("number".to_owned(), Value::from(identity.number));
+        variables.insert(
+            "contextsCursor".to_owned(),
+            contexts_cursor.map_or(Value::Null, |cursor| Value::String(cursor.to_owned())),
+        );
+        let body = GraphQlRequest {
+            query: pull_request_detail_query(identity.number),
+            variables,
+        };
+        let mut response = self
+            .agent
+            .post(&host.graphql_url)
+            .header("Authorization", &format!("Bearer {}", token.expose()))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "wt")
+            .send_json(&body)
+            .map_err(|error| GitHubError::Network(error.to_string()))?;
+        let status = response.status().as_u16();
+        let header_rate = rate_from_headers(response.headers());
+        let response_body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| GitHubError::Network(error.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(classify_http_error(
+                status,
+                &response_body,
+                header_rate.as_ref(),
+            ));
+        }
+        let envelope: GraphQlEnvelope = serde_json::from_str(&response_body)
+            .map_err(|error| GitHubError::Malformed(error.to_string()))?;
+        let warnings = deduplicate(envelope.errors.iter().map(|error| error.message.clone()));
+        let data = envelope
+            .data
+            .ok_or_else(|| classify_graphql_errors(&warnings))?;
+        if let Some(rate) = parse_graphql_rate(&data).or(header_rate)
+            && rate.remaining == 0
+        {
+            self.suppress(
+                &host.host,
+                &rate.reset_at,
+                header_reset_epoch(response.headers()),
+            );
+        }
+        Ok(DetailPage { data, warnings })
+    }
+
     fn fetch_batch(
         &self,
         remote: &RemoteRepository,
@@ -832,6 +1037,335 @@ struct AuthoredPage {
     has_next_page: bool,
     end_cursor: Option<String>,
     warnings: Vec<String>,
+}
+
+struct DetailPage {
+    data: Value,
+    warnings: Vec<String>,
+}
+
+fn pull_request_detail_query(number: u64) -> String {
+    format!(
+        r#"query($owner: String!, $repository: String!, $number: Int!, $contextsCursor: String) {{
+      repository(owner: $owner, name: $repository) {{
+        pr0: pullRequest(number: $number) {{
+          mergeable mergeStateStatus
+          reviewRequests(first: 100) {{
+            nodes {{ requestedReviewer {{
+              __typename
+              ... on User {{ id login }}
+              ... on Team {{ id slug name }}
+            }} }}
+            pageInfo {{ hasNextPage }}
+          }}
+          reviews(first: 100) {{
+            nodes {{ id databaseId author {{ login }} body state submittedAt url }}
+            pageInfo {{ hasNextPage }}
+          }}
+          reviewThreads(first: 100) {{
+            nodes {{
+              id isResolved isOutdated path
+              comments(last: 100) {{
+                nodes {{ id databaseId author {{ login }} body url }}
+                pageInfo {{ hasPreviousPage }}
+              }}
+            }}
+            pageInfo {{ hasNextPage }}
+          }}
+          commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{
+            contexts(first: {CHECK_CONTEXTS_PER_PAGE}, after: $contextsCursor) {{
+              nodes {{
+                __typename
+                ... on CheckRun {{
+                  name status conclusion detailsUrl startedAt completedAt
+                  isRequired(pullRequestNumber: {number})
+                }}
+                ... on StatusContext {{
+                  context state targetUrl createdAt
+                  isRequired(pullRequestNumber: {number})
+                }}
+              }}
+              pageInfo {{ hasNextPage endCursor }}
+            }}
+          }} }} }} }}
+        }}
+      }}
+      rateLimit {{ remaining resetAt }}
+    }}"#
+    )
+}
+
+fn parse_pull_request_attention(node: &Value, details: &mut PullRequestDetails) {
+    details.merge_conflict = match node.get("mergeable").and_then(Value::as_str) {
+        Some("MERGEABLE") => MergeConflictState::Clean,
+        Some("CONFLICTING") => MergeConflictState::Conflicting,
+        _ => MergeConflictState::Unknown,
+    };
+
+    details.review_requests = node
+        .pointer("/reviewRequests/nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|request| parse_review_request(request.get("requestedReviewer")?))
+        .collect();
+    details
+        .review_requests
+        .sort_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
+
+    let reviews = node.pointer("/reviews/nodes").and_then(Value::as_array);
+    for review in reviews.into_iter().flatten() {
+        if let Some(parsed) = parse_reviewer_review(review) {
+            details.reviewer_reviews.push(parsed);
+        }
+        if let Some(feedback) = parse_review_summary(review) {
+            details.feedback.push(feedback);
+        }
+    }
+    details.reviews_complete =
+        connection_complete(node.get("reviewRequests")) && connection_complete(node.get("reviews"));
+    if !details.reviews_complete {
+        details
+            .warnings
+            .push("review requests or reviews are incomplete".to_owned());
+    }
+
+    if let Some(threads) = node
+        .pointer("/reviewThreads/nodes")
+        .and_then(Value::as_array)
+    {
+        for thread in threads
+            .iter()
+            .filter(|thread| thread.get("isResolved").and_then(Value::as_bool) == Some(false))
+        {
+            let thread_id = thread.get("id").and_then(Value::as_str).map(str::to_owned);
+            let path = thread
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let outdated = thread
+                .get("isOutdated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(comments) = thread.pointer("/comments/nodes").and_then(Value::as_array) {
+                for comment in comments {
+                    let body = comment
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    let Some(id) = comment.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    details.feedback.push(PullRequestFeedback {
+                        id: id.to_owned(),
+                        database_id: comment.get("databaseId").and_then(Value::as_u64),
+                        thread_id: thread_id.clone(),
+                        kind: FeedbackKind::InlineThread,
+                        author: actor_name(comment.get("author")),
+                        body: body.to_owned(),
+                        path: path.clone(),
+                        permalink: comment
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        outdated,
+                    });
+                }
+            }
+        }
+    }
+    details.feedback_complete = connection_complete(node.get("reviewThreads"))
+        && node
+            .pointer("/reviewThreads/nodes")
+            .and_then(Value::as_array)
+            .is_some_and(|threads| {
+                threads.iter().all(|thread| {
+                    thread
+                        .pointer("/comments/pageInfo/hasPreviousPage")
+                        .and_then(Value::as_bool)
+                        == Some(false)
+                })
+            });
+    if !details.feedback_complete {
+        details
+            .warnings
+            .push("review feedback is incomplete".to_owned());
+    }
+}
+
+fn connection_complete(connection: Option<&Value>) -> bool {
+    connection
+        .and_then(|connection| connection.pointer("/pageInfo/hasNextPage"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+fn parse_review_request(node: &Value) -> Option<ReviewRequest> {
+    let id = node.get("id")?.as_str()?.to_owned();
+    let kind = match node.get("__typename").and_then(Value::as_str) {
+        Some("User") => ReviewerKind::User,
+        Some("Team") => ReviewerKind::Team,
+        _ => ReviewerKind::Unknown,
+    };
+    let name = node
+        .get("login")
+        .or_else(|| node.get("slug"))
+        .or_else(|| node.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown reviewer")
+        .to_owned();
+    Some(ReviewRequest { id, name, kind })
+}
+
+fn parse_reviewer_review(node: &Value) -> Option<ReviewerReview> {
+    Some(ReviewerReview {
+        id: node.get("id")?.as_str()?.to_owned(),
+        database_id: node.get("databaseId").and_then(Value::as_u64),
+        reviewer: actor_name(node.get("author")),
+        state: submitted_review_state(node.get("state").and_then(Value::as_str)),
+        submitted_at: node
+            .get("submittedAt")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn parse_review_summary(node: &Value) -> Option<PullRequestFeedback> {
+    let body = node.get("body")?.as_str()?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(PullRequestFeedback {
+        id: node.get("id")?.as_str()?.to_owned(),
+        database_id: node.get("databaseId").and_then(Value::as_u64),
+        thread_id: None,
+        kind: FeedbackKind::ReviewSummary,
+        author: actor_name(node.get("author")),
+        body: body.to_owned(),
+        path: None,
+        permalink: node.get("url").and_then(Value::as_str).map(str::to_owned),
+        outdated: false,
+    })
+}
+
+fn actor_name(actor: Option<&Value>) -> String {
+    actor
+        .and_then(|actor| actor.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("deleted user")
+        .to_owned()
+}
+
+fn submitted_review_state(state: Option<&str>) -> SubmittedReviewState {
+    match state {
+        Some("APPROVED") => SubmittedReviewState::Approved,
+        Some("CHANGES_REQUESTED") => SubmittedReviewState::ChangesRequested,
+        Some("COMMENTED") => SubmittedReviewState::Commented,
+        Some("DISMISSED") => SubmittedReviewState::Dismissed,
+        Some("PENDING") => SubmittedReviewState::Pending,
+        _ => SubmittedReviewState::Unknown,
+    }
+}
+
+fn parse_check_contexts(connection: &Value, checks: &mut Vec<PullRequestCheck>) -> bool {
+    let source_offset = checks.len();
+    let mut complete = connection.get("nodes").and_then(Value::as_array).is_some();
+    for (index, node) in connection
+        .get("nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let typename = node.get("__typename").and_then(Value::as_str);
+        complete &= node.get("isRequired").and_then(Value::as_bool).is_some();
+        let parsed = match typename {
+            Some("CheckRun") => {
+                node.get("name")
+                    .and_then(Value::as_str)
+                    .map(|name| PullRequestCheck {
+                        name: name.to_owned(),
+                        state: check_run_state(
+                            node.get("status").and_then(Value::as_str),
+                            node.get("conclusion").and_then(Value::as_str),
+                        ),
+                        target_url: node
+                            .get("detailsUrl")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        required: node
+                            .get("isRequired")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        source_order: source_offset + index,
+                        completed_at: node
+                            .get("completedAt")
+                            .and_then(Value::as_str)
+                            .or_else(|| node.get("startedAt").and_then(Value::as_str))
+                            .map(str::to_owned),
+                    })
+            }
+            Some("StatusContext") => {
+                node.get("context")
+                    .and_then(Value::as_str)
+                    .map(|name| PullRequestCheck {
+                        name: name.to_owned(),
+                        state: status_context_state(node.get("state").and_then(Value::as_str)),
+                        target_url: node
+                            .get("targetUrl")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        required: node
+                            .get("isRequired")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        source_order: source_offset + index,
+                        completed_at: node
+                            .get("createdAt")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    })
+            }
+            _ => None,
+        };
+        if let Some(check) = parsed {
+            checks.push(check);
+        } else {
+            complete = false;
+        }
+    }
+    complete
+}
+
+fn check_run_state(status: Option<&str>, conclusion: Option<&str>) -> CheckState {
+    if status != Some("COMPLETED") {
+        return match status {
+            Some("QUEUED" | "IN_PROGRESS" | "WAITING" | "REQUESTED" | "PENDING") => {
+                CheckState::Pending
+            }
+            _ => CheckState::Unknown,
+        };
+    }
+    match conclusion {
+        Some("SUCCESS") => CheckState::Success,
+        Some("FAILURE" | "TIMED_OUT" | "STARTUP_FAILURE") => CheckState::Failure,
+        Some("ACTION_REQUIRED" | "STALE") => CheckState::Error,
+        Some("NEUTRAL") => CheckState::Neutral,
+        Some("SKIPPED") => CheckState::Skipped,
+        _ => CheckState::Unknown,
+    }
+}
+
+fn status_context_state(state: Option<&str>) -> CheckState {
+    match state {
+        Some("SUCCESS") => CheckState::Success,
+        Some("FAILURE") => CheckState::Failure,
+        Some("ERROR") => CheckState::Error,
+        Some("PENDING") => CheckState::Pending,
+        Some("EXPECTED") => CheckState::Expected,
+        _ => CheckState::Unknown,
+    }
 }
 
 fn authored_pull_request_query() -> String {
@@ -1730,6 +2264,65 @@ mod tests {
         .to_string()
     }
 
+    fn detail_body(checks: Vec<Value>, has_next_page: bool, cursor: Option<&str>) -> String {
+        serde_json::json!({
+            "data": {
+                "repository": {
+                    "pr0": {
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "CLEAN",
+                        "reviewRequests": {
+                            "nodes": [{
+                                "requestedReviewer": {
+                                    "__typename": "Team", "id": "TEAM_1",
+                                    "slug": "maintainers", "name": "Maintainers"
+                                }
+                            }],
+                            "pageInfo": {"hasNextPage": false}
+                        },
+                        "reviews": {
+                            "nodes": [{
+                                "id": "REVIEW_1", "databaseId": 91,
+                                "author": {"login": "reviewer"},
+                                "body": "Please fix the race", "state": "CHANGES_REQUESTED",
+                                "submittedAt": "2026-01-02T00:00:00Z",
+                                "url": "https://example/review/91"
+                            }],
+                            "pageInfo": {"hasNextPage": false}
+                        },
+                        "reviewThreads": {
+                            "nodes": [{
+                                "id": "THREAD_1", "isResolved": false,
+                                "isOutdated": false, "path": "src/lib.rs",
+                                "comments": {
+                                    "nodes": [{
+                                        "id": "COMMENT_1", "databaseId": 101,
+                                        "author": {"login": "reviewer"},
+                                        "body": "This can deadlock",
+                                        "url": "https://example/comment/101"
+                                    }],
+                                    "pageInfo": {"hasPreviousPage": false}
+                                }
+                            }],
+                            "pageInfo": {"hasNextPage": false}
+                        },
+                        "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+                            "contexts": {
+                                "nodes": checks,
+                                "pageInfo": {
+                                    "hasNextPage": has_next_page,
+                                    "endCursor": cursor
+                                }
+                            }
+                        }}}]}
+                    }
+                },
+                "rateLimit": {"remaining": 4999, "resetAt": "2026-07-30T12:00:00Z"}
+            }
+        })
+        .to_string()
+    }
+
     fn input(branches: usize) -> RepositoryGitHubInput {
         RepositoryGitHubInput {
             repository: RepositoryConfig {
@@ -1915,6 +2508,210 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn detail_hydration_deduplicates_identity_and_paginates_check_contexts() {
+        let first_check = serde_json::json!({
+            "__typename": "CheckRun", "name": "build", "status": "COMPLETED",
+            "conclusion": "FAILURE", "detailsUrl": "https://example/check/old",
+            "completedAt": "2026-01-01T00:00:00Z", "isRequired": true
+        });
+        let current_check = serde_json::json!({
+            "__typename": "CheckRun", "name": "Build", "status": "COMPLETED",
+            "conclusion": "SUCCESS", "detailsUrl": "https://example/check/new",
+            "completedAt": "2026-01-02T00:00:00Z", "isRequired": true
+        });
+        let optional_failure = serde_json::json!({
+            "__typename": "StatusContext", "context": "lint", "state": "FAILURE",
+            "targetUrl": "https://example/check/lint", "createdAt": "2026-01-02T01:00:00Z",
+            "isRequired": false
+        });
+        let (base, requests, server) = fake_server(vec![
+            FakeResponse {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: detail_body(vec![first_check], true, Some("contexts-1")),
+            },
+            FakeResponse {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: detail_body(vec![current_check, optional_failure], false, None),
+            },
+        ]);
+        let mut credentials = FakeCredentials::default();
+        credentials
+            .environment
+            .insert("GITHUB_ENTERPRISE_TOKEN".to_owned(), "secret".to_owned());
+        let host = AuthoredHost {
+            host: "ghe.example".to_owned(),
+            graphql_url: format!("{base}/api/graphql"),
+            credential_anchor: PathBuf::from("/repo"),
+        };
+        let identity = CanonicalPullRequestId {
+            repository: GitHubRepositoryIdentity::canonical("ghe.example", "team", "project"),
+            number: 42,
+        };
+
+        let hydrated = GitHubService::new().hydrate_pull_requests_with(
+            &credentials,
+            &[host],
+            [identity.clone(), identity.clone()],
+        );
+
+        let first_request = requests.recv().unwrap();
+        let second_request = requests.recv().unwrap();
+        server.join().unwrap();
+        let request_json = |request: &str| -> Value {
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+        };
+        let first = request_json(&first_request);
+        assert_eq!(first["variables"]["owner"], "team");
+        assert_eq!(first["variables"]["repository"], "project");
+        assert_eq!(first["variables"]["number"], 42);
+        assert!(first["variables"]["contextsCursor"].is_null());
+        assert!(
+            first["query"]
+                .as_str()
+                .unwrap()
+                .contains("pr0: pullRequest")
+        );
+        assert!(
+            first["query"]
+                .as_str()
+                .unwrap()
+                .contains("isRequired(pullRequestNumber: 42)")
+        );
+        let query = first["query"].as_str().unwrap();
+        assert_eq!(query.matches('{').count(), query.matches('}').count());
+        assert_eq!(
+            request_json(&second_request)["variables"]["contextsCursor"],
+            "contexts-1"
+        );
+        let details = hydrated[&identity].as_ref().unwrap();
+        assert!(details.check_contexts_complete);
+        assert_eq!(details.checks.len(), 2);
+        assert_eq!(
+            details.required_check_readiness(),
+            crate::model::RequiredCheckReadiness::Ready
+        );
+        assert_eq!(details.attention_summary().optional_failures, 1);
+        assert_eq!(details.review_requests[0].name, "maintainers");
+        assert_eq!(details.reviewer_reviews[0].database_id, Some(91));
+        assert_eq!(details.feedback.len(), 2);
+        assert!(
+            details
+                .feedback
+                .iter()
+                .any(|feedback| feedback.database_id == Some(101))
+        );
+    }
+
+    #[test]
+    fn partial_detail_connections_remain_usable_and_unknown() {
+        let body = serde_json::json!({
+            "data": {
+                "repository": {"pr0": {
+                    "mergeable": "CONFLICTING",
+                    "reviewRequests": null,
+                    "reviews": null,
+                    "reviewThreads": null,
+                    "commits": {"nodes": [{"commit": {"statusCheckRollup": null}}]}
+                }},
+                "rateLimit": {"remaining": 10, "resetAt": "2026-07-30T12:00:00Z"}
+            },
+            "errors": [{
+                "message": "review threads are inaccessible",
+                "path": ["repository", "pr0", "reviewThreads"]
+            }]
+        })
+        .to_string();
+        let (base, _requests, server) = fake_server(vec![FakeResponse {
+            status: "200 OK",
+            headers: Vec::new(),
+            body,
+        }]);
+        let mut credentials = FakeCredentials::default();
+        credentials
+            .environment
+            .insert("GITHUB_ENTERPRISE_TOKEN".to_owned(), "secret".to_owned());
+        let host = AuthoredHost {
+            host: "ghe.example".to_owned(),
+            graphql_url: format!("{base}/api/graphql"),
+            credential_anchor: PathBuf::from("/repo"),
+        };
+        let identity = CanonicalPullRequestId {
+            repository: GitHubRepositoryIdentity::canonical("ghe.example", "team", "project"),
+            number: 7,
+        };
+
+        let hydrated = GitHubService::new().hydrate_pull_requests_with(
+            &credentials,
+            &[host],
+            [identity.clone()],
+        );
+        server.join().unwrap();
+
+        let details = hydrated[&identity].as_ref().unwrap();
+        assert_eq!(details.merge_conflict, MergeConflictState::Conflicting);
+        assert!(!details.check_contexts_complete);
+        assert!(!details.reviews_complete);
+        assert!(!details.feedback_complete);
+        assert_eq!(
+            details.required_check_readiness(),
+            crate::model::RequiredCheckReadiness::Unknown
+        );
+        assert!(
+            details
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("review threads are inaccessible"))
+        );
+    }
+
+    #[test]
+    fn detail_hydration_bounds_context_pagination_and_marks_truncation_unknown() {
+        let responses = (0..MAX_CHECK_CONTEXT_PAGES)
+            .map(|page| FakeResponse {
+                status: "200 OK",
+                headers: Vec::new(),
+                body: detail_body(Vec::new(), true, Some(&format!("cursor-{page}"))),
+            })
+            .collect();
+        let (base, _requests, server) = fake_server(responses);
+        let mut credentials = FakeCredentials::default();
+        credentials
+            .environment
+            .insert("GITHUB_ENTERPRISE_TOKEN".to_owned(), "secret".to_owned());
+        let host = AuthoredHost {
+            host: "ghe.example".to_owned(),
+            graphql_url: format!("{base}/api/graphql"),
+            credential_anchor: PathBuf::from("/repo"),
+        };
+        let identity = CanonicalPullRequestId {
+            repository: GitHubRepositoryIdentity::canonical("ghe.example", "team", "project"),
+            number: 9,
+        };
+
+        let hydrated = GitHubService::new().hydrate_pull_requests_with(
+            &credentials,
+            &[host],
+            [identity.clone()],
+        );
+        server.join().unwrap();
+
+        let details = hydrated[&identity].as_ref().unwrap();
+        assert!(!details.check_contexts_complete);
+        assert_eq!(
+            details.required_check_readiness(),
+            crate::model::RequiredCheckReadiness::Unknown
+        );
+        assert!(
+            details
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("truncated after 1000 entries"))
+        );
     }
 
     #[test]

@@ -39,6 +39,13 @@ enum GitHubMessage {
         generation: u64,
         event: AuthoredRefreshEvent,
     },
+    Details {
+        generation: u64,
+        results: std::collections::BTreeMap<
+            crate::model::CanonicalPullRequestId,
+            Result<crate::model::PullRequestDetails, crate::github::GitHubError>,
+        >,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -342,6 +349,17 @@ impl Controller {
             })
             .map(|authored| authored.identity.clone())
             .collect();
+        self.app.github_hosts = crate::github::inferred_github_hosts(&self.catalog);
+        self.app.pull_request_details = remote_cache
+            .pull_request_details
+            .into_iter()
+            .filter(|cached| {
+                self.app
+                    .github_hosts
+                    .contains(&cached.identity.repository.host)
+            })
+            .map(|cached| (cached.identity, cached.details))
+            .collect();
         for cached in remote_cache.branches {
             if current_branches.contains(&(cached.worktree.clone(), cached.branch.clone())) {
                 self.app
@@ -349,7 +367,6 @@ impl Controller {
                     .insert(cached.worktree, crate::app::GitHubState::Ready(cached.data));
             }
         }
-        self.app.github_hosts = crate::github::inferred_github_hosts(&self.catalog);
         self.app.authored_pull_requests.hydrate(
             remote_cache
                 .authored_pull_requests
@@ -1117,6 +1134,7 @@ impl Controller {
                 }
             };
             let refresh = service.fetch_catalog(&inputs);
+            let mut identities = refresh.active_pull_requests.clone();
             if let Err(error) = cache::update(&remote_cache_path, |cache| {
                 cache.merge_branch_refresh(&inputs, &refresh);
             }) {
@@ -1160,6 +1178,11 @@ impl Controller {
                         pull_requests,
                         warnings,
                     } => {
+                        identities.extend(
+                            pull_requests
+                                .iter()
+                                .map(|pull_request| pull_request.identity.clone()),
+                        );
                         refreshed_pull_requests.extend(pull_requests.clone());
                         let _ = sender.send(GitHubMessage::Authored {
                             generation: authored_generation,
@@ -1187,11 +1210,32 @@ impl Controller {
                 {
                     warnings.push(format!("unable to persist remote cache: {error}"));
                 }
+                let details =
+                    service.hydrate_pull_requests_with(&SystemCredentials, &hosts, identities);
+                if let Err(error) = cache::update(&remote_cache_path, |cache| {
+                    cache.merge_pull_request_details(&details);
+                }) && let AuthoredRefreshEvent::Finished { warnings, .. } = &mut finished
+                {
+                    warnings.push(format!("unable to persist pull request details: {error}"));
+                }
+                let _ = sender.send(GitHubMessage::Details {
+                    generation,
+                    results: details,
+                });
                 let _ = sender.send(GitHubMessage::Authored {
                     generation: authored_generation,
                     event: finished,
                 });
             } else {
+                let details =
+                    service.hydrate_pull_requests_with(&SystemCredentials, &hosts, identities);
+                let _ = cache::update(&remote_cache_path, |cache| {
+                    cache.merge_pull_request_details(&details);
+                });
+                let _ = sender.send(GitHubMessage::Details {
+                    generation,
+                    results: details,
+                });
                 let _ = sender.send(GitHubMessage::Authored {
                     generation: authored_generation,
                     event: AuthoredRefreshEvent::Finished {
@@ -1297,6 +1341,12 @@ impl Controller {
                         }
                     }
                 },
+                GitHubMessage::Details {
+                    generation,
+                    results,
+                } => {
+                    changed |= self.app.apply_pull_request_details(generation, results);
+                }
             }
         }
         changed |= self.pump_materialization();
@@ -1535,22 +1585,26 @@ fn load_repository_views(catalog: &Catalog, current_directory: &Path) -> Vec<Rep
                 github_remotes: Default::default(),
                 github_preferred_remote: None,
             };
-            match git::discover_worktrees(&SystemGit, &identity.anchor) {
-                Ok(worktrees) => views.push(RepositoryView {
+            let session = match git::discover_worktrees(&SystemGit, &identity.anchor) {
+                Ok(worktrees) => RepositoryView {
                     config,
                     session_only: true,
                     stale_error: None,
                     expanded: true,
                     worktrees,
-                }),
-                Err(error) => views.push(RepositoryView {
+                },
+                Err(error) => RepositoryView {
                     config,
                     session_only: true,
                     stale_error: Some(error.to_string()),
                     expanded: true,
                     worktrees: Vec::new(),
-                }),
-            }
+                },
+            };
+            // The current repository is selected on startup. Keep its temporary
+            // row first so selecting it does not scroll the global catalog out
+            // of the initial viewport.
+            views.insert(0, session);
         }
     }
     views
@@ -1670,6 +1724,44 @@ mod tests {
     fn empty_catalog_outside_repository_remains_empty() {
         let directory = tempfile::tempdir().unwrap();
         assert!(load_repository_views(&Catalog::default(), directory.path()).is_empty());
+    }
+
+    #[test]
+    fn unregistered_current_repository_keeps_catalog_visible_on_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let registered = directory.path().join("registered");
+        let current = directory.path().join("current");
+        run_git_command(directory.path(), &["init", registered.to_str().unwrap()]);
+        run_git_command(directory.path(), &["init", current.to_str().unwrap()]);
+        let catalog = Catalog {
+            repositories: vec![RepositoryConfig {
+                path: std::fs::canonicalize(&registered).unwrap(),
+                label: Some("registered".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            }],
+            ..Catalog::default()
+        };
+
+        let views = load_repository_views(&catalog, &current);
+
+        assert_eq!(views.len(), 2);
+        assert!(views[0].session_only);
+        assert_eq!(views[1].config.path, catalog.repositories[0].path);
+        let mut app = App::new(views, current);
+        app.set_viewport_height(4);
+        assert_eq!(app.scroll, 0);
+        assert!(app.visible_rows().iter().any(|row| {
+            matches!(
+                row,
+                crate::app::VisibleRow::Repository {
+                    repository_index: 1,
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]
@@ -1865,6 +1957,13 @@ mod tests {
             }];
             cache.authored_pull_requests = vec![local.clone(), virtual_pr.clone()];
             cache.active_pull_requests = vec![local.identity.clone()];
+            cache.pull_request_details = vec![crate::cache::CachedPullRequestDetails {
+                identity: local.identity.clone(),
+                details: crate::model::PullRequestDetails {
+                    check_contexts_complete: true,
+                    ..crate::model::PullRequestDetails::default()
+                },
+            }];
         })
         .unwrap();
 
@@ -1875,6 +1974,13 @@ mod tests {
             Some(GitHubState::Ready(data)) if data.pull_request.as_ref().is_some_and(|pull_request| pull_request.number == 1)
         ));
         assert_eq!(controller.app.authored_pull_requests.visible().len(), 2);
+        assert_eq!(controller.app.pull_request_details.len(), 1);
+        assert!(
+            controller
+                .app
+                .pull_request_details
+                .contains_key(&local.identity)
+        );
         assert_eq!(controller.app.virtual_repositories.len(), 1);
         assert_eq!(
             controller.app.virtual_repositories[0].pull_requests[0]
