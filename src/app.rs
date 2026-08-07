@@ -8,6 +8,7 @@ use crate::model::{
     AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, GitHubRepositoryIdentity,
     PullRequest, PullRequestDetails, RepositoryConfig, Worktree, WorktreeStatus,
 };
+use crate::prompt::{PromptPullRequest, format_agent_prompt};
 
 const LIST_SCROLL_MARGIN: usize = 5;
 
@@ -244,6 +245,7 @@ pub enum Pane {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
+    CopyAgentPrompt,
     Create,
     NewWorktree,
     Move,
@@ -258,7 +260,8 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
+        Self::CopyAgentPrompt,
         Self::Create,
         Self::NewWorktree,
         Self::Move,
@@ -274,6 +277,7 @@ impl Action {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::CopyAgentPrompt => "copy agent prompt",
             Self::Create => "create worktree",
             Self::NewWorktree => "new tracked worktree",
             Self::Move => "move worktree",
@@ -290,6 +294,7 @@ impl Action {
 
     pub fn shortcut(self) -> &'static str {
         match self {
+            Self::CopyAgentPrompt => "C",
             Self::Create => "c",
             Self::NewWorktree => "n",
             Self::Move => "m",
@@ -1325,6 +1330,13 @@ impl App {
             enabled: false,
             reason: Some(reason.to_owned()),
         };
+        if action == Action::CopyAgentPrompt {
+            return ActionAvailability {
+                action,
+                enabled: true,
+                reason: None,
+            };
+        }
         if matches!(
             self.selected_row(),
             Some(VisibleRow::VirtualRepository { .. } | VisibleRow::VirtualPullRequest { .. })
@@ -1357,6 +1369,7 @@ impl App {
                     disabled("repository is already registered")
                 }
             }
+            Action::CopyAgentPrompt => unreachable!("handled before selection validation"),
             Action::EditRepository | Action::RemoveRepository => {
                 if repository.session_only {
                     disabled("register this session-only repository first")
@@ -1711,8 +1724,212 @@ impl App {
             .unwrap_or(Intent::None)
     }
 
+    pub fn agent_prompt(&self) -> Option<String> {
+        let all = self.prompt_pull_requests();
+        let selected_detail = (self.pane == Pane::Detail)
+            .then_some(self.detail_selected.as_ref())
+            .flatten();
+        let scoped = match selected_detail {
+            Some(DetailRowId::Check(identity, name)) => all
+                .get(identity)
+                .map(|pull_request| PromptPullRequest {
+                    identity: identity.clone(),
+                    pull_request: pull_request.pull_request.clone(),
+                    checks: pull_request
+                        .checks
+                        .iter()
+                        .filter(|check| check.name == *name && check.state.is_actionable())
+                        .cloned()
+                        .collect(),
+                    feedback: Vec::new(),
+                })
+                .into_iter()
+                .collect(),
+            Some(DetailRowId::Feedback(identity, id)) => all
+                .get(identity)
+                .map(|pull_request| PromptPullRequest {
+                    identity: identity.clone(),
+                    pull_request: pull_request.pull_request.clone(),
+                    checks: Vec::new(),
+                    feedback: pull_request
+                        .feedback
+                        .iter()
+                        .filter(|feedback| feedback.id == *id)
+                        .cloned()
+                        .collect(),
+                })
+                .into_iter()
+                .collect(),
+            Some(DetailRowId::Section(identity, DetailSection::Checks)) => all
+                .get(identity)
+                .map(|pull_request| PromptPullRequest {
+                    identity: identity.clone(),
+                    pull_request: pull_request.pull_request.clone(),
+                    checks: pull_request.checks.clone(),
+                    feedback: Vec::new(),
+                })
+                .into_iter()
+                .collect(),
+            Some(DetailRowId::Section(identity, DetailSection::Feedback)) => all
+                .get(identity)
+                .map(|pull_request| PromptPullRequest {
+                    identity: identity.clone(),
+                    pull_request: pull_request.pull_request.clone(),
+                    checks: Vec::new(),
+                    feedback: pull_request.feedback.clone(),
+                })
+                .into_iter()
+                .collect(),
+            Some(DetailRowId::Summary(identity))
+            | Some(DetailRowId::Section(identity, DetailSection::Attention))
+            | Some(DetailRowId::Section(identity, DetailSection::Reviews))
+            | Some(DetailRowId::ReviewRequest(identity, _))
+            | Some(DetailRowId::Review(identity, _)) => self.prompt_stack(&all, identity),
+            None => self.prompt_scope_from_tree(&all),
+        };
+        format_agent_prompt(&scoped)
+    }
+
+    fn prompt_pull_requests(&self) -> BTreeMap<CanonicalPullRequestId, PromptPullRequest> {
+        let mut pull_requests = BTreeMap::new();
+        for repository in &self.virtual_repositories {
+            for authored in &repository.pull_requests {
+                pull_requests.insert(
+                    authored.identity.clone(),
+                    self.prompt_pull_request(&authored.identity, &authored.pull_request),
+                );
+            }
+        }
+        for repository in &self.repositories {
+            for worktree in &repository.worktrees {
+                let Some(pull_request) = self
+                    .github
+                    .get(&worktree.path)
+                    .and_then(GitHubState::data)
+                    .and_then(|data| data.pull_request.as_ref())
+                else {
+                    continue;
+                };
+                let Some(identity) = self.pull_request_identity(repository, pull_request) else {
+                    continue;
+                };
+                pull_requests.insert(
+                    identity.clone(),
+                    self.prompt_pull_request(&identity, pull_request),
+                );
+            }
+        }
+        pull_requests
+    }
+
+    fn prompt_pull_request(
+        &self,
+        identity: &CanonicalPullRequestId,
+        pull_request: &PullRequest,
+    ) -> PromptPullRequest {
+        let details = self.pull_request_details.get(identity);
+        PromptPullRequest {
+            identity: identity.clone(),
+            pull_request: pull_request.clone(),
+            checks: details
+                .into_iter()
+                .flat_map(|details| details.checks.iter())
+                .filter(|check| check.state.is_actionable())
+                .cloned()
+                .collect(),
+            feedback: details
+                .into_iter()
+                .flat_map(|details| details.feedback.iter())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn prompt_stack(
+        &self,
+        all: &BTreeMap<CanonicalPullRequestId, PromptPullRequest>,
+        root: &CanonicalPullRequestId,
+    ) -> Vec<PromptPullRequest> {
+        let Some(root_pull_request) = all.get(root) else {
+            return Vec::new();
+        };
+        let mut included = BTreeSet::from([root.clone()]);
+        let mut ordered = vec![root_pull_request.clone()];
+        loop {
+            let mut added = false;
+            for (identity, candidate) in all {
+                if identity.repository != root.repository || included.contains(identity) {
+                    continue;
+                }
+                if ordered.iter().any(|parent| {
+                    pull_request_identity_matches(
+                        &parent.pull_request.head,
+                        &candidate.pull_request.base,
+                    )
+                }) {
+                    included.insert(identity.clone());
+                    ordered.push(candidate.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        ordered
+    }
+
+    fn prompt_scope_from_tree(
+        &self,
+        all: &BTreeMap<CanonicalPullRequestId, PromptPullRequest>,
+    ) -> Vec<PromptPullRequest> {
+        match self.selected.as_ref() {
+            Some(RowId::VirtualPullRequest(identity)) => self.prompt_stack(all, identity),
+            Some(RowId::Worktree(path)) => self
+                .repositories
+                .iter()
+                .find(|repository| {
+                    repository
+                        .worktrees
+                        .iter()
+                        .any(|worktree| worktree.path == *path)
+                })
+                .and_then(|repository| {
+                    let pull_request = self
+                        .github
+                        .get(path)
+                        .and_then(GitHubState::data)
+                        .and_then(|data| data.pull_request.as_ref())?;
+                    self.pull_request_identity(repository, pull_request)
+                })
+                .map(|identity| self.prompt_stack(all, &identity))
+                .unwrap_or_default(),
+            Some(RowId::Repository(path)) => {
+                let identities: BTreeSet<_> = self
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.config.path == *path)
+                    .into_iter()
+                    .flat_map(|repository| repository.config.github_remotes.values())
+                    .cloned()
+                    .collect();
+                all.values()
+                    .filter(|pull_request| identities.contains(&pull_request.identity.repository))
+                    .cloned()
+                    .collect()
+            }
+            Some(RowId::VirtualRepository(repository)) => all
+                .values()
+                .filter(|pull_request| pull_request.identity.repository == *repository)
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     fn direct_action(&mut self, character: char) -> Intent {
         let action = match character {
+            'C' => Action::CopyAgentPrompt,
             'c' => Action::Create,
             'n' => Action::NewWorktree,
             'm' => Action::Move,
@@ -2571,7 +2788,10 @@ mod tests {
             Intent::MaterializePullRequest(selected.identity.clone())
         );
         for action in Action::ALL {
-            assert!(!app.action_availability(action).enabled);
+            assert_eq!(
+                app.action_availability(action).enabled,
+                action == Action::CopyAgentPrompt
+            );
         }
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(
@@ -2893,6 +3113,83 @@ mod tests {
         }));
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.pane, Pane::List);
+    }
+
+    #[test]
+    fn agent_prompt_scopes_are_exact_deterministic_and_collapse_independent() {
+        let mut parent = authored("team", "project", 1, "2026-01-01");
+        parent.pull_request.head.branch = "stack-parent".to_owned();
+        let mut child = authored("team", "project", 2, "2026-01-02");
+        child.pull_request.base = parent.pull_request.head.clone();
+        child.pull_request.head.branch = "stack-child".to_owned();
+        let unrelated = authored("team", "project", 3, "2026-01-03");
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: parent.identity.repository.clone(),
+            mapped_repository: None,
+            expanded: true,
+            pull_requests: vec![unrelated.clone(), child.clone(), parent.clone()],
+        }];
+        for pull_request in [&parent, &child, &unrelated] {
+            app.pull_request_details.insert(
+                pull_request.identity.clone(),
+                PullRequestDetails {
+                    checks: vec![crate::model::PullRequestCheck {
+                        name: format!("check-{}", pull_request.identity.number),
+                        state: crate::model::CheckState::Failure,
+                        target_url: None,
+                        required: true,
+                        source_order: 0,
+                        completed_at: None,
+                    }],
+                    check_contexts_complete: true,
+                    feedback: vec![crate::model::PullRequestFeedback {
+                        id: format!("feedback-{}", pull_request.identity.number),
+                        database_id: None,
+                        thread_id: None,
+                        kind: crate::model::FeedbackKind::ReviewSummary,
+                        author: "reviewer".to_owned(),
+                        body: format!("body {}", pull_request.identity.number),
+                        path: None,
+                        permalink: None,
+                        outdated: false,
+                    }],
+                    ..PullRequestDetails::default()
+                },
+            );
+        }
+        app.selected = Some(RowId::VirtualPullRequest(parent.identity.clone()));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('C'))),
+            Intent::BeginAction(Action::CopyAgentPrompt)
+        );
+        let expanded = app.agent_prompt().unwrap();
+        assert!(expanded.contains("PR #1"));
+        assert!(expanded.contains("PR #2"));
+        assert!(!expanded.contains("PR #3"));
+        assert!(expanded.find("PR #1").unwrap() < expanded.find("PR #2").unwrap());
+
+        app.virtual_repositories[0].expanded = false;
+        assert_eq!(app.agent_prompt().unwrap(), expanded);
+
+        app.pane = Pane::Detail;
+        app.detail_selected = Some(DetailRowId::Check(
+            parent.identity.clone(),
+            "check-1".to_owned(),
+        ));
+        let single = app.agent_prompt().unwrap();
+        assert!(single.contains("check-1"));
+        assert!(!single.contains("feedback-1"));
+        assert!(!single.contains("PR #2"));
+
+        app.detail_selected = Some(DetailRowId::Section(
+            parent.identity.clone(),
+            DetailSection::Feedback,
+        ));
+        let feedback = app.agent_prompt().unwrap();
+        assert!(feedback.contains("feedback-1"));
+        assert!(!feedback.contains("check-1"));
+        assert!(!feedback.contains("PR #2"));
     }
 
     #[test]
