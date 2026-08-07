@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::github::{GitHubError, PullRequestMapping};
 use crate::model::{
     AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, GitHubRepositoryIdentity,
-    PullRequestDetails, RepositoryConfig, Worktree, WorktreeStatus,
+    PullRequest, PullRequestDetails, RepositoryConfig, Worktree, WorktreeStatus,
 };
 
 const LIST_SCROLL_MARGIN: usize = 5;
@@ -422,7 +422,8 @@ impl App {
                 .enumerate()
                 .filter(|(_, worktree)| {
                     !worktree.bare
-                        && (repository_matches || self.worktree_matches(worktree, &filter))
+                        && (repository_matches
+                            || self.worktree_matches(repository, worktree, &filter))
                 })
                 .map(|(index, _)| index)
                 .collect();
@@ -439,10 +440,9 @@ impl App {
             let mapped_virtual_matches = mapped_virtual_repositories.iter().any(|index| {
                 let virtual_repository = &self.virtual_repositories[*index];
                 virtual_repository_matches(virtual_repository, &filter)
-                    || virtual_repository
-                        .pull_requests
-                        .iter()
-                        .any(|pull_request| virtual_pull_request_matches(pull_request, &filter))
+                    || virtual_repository.pull_requests.iter().any(|pull_request| {
+                        self.virtual_pull_request_matches(pull_request, &filter)
+                    })
             });
             if !repository_matches && matching_worktrees.is_empty() && !mapped_virtual_matches {
                 continue;
@@ -531,7 +531,9 @@ impl App {
                     .pull_requests
                     .iter()
                     .enumerate()
-                    .filter(|(_, pull_request)| virtual_pull_request_matches(pull_request, filter))
+                    .filter(|(_, pull_request)| {
+                        self.virtual_pull_request_matches(pull_request, filter)
+                    })
                     .map(|(index, _)| index)
                     .collect()
             };
@@ -577,7 +579,12 @@ impl App {
         }
     }
 
-    fn worktree_matches(&self, worktree: &Worktree, filter: &str) -> bool {
+    fn worktree_matches(
+        &self,
+        repository: &RepositoryView,
+        worktree: &Worktree,
+        filter: &str,
+    ) -> bool {
         if filter.is_empty() {
             return true;
         }
@@ -596,13 +603,13 @@ impl App {
             .map(|state| match state {
                 GitHubState::Loading { previous } => previous
                     .as_ref()
-                    .map(github_search_text)
+                    .map(|data| self.github_search_text(repository, data))
                     .unwrap_or_else(|| "github loading".to_owned()),
-                GitHubState::Ready(data) => github_search_text(data),
+                GitHubState::Ready(data) => self.github_search_text(repository, data),
                 GitHubState::Stale { previous, error } => {
                     let mut text = previous
                         .as_ref()
-                        .map(github_search_text)
+                        .map(|data| self.github_search_text(repository, data))
                         .unwrap_or_default();
                     text.push(' ');
                     text.push_str(error);
@@ -686,6 +693,63 @@ impl App {
             )),
             _ => None,
         }
+    }
+
+    pub fn pull_request_identity(
+        &self,
+        repository: &RepositoryView,
+        pull_request: &PullRequest,
+    ) -> Option<CanonicalPullRequestId> {
+        let base_repository = pull_request.base.repository.as_deref()?;
+        let mut remote_names = Vec::new();
+        remote_names.extend(repository.config.github_preferred_remote.iter().cloned());
+        remote_names.extend(repository.config.github_remote.iter().cloned());
+        remote_names.push("origin".to_owned());
+        remote_names.extend(repository.config.github_remotes.keys().cloned());
+        remote_names
+            .into_iter()
+            .filter_map(|name| repository.config.github_remotes.get(&name))
+            .find(|identity| identity.full_name().eq_ignore_ascii_case(base_repository))
+            .map(|repository| CanonicalPullRequestId {
+                repository: repository.clone(),
+                number: pull_request.number,
+            })
+    }
+
+    pub fn pull_request_details_for<'a>(
+        &'a self,
+        repository: &RepositoryView,
+        pull_request: &PullRequest,
+    ) -> Option<(&'a CanonicalPullRequestId, &'a PullRequestDetails)> {
+        let identity = self.pull_request_identity(repository, pull_request)?;
+        self.pull_request_details.get_key_value(&identity)
+    }
+
+    fn github_search_text(&self, repository: &RepositoryView, data: &GitHubBranchData) -> String {
+        let mut text = github_search_text(data);
+        if let Some(pull_request) = &data.pull_request
+            && let Some((_, details)) = self.pull_request_details_for(repository, pull_request)
+        {
+            text.push(' ');
+            text.push_str(&pull_request_details_search_text(details));
+        }
+        text
+    }
+
+    fn virtual_pull_request_matches(
+        &self,
+        pull_request: &AuthoredPullRequest,
+        filter: &str,
+    ) -> bool {
+        virtual_pull_request_matches(pull_request, filter)
+            || self
+                .pull_request_details
+                .get(&pull_request.identity)
+                .is_some_and(|details| {
+                    pull_request_details_search_text(details)
+                        .to_ascii_lowercase()
+                        .contains(filter)
+                })
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Intent {
@@ -1696,6 +1760,61 @@ fn virtual_pull_request_matches(pull_request: &AuthoredPullRequest, filter: &str
         || (pull_request_data.auto_merge && "auto-merge".contains(filter))
 }
 
+fn pull_request_details_search_text(details: &PullRequestDetails) -> String {
+    let mut parts = details.warnings.clone();
+    parts.extend(details.checks.iter().flat_map(|check| {
+        [
+            check.name.clone(),
+            format!("{:?}", check.state),
+            check.target_url.clone().unwrap_or_default(),
+            if check.required {
+                "required".to_owned()
+            } else {
+                "optional".to_owned()
+            },
+        ]
+    }));
+    parts.extend(details.review_requests.iter().flat_map(|request| {
+        [
+            request.id.clone(),
+            request.name.clone(),
+            format!("{:?}", request.kind),
+        ]
+    }));
+    parts.extend(details.reviewer_reviews.iter().flat_map(|review| {
+        [
+            review.id.clone(),
+            review
+                .database_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            review.reviewer.clone(),
+            format!("{:?}", review.state),
+        ]
+    }));
+    parts.extend(details.feedback.iter().flat_map(|feedback| {
+        [
+            feedback.id.clone(),
+            feedback
+                .database_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            feedback.author.clone(),
+            feedback.body.clone(),
+            feedback.path.clone().unwrap_or_default(),
+            feedback.permalink.clone().unwrap_or_default(),
+            format!("{:?}", feedback.kind),
+            if feedback.outdated {
+                "outdated".to_owned()
+            } else {
+                String::new()
+            },
+        ]
+    }));
+    parts.push(format!("{:?}", details.merge_conflict));
+    parts.join(" ")
+}
+
 fn contains_path(worktree: &Path, candidate: &Path) -> bool {
     let worktree = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_owned());
     let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_owned());
@@ -2290,6 +2409,11 @@ mod tests {
     fn filter_matches_pull_request_enrichment() {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         let path = PathBuf::from("/repo-topic");
+        let repository_identity = GitHubRepositoryIdentity::canonical("github.com", "team", "repo");
+        app.repositories[0]
+            .config
+            .github_remotes
+            .insert("origin".to_owned(), repository_identity.clone());
         app.github.insert(
             path.clone(),
             GitHubState::Ready(GitHubBranchData {
@@ -2317,10 +2441,55 @@ mod tests {
                 rate_limit: None,
             }),
         );
-        app.filter = "frobnicator".to_owned();
-        assert!(app.visible_rows().iter().any(
-            |row| matches!(row, VisibleRow::Worktree { id: RowId::Worktree(found), .. } if found == &path)
-        ));
+        app.pull_request_details.insert(
+            CanonicalPullRequestId {
+                repository: repository_identity,
+                number: 42,
+            },
+            PullRequestDetails {
+                checks: vec![crate::model::PullRequestCheck {
+                    name: "deep-lint".to_owned(),
+                    state: crate::model::CheckState::Failure,
+                    target_url: Some("https://checks.example/hidden".to_owned()),
+                    required: false,
+                    source_order: 0,
+                    completed_at: None,
+                }],
+                check_contexts_complete: true,
+                review_requests: vec![crate::model::ReviewRequest {
+                    id: "review-request".to_owned(),
+                    name: "platform-team".to_owned(),
+                    kind: crate::model::ReviewerKind::Team,
+                }],
+                reviews_complete: true,
+                feedback: vec![crate::model::PullRequestFeedback {
+                    id: "comment-id".to_owned(),
+                    database_id: Some(123),
+                    thread_id: Some("thread-id".to_owned()),
+                    kind: crate::model::FeedbackKind::InlineThread,
+                    author: "reviewer".to_owned(),
+                    body: "hidden race condition".to_owned(),
+                    path: Some("src/hidden.rs".to_owned()),
+                    permalink: None,
+                    outdated: false,
+                }],
+                feedback_complete: true,
+                ..PullRequestDetails::default()
+            },
+        );
+        for filter in [
+            "frobnicator",
+            "deep-lint",
+            "platform-team",
+            "race condition",
+            "src/hidden.rs",
+            "123",
+        ] {
+            app.filter = filter.to_owned();
+            assert!(app.visible_rows().iter().any(
+                |row| matches!(row, VisibleRow::Worktree { id: RowId::Worktree(found), .. } if found == &path)
+            ));
+        }
     }
 
     #[test]

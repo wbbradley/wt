@@ -32,6 +32,47 @@ Verification:
 - Update the README's TUI examples and status legend.
 - Run the formatting, clippy, and full test gates.
 
+### Implementation plan
+
+- Modify `src/model.rs` to expose a compact actionable-attention classification over the existing required-check, review, optional-failure, feedback, and conflict summaries, with precedence tests proving waiting states are not actionable.
+- Modify `src/app.rs` to resolve local branch summaries and virtual rows to their shared canonical detail record, include detailed checks/reviewers/comments and hidden title/path/SHA fields in filtering, and retain the existing local-ancestry-first, deduplicated visible-row structure and selection reconciliation.
+- Modify `src/ui.rs` to replace path/SHA/title-heavy child lines with width-budgeted branch/PR rows and independently styled compact indicators for required checks, optional failures, review state, feedback, conflicts, draft, dirty, locked/prunable, virtual, loading, and stale states; keep full metadata in Details.
+- Extend `src/app.rs` and `src/ui.rs` tests with canonical local/virtual resolution, hidden-detail filtering, actionable classification, narrow/wide render assertions, badge precedence, local-row uniqueness, and selection-preservation coverage.
+- Update `README.md` with compact-row examples and an exact indicator/color legend while retaining the existing TUI navigation and materialization documentation.
+
+Risks and open questions: detailed hydration can be absent or stale, so compact rows must show unknown rather than infer required readiness from the legacy aggregate rollup. Extremely deep stacks and long branch names compete with indicators at narrow widths; reserve indicator space first and truncate only the branch/repository label. ASCII prefixes keep indicator meaning available even when terminal glyph support or color perception is limited.
+
+## Post-Plan Execution Steps
+
+Execute these steps in order:
+
+### Implement
+Execute the plan above.
+
+**Naming gate:** before creating any file, identifier, run-id, or env var, ask "would this name
+make sense to someone who never read the plan?" If it encodes a sequence position (`Stage N` /
+`Phase N` / `stepN`), rename it now — cheap before a checkpoint or downstream reference pins it.
+
+### Verify
+
+1. Run the project's build/lint command. Fix all warnings.
+2. Run the project's test suite.
+3. If tests fail, fix them before proceeding.
+4. If test coverage for the new work is insufficient, add tests.
+
+### Commit
+
+Use Conventional Commits commit message style. If there are pre-existing modified files and they don't look harmful, go ahead and commit them, too.
+
+### Update PLAN.md
+
+Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" section — do not leave it in place with a [DONE] tag, strikethrough, or any other marker. The task and its related subsections should no longer appear in PLAN.md at all. PLAN.md should not have any sort of "Done" section. Then append a new entry to `COMPLETED.md` with two parts, in this order:
+
+1. A brief summary, written now, of what was actually implemented.
+2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
+
+If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
+
 ## Add selectable PR details
 
 Turn the existing scroll-only Details pane into a structured, selectable view for PR metadata, checks, reviewers, and feedback while preserving ordinary worktree details.

@@ -270,6 +270,16 @@ pub struct PullRequestAttentionSummary {
     pub merge_conflict: MergeConflictState,
 }
 
+impl PullRequestAttentionSummary {
+    pub fn is_actionable(self) -> bool {
+        self.required_checks == RequiredCheckReadiness::Failure
+            || self.review == ReviewReadiness::ChangesRequested
+            || self.unresolved_feedback > 0
+            || self.optional_failures > 0
+            || self.merge_conflict == MergeConflictState::Conflicting
+    }
+}
+
 impl PullRequestDetails {
     pub fn normalize_checks(&mut self) {
         let mut checks = BTreeMap::<String, PullRequestCheck>::new();
@@ -357,11 +367,14 @@ impl PullRequestDetails {
                 .iter()
                 .filter(|feedback| feedback.kind == FeedbackKind::InlineThread)
                 .count(),
-            optional_failures: self
-                .checks
-                .iter()
-                .filter(|check| !check.required && check.state.is_actionable())
-                .count(),
+            optional_failures: if self.check_contexts_complete {
+                self.checks
+                    .iter()
+                    .filter(|check| !check.required && check.state.is_actionable())
+                    .count()
+            } else {
+                0
+            },
             merge_conflict: self.merge_conflict,
         }
     }
@@ -423,10 +436,6 @@ impl WorktreeStatus {
             "{} staged, {} modified, {} untracked",
             self.staged, self.modified, self.untracked
         )
-    }
-
-    pub fn compact(&self) -> String {
-        format!("[{} {} {}]", self.staged, self.modified, self.untracked)
     }
 }
 
@@ -644,5 +653,29 @@ mod tests {
         assert_eq!(summary.review, ReviewReadiness::ChangesRequested);
         assert_eq!(summary.unresolved_feedback, 1);
         assert_eq!(summary.merge_conflict, MergeConflictState::Conflicting);
+        assert!(summary.is_actionable());
+    }
+
+    #[test]
+    fn waiting_checks_and_review_requests_are_not_actionable_attention() {
+        let details = PullRequestDetails {
+            checks: vec![check("build", CheckState::Pending, true, 1)],
+            check_contexts_complete: true,
+            review_requests: vec![ReviewRequest {
+                id: "reviewer".to_owned(),
+                name: "reviewer".to_owned(),
+                kind: ReviewerKind::User,
+            }],
+            reviews_complete: true,
+            feedback_complete: true,
+            merge_conflict: MergeConflictState::Clean,
+            ..PullRequestDetails::default()
+        };
+
+        let summary = details.attention_summary();
+
+        assert_eq!(summary.required_checks, RequiredCheckReadiness::Pending);
+        assert_eq!(summary.review, ReviewReadiness::Waiting);
+        assert!(!summary.is_actionable());
     }
 }

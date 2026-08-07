@@ -67,7 +67,18 @@ Direct action shortcuts:
 
 Forms show the exact operation inputs before a separate confirmation. Disabled palette actions explain why they are unavailable.
 
-Authored pull requests appear once under their canonical base `owner/repository`. A grey `[no local repo]` marker means the base repository is not yet registered, and `[virtual]` means no ordinary local worktree represents that PR. Virtual rows are Enter-only: direct selectors and action-palette commands never create PR worktrees.
+Authored pull requests appear once under their canonical base `owner/repository`. A grey `[no local repo]` marker means the base repository is not yet registered, and `V` means no ordinary local worktree represents that PR. Virtual rows are Enter-only: direct selectors and action-palette commands never create PR worktrees.
+
+PR rows stay compact enough for an 80-column terminal. A typical local row looks like `feature/login #42 C✓ R… F2 D1`; a virtual draft might look like `feature/api #51 draft C? R? X? V`. Titles, full paths, and commit SHAs stay in Details, but `/` filtering still searches them as well as check names, reviewers, and feedback text.
+
+Compact status legend:
+
+- `C✓`/`C✗`/`C…`/`C?`: required checks ready, failed, waiting, or unknown. Only required failures make `C` red.
+- `O!N`: `N` failed/error optional checks. They are actionable but do not make required-check readiness fail.
+- `R✓`/`R✗`/`R…`/`R?`: approved, changes requested, review requested/waiting, or unknown.
+- `FN`: `N` unresolved inline-feedback items; `X` is a merge conflict and `X?` means conflict state is unavailable.
+- `draft`, `merged`, and `closed` show non-open PR state; `D<N>` is a dirty local worktree, `L` is locked, `P` is prunable, and `V` is virtual-only.
+- `↻` means GitHub data is refreshing and `stale` means the last usable snapshot is retained after an error. Red PR numbers have actionable attention; yellow waiting indicators alone are not actionable.
 
 Press `n` on a repository or one of its worktrees for the common new-worktree flow. The form pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk branch. The new local branch tracks that remote branch; after creation `wt` caches the worktree, exits, and changes the invoking shell into it.
 
