@@ -12,6 +12,7 @@ mod materialize;
 mod model;
 mod operations;
 mod prompt;
+mod state;
 mod terminal;
 mod tui;
 mod ui;

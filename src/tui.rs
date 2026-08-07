@@ -22,6 +22,7 @@ use crate::github::{
 };
 use crate::model::{Catalog, RepositoryConfig, Worktree};
 use crate::operations::{self, CreateMode};
+use crate::state::{self, PersistentState};
 use crate::terminal::{InteractiveTerminal, PanicHookGuard};
 use crate::ui;
 
@@ -331,16 +332,22 @@ struct Controller {
     completed_creation: Option<PathBuf>,
     url_opener: Arc<dyn UrlOpener>,
     clipboard: Arc<dyn Clipboard>,
+    state_path: PathBuf,
 }
 
 impl Controller {
-    fn new(catalog_path: PathBuf, catalog: Catalog, app: App) -> Self {
+    fn new(catalog_path: PathBuf, catalog: Catalog, mut app: App) -> Self {
         let workers = std::thread::available_parallelism()
             .map(|parallelism| parallelism.get().min(4))
             .unwrap_or(2);
         let github_refresh_interval = github_refresh_interval(&catalog);
         let (github_sender, github_receiver) = mpsc::channel();
         let remote_cache_path = cache::path(&catalog_path);
+        let state_path = state::path(&catalog_path);
+        match state::load(&state_path) {
+            Ok(state) => app.backburner = state.backburner,
+            Err(error) => app.inline_error = Some(format!("Backburner state ignored: {error}")),
+        }
         Self {
             catalog_path,
             remote_cache_path,
@@ -363,6 +370,7 @@ impl Controller {
             completed_creation: None,
             url_opener: Arc::new(SystemUrlOpener),
             clipboard: Arc::new(SystemClipboard),
+            state_path,
         }
     }
 
@@ -550,6 +558,17 @@ impl Controller {
             Intent::OpenUrl(url) => {
                 if let Err(error) = self.url_opener.open(&url) {
                     self.app.inline_error = Some(format!("unable to open {url}: {error}"));
+                }
+                Ok(ControlFlow::Continue)
+            }
+            Intent::PersistBackburner => {
+                let persistent = PersistentState {
+                    backburner: self.app.backburner.clone(),
+                    ..PersistentState::default()
+                };
+                if let Err(error) = state::save(&self.state_path, &persistent) {
+                    self.app.inline_error =
+                        Some(format!("unable to save Backburner state: {error}"));
                 }
                 Ok(ControlFlow::Continue)
             }
@@ -1940,6 +1959,51 @@ mod tests {
                 .inline_error
                 .as_deref()
                 .is_some_and(|error| error.contains("clipboard unavailable"))
+        );
+    }
+
+    #[test]
+    fn controller_restores_persists_and_surfaces_backburner_state_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog_path = directory.path().join("wt.json");
+        let state_path = state::path(&catalog_path);
+        let identity = CanonicalPullRequestId {
+            repository: GitHubRepositoryIdentity::canonical("github.example.com", "team", "repo"),
+            number: 9,
+        };
+        state::save(
+            &state_path,
+            &PersistentState {
+                backburner: std::collections::BTreeSet::from([identity.clone()]),
+                ..PersistentState::default()
+            },
+        )
+        .unwrap();
+        let mut controller = Controller::new(
+            catalog_path,
+            Catalog::default(),
+            App::new(Vec::new(), directory.path().to_owned()),
+        );
+        assert!(controller.app.backburner.contains(&identity));
+
+        let second = CanonicalPullRequestId {
+            repository: GitHubRepositoryIdentity::canonical("github.com", "team", "repo"),
+            number: 9,
+        };
+        controller.app.backburner.insert(second.clone());
+        controller.handle_intent(Intent::PersistBackburner).unwrap();
+        let restored = state::load(&state_path).unwrap();
+        assert!(restored.backburner.contains(&identity));
+        assert!(restored.backburner.contains(&second));
+
+        controller.state_path = directory.path().to_owned();
+        controller.handle_intent(Intent::PersistBackburner).unwrap();
+        assert!(
+            controller
+                .app
+                .inline_error
+                .as_deref()
+                .is_some_and(|error| error.contains("unable to save Backburner state"))
         );
     }
 
