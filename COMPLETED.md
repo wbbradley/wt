@@ -499,3 +499,13 @@ Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" sectio
 2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
 
 If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
+
+## Materialized pull request cache reconciliation
+
+Reconciled the remote cache immediately after a virtual pull request becomes a local worktree, recording its branch enrichment, refreshed authored data, and active canonical identity without triggering a catalog-wide refresh. Startup now trusts cached active identities only when the complete navigable local-branch topology matches, while still hydrating individually matching branches; bare anchors are consistently excluded. Added regression coverage for deterministic cache upserts and newly created branches absent from an older cache.
+
+## Materialized pull request cache reconciliation
+
+This task was supplied directly by the user while `PLAN.md` contained no queued entry:
+
+> I also noticed that on boot, if on the last time we ran, we converted a virtual branch to a local worktree, then that branch appears twice because of the cache. We should probably invalidate the cache when we create a new worktree that makes a branch no longer virtual.
