@@ -49,6 +49,16 @@ pub struct AuthoredPullRequestState {
 }
 
 impl AuthoredPullRequestState {
+    pub fn hydrate(&mut self, pull_requests: Vec<AuthoredPullRequest>) {
+        if self.loading {
+            return;
+        }
+        self.baseline = pull_requests
+            .into_iter()
+            .map(|pull_request| (pull_request.identity.clone(), pull_request))
+            .collect();
+    }
+
     pub fn begin(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.pending.clear();

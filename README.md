@@ -2,7 +2,7 @@
 
 `wt` is a global Git worktree manager. It keeps a catalog of repositories, presents all of their worktrees in one terminal UI, performs guarded worktree operations, and optionally enriches branches with GitHub pull-request status. It also discovers your open authored pull requests and can safely turn a virtual PR row into a persistent local repository and linked worktree.
 
-Local repository and worktree data renders first. Status and GitHub requests run in the background, so unavailable repositories, missing credentials, network failures, and rate limits do not block navigation or local operations.
+Local repository and worktree data renders first. The most recent GitHub snapshot is loaded from a machine-local cache for the first frame, then status and GitHub requests run in the background. Unavailable repositories, missing credentials, network failures, and rate limits do not block navigation or local operations.
 
 ## Install
 
@@ -130,6 +130,8 @@ Catalog mutations use a sidecar lock next to the JSON file. PR materialization h
 For each local branch, `wt` prefers its configured upstream remote, then the catalog's `github_remote`, then `origin`. SSH and HTTPS remotes for `github.com` and GitHub Enterprise are supported. Detached and bare rows do not make PR requests.
 
 At startup and on refresh, `wt` searches each configured or inferred host for open pull requests authored by the authenticated viewer, including drafts. Results arrive progressively in the background, are deduplicated by base repository and PR number, and retain the last complete snapshot if a host/page fails. `github.com` is always included; Enterprise hosts can be listed in `github_hosts` and are also inferred from cached local remotes. Enterprise GraphQL uses `https://<host>/api/graphql`.
+
+Successful authored-PR and local-branch enrichment snapshots are cached in `$XDG_CACHE_HOME/wt/github.json` (or `~/.cache/wt/github.json`) with mode `0600`. Set `WT_CACHE_PATH` to override the location. Cache entries are matched to both worktree path and full branch ref, so changing a checkout cannot display another branch's cached PR. Cache corruption or an unsupported future schema never prevents startup; `wt` falls back to the asynchronous network refresh.
 
 Tokens are resolved per host in this order:
 
