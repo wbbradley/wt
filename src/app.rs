@@ -162,6 +162,10 @@ impl RepositoryView {
     pub fn id(&self) -> RowId {
         RowId::Repository(self.config.path.clone())
     }
+
+    pub fn is_bare(&self) -> bool {
+        self.worktrees.iter().any(|worktree| worktree.bare)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -404,13 +408,15 @@ impl App {
                     .path
                     .to_string_lossy()
                     .to_ascii_lowercase()
-                    .contains(&filter);
+                    .contains(&filter)
+                || (repository.is_bare() && "bare".contains(&filter));
             let matching_worktrees: Vec<usize> = repository
                 .worktrees
                 .iter()
                 .enumerate()
                 .filter(|(_, worktree)| {
-                    repository_matches || self.worktree_matches(worktree, &filter)
+                    !worktree.bare
+                        && (repository_matches || self.worktree_matches(worktree, &filter))
                 })
                 .map(|(index, _)| index)
                 .collect();
@@ -1757,6 +1763,30 @@ mod tests {
     }
 
     #[test]
+    fn bare_anchor_is_represented_by_repository_header_not_worktree_row() {
+        let mut bare = repository("/repo.git", true);
+        bare.worktrees = vec![
+            worktree("/repo.git", "main", true),
+            worktree("/trees/topic", "topic", false),
+        ];
+        let mut app = App::new(vec![bare], PathBuf::from("/elsewhere"));
+
+        assert_eq!(
+            app.visible_rows()
+                .into_iter()
+                .map(|row| row.id().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                RowId::Repository(PathBuf::from("/repo.git")),
+                RowId::Worktree(PathBuf::from("/trees/topic")),
+            ]
+        );
+
+        app.filter = "bare".to_owned();
+        assert_eq!(app.visible_rows().len(), 2);
+    }
+
+    #[test]
     fn virtual_selection_expansion_and_enter_survive_updates_with_safe_fallback() {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         let selected = authored("team", "project", 10, "2026-01-01T00:00:00Z");
@@ -2066,7 +2096,8 @@ mod tests {
         app.selected = Some(RowId::Repository(PathBuf::from("/stale")));
         assert!(!app.action_availability(Action::Create).enabled);
         assert!(app.action_availability(Action::EditRepository).enabled);
-        app.selected = Some(RowId::Worktree(PathBuf::from("/bare")));
+        app.selected = Some(RowId::Repository(PathBuf::from("/bare")));
+        assert!(app.action_availability(Action::Create).enabled);
         assert!(!app.action_availability(Action::Remove).enabled);
         app.selected = Some(RowId::Worktree(PathBuf::from("/session-topic")));
         app.statuses.insert(
