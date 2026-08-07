@@ -76,6 +76,11 @@ fn shell_init_is_in_local_completion_candidates() {
             .lines()
             .any(|candidate| candidate == "shell-init")
     );
+    assert!(
+        String::from_utf8_lossy(&top_level.stdout)
+            .lines()
+            .any(|candidate| candidate == "-x")
+    );
 
     let shell = Command::new(env!("CARGO_BIN_EXE_wt"))
         .args(["__complete", "shell-init", ""])

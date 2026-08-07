@@ -307,6 +307,30 @@ impl Controller {
             .map(|cached| (cached.worktree.clone(), cached.branch.clone()))
             .collect();
         let cache_topology_matches = current_branches == cached_branches;
+        let active_from_matching_branches: std::collections::HashSet<_> = remote_cache
+            .authored_pull_requests
+            .iter()
+            .filter(|authored| {
+                remote_cache.branches.iter().any(|cached| {
+                    current_branches.contains(&(cached.worktree.clone(), cached.branch.clone()))
+                        && cached
+                            .data
+                            .pull_request
+                            .as_ref()
+                            .is_some_and(|pull_request| {
+                                pull_request.number == authored.identity.number
+                                    && pull_request.base.repository.as_deref().is_some_and(
+                                        |repository| {
+                                            repository.eq_ignore_ascii_case(
+                                                &authored.identity.repository.full_name(),
+                                            )
+                                        },
+                                    )
+                            })
+                })
+            })
+            .map(|authored| authored.identity.clone())
+            .collect();
         for cached in remote_cache.branches {
             if current_branches.contains(&(cached.worktree.clone(), cached.branch.clone())) {
                 self.app
@@ -327,9 +351,13 @@ impl Controller {
                 .collect(),
         );
         self.app.active_pull_requests = if cache_topology_matches {
-            remote_cache.active_pull_requests.into_iter().collect()
+            remote_cache
+                .active_pull_requests
+                .into_iter()
+                .chain(active_from_matching_branches)
+                .collect()
         } else {
-            Default::default()
+            active_from_matching_branches
         };
         self.refresh_authored_mappings();
     }
@@ -1541,6 +1569,53 @@ mod tests {
     }
 
     #[test]
+    fn invalid_repository_can_be_unregistered_through_ui_shortcut() {
+        let directory = tempfile::tempdir().unwrap();
+        let invalid_path = directory.path().join("not-a-repository");
+        std::fs::create_dir(&invalid_path).unwrap();
+        let catalog_path = directory.path().join("config/wt.json");
+        let catalog = Catalog {
+            repositories: vec![RepositoryConfig {
+                path: invalid_path,
+                label: Some("invalid-project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            }],
+            ..Catalog::default()
+        };
+        config::save(&catalog_path, &catalog).unwrap();
+        let views = load_repository_views(&catalog, directory.path());
+        let app = App::new(views, directory.path().to_owned());
+        let mut controller = Controller::new(catalog_path.clone(), catalog, app);
+
+        let unregister = controller.app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(unregister, Intent::BeginAction(Action::RemoveRepository));
+        controller.handle_intent(unregister).unwrap();
+        assert!(matches!(
+            controller.app.modal,
+            Some(Modal::Confirm {
+                action: Action::RemoveRepository,
+                ..
+            })
+        ));
+
+        let confirm = controller.app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('y'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(confirm, Intent::ConfirmAction(Action::RemoveRepository));
+        controller.handle_intent(confirm).unwrap();
+
+        assert!(config::load(&catalog_path).unwrap().repositories.is_empty());
+        assert!(controller.app.repositories.is_empty());
+    }
+
+    #[test]
     fn form_parsers_reject_ambiguous_values() {
         assert!(parse_yes_no("maybe", "choice").is_err());
         assert!(nonempty("  ", "branch").is_err());
@@ -1689,13 +1764,16 @@ mod tests {
         });
         controller.load_remote_cache();
 
-        assert!(controller.app.active_pull_requests.is_empty());
+        assert_eq!(
+            controller.app.active_pull_requests,
+            std::collections::HashSet::from([local.identity.clone()])
+        );
         assert!(
             controller
                 .app
                 .authored_mappings
                 .iter()
-                .any(|mapping| mapping.identity == local.identity)
+                .all(|mapping| mapping.identity != local.identity)
         );
     }
 

@@ -22,6 +22,8 @@ wt repo list
 
 Running `wt` opens the global TUI. Running it inside an unregistered Git repository also shows that repository as session-only; press `a` to register it. An empty catalog displays onboarding instructions.
 
+Run `wt -x` from a linked worktree when you are finished with it. `wt` safely removes the containing worktree only when it is clean and unlocked, relocates to the registered repository anchor (or `$HOME` if the anchor is unavailable), and then opens the TUI normally. The main worktree and bare anchors remain protected. If the TUI is cancelled after a successful cleanup, the shell still moves to that fallback directory.
+
 ## Bash navigation and completion
 
 Add the self-contained Bash 3.2-compatible integration to `.bashrc`:
@@ -89,6 +91,7 @@ Mutating commands print an exact preview and prompt unless `--yes` is supplied w
 ### Safety rules
 
 - Normal removal refuses bare anchors, main worktrees, the worktree containing `$PWD`, locked worktrees, and dirty worktrees.
+- Top-level `wt -x` is the explicit exception for the worktree containing `$PWD`; it retains the bare, main, locked, and dirty protections.
 - Removal does not delete the branch.
 - Force removal is a distinct command and requires `--confirm` to exactly match the branch or full worktree path.
 - Missing parent directories at or below a repository's configured `worktree_root` are created automatically; anywhere else they need `--create-parents`.

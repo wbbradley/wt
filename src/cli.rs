@@ -23,6 +23,9 @@ use crate::tui;
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Safely remove the linked worktree containing $PWD before opening the app.
+    #[arg(short = 'x', long = "cleanup", conflicts_with = "selector")]
+    cleanup: bool,
     /// Navigate directly with <repository-label>:<branch-or-worktree>.
     selector: Option<String>,
 }
@@ -255,6 +258,17 @@ pub enum CliError {
     Git(#[from] git::GitError),
     #[error("cannot resolve current directory: {0}")]
     CurrentDirectory(std::io::Error),
+    #[error("the current directory is not inside a registered linked worktree")]
+    CurrentWorktreeNotFound,
+    #[error(
+        "cannot relocate after cleanup because neither the repository nor home directory is available"
+    )]
+    CleanupDestinationUnavailable,
+    #[error("cannot relocate to {path}: {source}")]
+    CleanupChdir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("repository selector {0:?} did not match any catalog entry")]
     SelectorNotFound(String),
     #[error("repository selector {0:?} is ambiguous")]
@@ -292,7 +306,18 @@ pub fn run(cli: Cli) -> Result<Option<PathBuf>, CliError> {
         };
     }
     if cli.command.is_none() {
-        return Ok(tui::run()?);
+        let cleanup_destination = if cli.cleanup {
+            let path = config::catalog_path()?;
+            let catalog = config::load(&path)?;
+            let current = env::current_dir().map_err(CliError::CurrentDirectory)?;
+            let cleanup = cleanup_current_worktree(&SystemGit, &catalog, &current)?;
+            let destination = relocate_after_cleanup(&cleanup.destination, &cleanup.removed)?;
+            eprintln!("removed\t{}", cleanup.removed.display());
+            Some(destination)
+        } else {
+            None
+        };
+        return Ok(tui::run()?.or(cleanup_destination));
     }
     if let Some(Command::ShellInit { shell }) = cli.command.as_ref() {
         let script = match shell {
@@ -403,6 +428,89 @@ fn resolve_navigation(
     }
 }
 
+struct CleanupOutcome {
+    removed: PathBuf,
+    destination: PathBuf,
+}
+
+fn cleanup_current_worktree(
+    runner: &dyn GitRunner,
+    catalog: &Catalog,
+    current_directory: &Path,
+) -> Result<CleanupOutcome, CliError> {
+    let current = fs::canonicalize(current_directory).unwrap_or_else(|_| current_directory.into());
+    let mut containing = Vec::new();
+    for repository in &catalog.repositories {
+        let Ok(worktrees) = git::discover_worktrees(runner, &repository.path) else {
+            continue;
+        };
+        containing.extend(
+            worktrees
+                .into_iter()
+                .filter(|worktree| {
+                    worktree.navigable()
+                        && current.starts_with(
+                            fs::canonicalize(&worktree.path)
+                                .unwrap_or_else(|_| worktree.path.clone()),
+                        )
+                })
+                .map(|worktree| (repository.clone(), worktree)),
+        );
+    }
+    let (repository, worktree) = containing
+        .into_iter()
+        .max_by_key(|(_, worktree)| worktree.path.components().count())
+        .ok_or(CliError::CurrentWorktreeNotFound)?;
+    let destination = cleanup_destination(&repository, &worktree.path)?;
+    let details = operations::remove_current(
+        runner,
+        &repository,
+        &worktree.path.to_string_lossy(),
+        &current,
+    )?;
+    Ok(CleanupOutcome {
+        removed: details.worktree.path,
+        destination,
+    })
+}
+
+fn cleanup_destination(
+    repository: &RepositoryConfig,
+    removed_worktree: &Path,
+) -> Result<PathBuf, CliError> {
+    let repository_path =
+        fs::canonicalize(&repository.path).unwrap_or_else(|_| repository.path.clone());
+    if repository_path.is_dir() && !repository_path.starts_with(removed_worktree) {
+        return Ok(repository_path);
+    }
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir() && !path.starts_with(removed_worktree))
+        .and_then(|path| fs::canonicalize(&path).ok().or(Some(path)))
+        .ok_or(CliError::CleanupDestinationUnavailable)
+}
+
+fn relocate_after_cleanup(preferred: &Path, removed_worktree: &Path) -> Result<PathBuf, CliError> {
+    let mut candidates = vec![preferred.to_owned()];
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from)
+        && !home.starts_with(removed_worktree)
+        && !candidates.contains(&home)
+    {
+        candidates.push(home);
+    }
+    let mut last_error = None;
+    for candidate in candidates {
+        match env::set_current_dir(&candidate) {
+            Ok(()) => return Ok(fs::canonicalize(&candidate).unwrap_or(candidate)),
+            Err(source) => last_error = Some((candidate, source)),
+        }
+    }
+    match last_error {
+        Some((path, source)) => Err(CliError::CleanupChdir { path, source }),
+        None => Err(CliError::CleanupDestinationUnavailable),
+    }
+}
+
 fn worktree_matches(worktree: &crate::model::Worktree, selector: &str) -> bool {
     let selector_path = Path::new(selector);
     worktree.path == selector_path
@@ -446,7 +554,11 @@ fn completion_candidates(
         }
         "worktree" => complete_worktree(runner, catalog, words, &mut candidates),
         _ => {
-            candidates.extend(["--version".to_owned(), "-V".to_owned()]);
+            candidates.extend(
+                ["--cleanup", "--version", "-V", "-x"]
+                    .into_iter()
+                    .map(str::to_owned),
+            );
             candidates.extend(
                 ["config", "repo", "shell-init", "worktree"]
                     .into_iter()
@@ -1137,6 +1249,63 @@ mod tests {
     use super::*;
     use crate::git::{CommandOutput, GitError};
     use std::ffi::OsString;
+    use std::process::Command as ProcessCommand;
+
+    #[test]
+    fn cleanup_flag_removes_containing_clean_linked_worktree() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository_path = directory.path().join("repository");
+        let worktree_path = directory.path().join("topic");
+        run_git(
+            directory.path(),
+            &["init", "-b", "main", path(&repository_path)],
+        );
+        run_git(
+            &repository_path,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        run_git(
+            &repository_path,
+            &["worktree", "add", "-b", "topic", path(&worktree_path)],
+        );
+        let nested = worktree_path.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let canonical_worktree = fs::canonicalize(&worktree_path).unwrap();
+        let catalog = Catalog {
+            repositories: vec![repository(path(&repository_path), "project")],
+            ..Catalog::default()
+        };
+
+        let outcome = cleanup_current_worktree(&SystemGit, &catalog, &nested).unwrap();
+
+        assert_eq!(outcome.removed, canonical_worktree);
+        assert_eq!(
+            outcome.destination,
+            fs::canonicalize(repository_path).unwrap()
+        );
+        assert!(!outcome.removed.exists());
+        let remaining = git::discover_worktrees(&SystemGit, &catalog.repositories[0].path).unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn cleanup_flag_is_a_top_level_tui_option() {
+        let cli = Cli::try_parse_from(["wt", "-x"]).unwrap();
+        assert!(cli.cleanup);
+        assert!(cli.command.is_none());
+        assert!(cli.selector.is_none());
+        assert!(Cli::try_parse_from(["wt", "-x", "project:topic"]).is_err());
+        assert!(Cli::try_parse_from(["wt", "-x", "repo", "list"]).is_err());
+    }
 
     #[test]
     fn selector_rejects_duplicate_labels() {
@@ -1212,5 +1381,24 @@ mod tests {
             github_remotes: Default::default(),
             github_preferred_remote: None,
         }
+    }
+
+    fn path(path: &Path) -> &str {
+        path.to_str().unwrap()
+    }
+
+    fn run_git(directory: &Path, arguments: &[&str]) {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

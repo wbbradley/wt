@@ -341,6 +341,26 @@ pub fn remove(
     Ok(details)
 }
 
+pub fn remove_current(
+    runner: &dyn GitRunner,
+    repository: &RepositoryConfig,
+    selector: &str,
+    current_directory: &Path,
+) -> Result<WorktreeDetails, OperationError> {
+    let details =
+        removal_preview_with_current(runner, repository, selector, current_directory, false, true)?;
+    git::run_git(
+        runner,
+        &repository.path,
+        &[
+            OsString::from("worktree"),
+            OsString::from("remove"),
+            details.worktree.path.as_os_str().to_owned(),
+        ],
+    )?;
+    Ok(details)
+}
+
 pub fn force_remove(
     runner: &dyn GitRunner,
     repository: &RepositoryConfig,
@@ -377,7 +397,31 @@ pub fn removal_preview(
     current_directory: &Path,
     allow_dirty_or_locked: bool,
 ) -> Result<WorktreeDetails, OperationError> {
-    let details = removal_details(runner, repository, selector, current_directory)?;
+    removal_preview_with_current(
+        runner,
+        repository,
+        selector,
+        current_directory,
+        allow_dirty_or_locked,
+        false,
+    )
+}
+
+fn removal_preview_with_current(
+    runner: &dyn GitRunner,
+    repository: &RepositoryConfig,
+    selector: &str,
+    current_directory: &Path,
+    allow_dirty_or_locked: bool,
+    allow_current_worktree: bool,
+) -> Result<WorktreeDetails, OperationError> {
+    let details = removal_details(
+        runner,
+        repository,
+        selector,
+        current_directory,
+        allow_current_worktree,
+    )?;
     if let Some(error) = &details.status_error {
         return Err(OperationError::StatusUnavailable(error.clone()));
     }
@@ -443,6 +487,7 @@ fn removal_details(
     repository: &RepositoryConfig,
     selector: &str,
     current_directory: &Path,
+    allow_current_worktree: bool,
 ) -> Result<WorktreeDetails, OperationError> {
     let worktrees = list(runner, repository)?;
     let (index, worktree) = select_worktree(&worktrees, selector)?;
@@ -452,7 +497,7 @@ fn removal_details(
     if index == 0 {
         return Err(OperationError::MainWorktree);
     }
-    if contains_path(&worktree.path, current_directory) {
+    if !allow_current_worktree && contains_path(&worktree.path, current_directory) {
         return Err(OperationError::CurrentWorktree);
     }
     inspect(runner, repository, &worktree.path.to_string_lossy())
