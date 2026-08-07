@@ -9,6 +9,8 @@ use crate::model::{
     RepositoryConfig, Worktree, WorktreeStatus,
 };
 
+const LIST_SCROLL_MARGIN: usize = 5;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RowId {
     Repository(PathBuf),
@@ -337,6 +339,7 @@ pub struct App {
     pub pane: Pane,
     pub scroll: usize,
     pub viewport_height: usize,
+    viewport_initialized: bool,
     pub detail_scroll: usize,
     detail_max_scroll: usize,
     pub modal: Option<Modal>,
@@ -368,6 +371,7 @@ impl App {
             pane: Pane::List,
             scroll: 0,
             viewport_height: 1,
+            viewport_initialized: false,
             detail_scroll: 0,
             detail_max_scroll: 0,
             modal: None,
@@ -1182,7 +1186,12 @@ impl App {
 
     pub fn set_viewport_height(&mut self, height: usize) {
         self.viewport_height = height.max(1);
-        self.ensure_selected_in_view();
+        if self.viewport_initialized {
+            self.ensure_selected_in_view();
+        } else {
+            self.viewport_initialized = true;
+            self.ensure_initial_selection_in_view();
+        }
     }
 
     pub fn set_detail_max_scroll(&mut self, max_scroll: usize) {
@@ -1400,11 +1409,40 @@ impl App {
             self.scroll = 0;
             return;
         };
-        if index < self.scroll {
-            self.scroll = index;
-        } else if index >= self.scroll + self.viewport_height {
-            self.scroll = index + 1 - self.viewport_height;
+        if !self.viewport_initialized {
+            return;
         }
+        let margin = LIST_SCROLL_MARGIN.min(self.viewport_height.saturating_sub(1) / 2);
+        if index < self.scroll.saturating_add(margin) {
+            self.scroll = index.saturating_sub(margin);
+        } else if index >= self.scroll + self.viewport_height.saturating_sub(margin) {
+            self.scroll = index + margin + 1 - self.viewport_height;
+        }
+        self.clamp_list_scroll(rows.len());
+    }
+
+    fn ensure_initial_selection_in_view(&mut self) {
+        let rows = self.visible_rows();
+        let Some(index) = self
+            .selected
+            .as_ref()
+            .and_then(|selected| rows.iter().position(|row| row.id() == selected))
+        else {
+            self.scroll = 0;
+            return;
+        };
+        self.scroll = 0;
+        if index >= self.viewport_height {
+            let margin = LIST_SCROLL_MARGIN.min(self.viewport_height.saturating_sub(1) / 2);
+            self.scroll = index + margin + 1 - self.viewport_height;
+        }
+        self.clamp_list_scroll(rows.len());
+    }
+
+    fn clamp_list_scroll(&mut self, row_count: usize) {
+        self.scroll = self
+            .scroll
+            .min(row_count.saturating_sub(self.viewport_height));
     }
 }
 
@@ -2087,6 +2125,34 @@ mod tests {
         );
         app.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(app.selected, Some(RowId::Repository(_))));
+    }
+
+    #[test]
+    fn initial_selection_does_not_scroll_when_already_visible() {
+        let repositories = (0..6)
+            .map(|index| repository(&format!("/repo-{index}"), true))
+            .collect();
+        let mut app = App::new(repositories, PathBuf::from("/repo-3"));
+
+        app.set_viewport_height(12);
+
+        assert_eq!(app.scroll, 0);
+        app.select_index(11);
+        assert_eq!(app.scroll, 5, "navigation keeps a five-row bottom margin");
+        app.select_index(6);
+        assert_eq!(app.scroll, 1, "navigation keeps a five-row top margin");
+    }
+
+    #[test]
+    fn initial_selection_scrolls_down_only_when_below_viewport() {
+        let repositories = (0..6)
+            .map(|index| repository(&format!("/repo-{index}"), true))
+            .collect();
+        let mut app = App::new(repositories, PathBuf::from("/repo-4"));
+
+        app.set_viewport_height(12);
+
+        assert_eq!(app.scroll, 6);
     }
 
     #[test]
