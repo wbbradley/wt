@@ -115,9 +115,14 @@ pub enum AuthoredRefreshEvent {
 pub fn refresh_catalog_remote_identities(
     runner: &dyn GitRunner,
     catalog: &mut Catalog,
+    refreshable_paths: &HashSet<PathBuf>,
 ) -> RemoteIdentityRefresh {
     let mut refresh = RemoteIdentityRefresh::default();
-    for repository in &mut catalog.repositories {
+    for repository in catalog
+        .repositories
+        .iter_mut()
+        .filter(|repository| refreshable_paths.contains(&repository.path))
+    {
         match refresh_repository_remote_identities(runner, repository) {
             Ok(repository_refresh) => {
                 refresh.changed |= repository_refresh.changed;
@@ -1810,6 +1815,39 @@ mod tests {
         assert_eq!(
             repository.github_preferred_remote.as_deref(),
             Some("upstream")
+        );
+    }
+
+    #[test]
+    fn catalog_remote_refresh_skips_paths_excluded_by_startup_discovery() {
+        let retained = identity("github.com", "cached", "invalid");
+        let mut catalog = Catalog {
+            repositories: vec![
+                repository_with_remotes("/invalid", None, [("origin", retained.clone())]),
+                repository_with_remotes("/valid", None, []),
+            ],
+            ..Catalog::default()
+        };
+        let git = FakeGit {
+            upstream: None,
+            remotes: HashMap::from([(
+                "origin".to_owned(),
+                "git@github.com:team/project.git".to_owned(),
+            )]),
+        };
+
+        let refresh = refresh_catalog_remote_identities(
+            &git,
+            &mut catalog,
+            &HashSet::from([PathBuf::from("/valid")]),
+        );
+
+        assert!(refresh.changed);
+        assert!(refresh.warnings.is_empty());
+        assert_eq!(catalog.repositories[0].github_remotes["origin"], retained);
+        assert_eq!(
+            catalog.repositories[1].github_remotes["origin"],
+            identity("github.com", "team", "project")
         );
     }
 

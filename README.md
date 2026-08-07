@@ -100,7 +100,7 @@ Bare repositories are marked `[bare]` on their repository header; only their nav
 
 ## Catalog and configuration
 
-The default catalog is `~/.config/wt.json`. Set `WT_CONFIG_PATH` to use a different file. Writes are atomic and create missing parent directories. Missing repositories remain visible as stale entries so they can be relinked with `wt repo edit ... --path ...` or unregistered.
+The default catalog is `~/.config/wt.json`. Set `WT_CONFIG_PATH` to use a different file. Writes are atomic and create missing parent directories. Missing repositories remain visible as `[stale]`; paths that exist but are not usable Git repositories appear as `[invalid]`. Either can be relinked with `wt repo edit ... --path ...` or unregistered without touching the old filesystem path.
 
 Example:
 
@@ -165,6 +165,7 @@ Configured repositories use `<worktree_root>/<sanitized-local-branch>`; otherwis
 ## Troubleshooting
 
 - **Repository is stale:** relink it with `wt repo edit <label> --path <new-path>`, or unregister it with `wt repo remove <label>`.
+- **Repository is invalid:** the configured path exists but is not a usable Git repository. Select it to see the exact path, then relink or unregister it; `wt` will not delete the existing path.
 - **No PR data:** verify the selected remote with `git remote -v`, ensure the branch has an upstream when appropriate, and configure a token for that host.
 - **Authored PR is missing:** confirm the token resolves to the expected viewer and that its host is present in `github_hosts` or a registered remote.
 - **PR materialization is waiting:** another `wt` process holds the catalog sidecar lock; wait or press Ctrl-C to cancel without changing directories.
