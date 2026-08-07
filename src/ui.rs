@@ -65,13 +65,15 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } => {
                 let repository = &app.repositories[*repository_index];
                 let arrow = if repository.expanded { "▾" } else { "▸" };
-                let state = if repository.session_only {
-                    " [session-only]"
-                } else if repository.stale_error.is_some() {
-                    " [stale]"
-                } else {
-                    ""
-                };
+                let state = [
+                    repository.is_bare().then_some("bare"),
+                    repository.session_only.then_some("session-only"),
+                    repository.stale_error.is_some().then_some("stale"),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|state| format!(" [{state}]"))
+                .collect::<String>();
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("{arrow} {}", repository.config.display_label()),
@@ -866,6 +868,53 @@ mod tests {
         assert!(content.contains("branch"));
         terminal.resize(Rect::new(0, 0, 42, 12)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn renders_bare_state_on_repository_without_anchor_child() {
+        let path = PathBuf::from("/repo.git");
+        let repository = RepositoryView {
+            config: RepositoryConfig {
+                path: path.clone(),
+                label: Some("project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            },
+            session_only: false,
+            stale_error: None,
+            expanded: true,
+            worktrees: vec![
+                Worktree {
+                    path: path.clone(),
+                    head: None,
+                    branch: None,
+                    detached: false,
+                    bare: true,
+                    locked: None,
+                    prunable: None,
+                },
+                Worktree {
+                    path: PathBuf::from("/trees/topic"),
+                    head: Some("1234567890".to_owned()),
+                    branch: Some("refs/heads/topic".to_owned()),
+                    detached: false,
+                    bare: false,
+                    locked: None,
+                    prunable: None,
+                },
+            ],
+        };
+        let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("project [bare]"));
+        assert!(content.contains("topic"));
+        assert!(!content.contains("[anchor]"));
     }
 
     #[test]

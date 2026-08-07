@@ -96,7 +96,7 @@ Mutating commands print an exact preview and prompt unless `--yes` is supplied w
 - Catalog removal only unregisters metadata; it never deletes a repository or worktree.
 - Git is always invoked with argument arrays rather than shell command strings.
 
-Bare repositories appear as non-navigable anchors while their linked worktrees remain fully manageable. Create, repair, prune, and catalog operations work from bare anchors; checkout-only actions remain disabled on the anchor itself.
+Bare repositories are marked `[bare]` on their repository header; only their navigable linked worktrees appear as children. Create, prune, and catalog operations work from the repository header, while checkout-only actions apply to linked worktrees.
 
 ## Catalog and configuration
 
