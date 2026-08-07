@@ -142,13 +142,21 @@ pub fn materialize_pull_request(
         let result = ensure_remote_tracking_configuration(runner, &repository.path, &remote)
             .map_err(MaterializeError::from)
             .and_then(|()| {
-                fetch_ref(
-                    fetch_runner,
-                    &repository.path,
-                    &remote,
-                    &format!("+refs/heads/{branch}:{target}"),
-                    https_token,
-                )
+                let local_target = optional_commit(runner, &repository.path, &target)?;
+                if local_target
+                    .as_deref()
+                    .is_some_and(|commit| commit.eq_ignore_ascii_case(expected_head))
+                {
+                    Ok(())
+                } else {
+                    fetch_ref(
+                        fetch_runner,
+                        &repository.path,
+                        &remote,
+                        &format!("+refs/heads/{branch}:{target}"),
+                        https_token,
+                    )
+                }
             });
         (
             result,
@@ -639,10 +647,27 @@ mod tests {
     use std::collections::BTreeMap;
     use std::process::Command;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CapturingFetchRunner {
         request: Mutex<Option<FetchRequest>>,
         output: FetchOutput,
+    }
+
+    #[derive(Default)]
+    struct CountingFetchRunner {
+        requests: AtomicUsize,
+    }
+
+    impl FetchRunner for CountingFetchRunner {
+        fn run(
+            &self,
+            repository: &Path,
+            request: &FetchRequest,
+        ) -> Result<FetchOutput, std::io::Error> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            SystemFetchRunner.run(repository, request)
+        }
     }
 
     impl FetchRunner for CapturingFetchRunner {
@@ -705,10 +730,11 @@ mod tests {
                 .is_some_and(|code| code != 0)
         );
         let authored = fixture.authored(42, "feature/topic", "contributor/project");
+        let fetches = CountingFetchRunner::default();
 
         let materialized = materialize_pull_request(
             &SystemGit,
-            &SystemFetchRunner,
+            &fetches,
             &repository,
             &fixture.repository_root,
             &authored,
@@ -748,7 +774,7 @@ mod tests {
 
         let reused = materialize_pull_request(
             &SystemGit,
-            &SystemFetchRunner,
+            &fetches,
             &repository,
             &fixture.repository_root,
             &authored,
@@ -757,6 +783,7 @@ mod tests {
         .unwrap();
         assert!(reused.reused);
         assert_eq!(reused.path, materialized.path);
+        assert_eq!(fetches.requests.load(Ordering::Relaxed), 1);
     }
 
     #[test]

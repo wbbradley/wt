@@ -226,7 +226,6 @@ enum ControlFlow {
 
 struct MaterializationOutcome {
     path: PathBuf,
-    refreshed: crate::model::AuthoredPullRequest,
 }
 
 struct Controller {
@@ -832,12 +831,17 @@ impl Controller {
     }
 
     fn refresh_local(&mut self) -> Result<(), TuiError> {
+        self.reload_catalog_and_worktrees()?;
+        self.start_status_refresh();
+        self.request_github_refresh();
+        Ok(())
+    }
+
+    fn reload_catalog_and_worktrees(&mut self) -> Result<(), TuiError> {
         self.catalog = config::load(&self.catalog_path)?;
         self.github_refresh_interval = github_refresh_interval(&self.catalog);
         let repositories = load_repository_views(&self.catalog, &self.app.current_directory);
         self.app.replace_repositories(repositories);
-        self.start_status_refresh();
-        self.request_github_refresh();
         Ok(())
     }
 
@@ -1173,31 +1177,30 @@ impl Controller {
                     self.app.progress = None;
                     match result {
                         Ok(outcome) => {
-                            self.app.authored_pull_requests.update(outcome.refreshed);
-                            self.app.rebuild_virtual_repositories();
-                            match self.refresh_local() {
-                                Ok(()) => self.completed_materialization = Some(outcome.path),
-                                Err(error) => self.app.inline_error = Some(error.to_string()),
-                            }
+                            self.completed_materialization = Some(outcome.path);
                         }
                         Err(JobError::Cancelled) => {
                             self.app.inline_error = Some(
                                 "pull request materialization cancelled; completed safe stages were retained"
                                     .to_owned(),
                             );
-                            if let Err(error) = self.refresh_local() {
+                            if let Err(error) = self.reload_catalog_and_worktrees() {
                                 self.app.inline_error = Some(format!(
                                     "materialization cancelled; refresh failed: {error}"
                                 ));
+                            } else {
+                                self.refresh_authored_mappings();
                             }
                         }
                         Err(JobError::Failed(error)) => {
                             self.app.inline_error = Some(error);
-                            if let Err(refresh_error) = self.refresh_local() {
+                            if let Err(refresh_error) = self.reload_catalog_and_worktrees() {
                                 let message = self.app.inline_error.take().unwrap_or_default();
                                 self.app.inline_error = Some(format!(
                                     "{message}; refresh also failed: {refresh_error}"
                                 ));
+                            } else {
+                                self.refresh_authored_mappings();
                             }
                         }
                     }
@@ -1283,8 +1286,11 @@ impl Controller {
                 &mut catalog,
                 &repository_root,
                 &identity.repository,
-                Some(&token),
-                fresh_mapping,
+                bootstrap::BootstrapOptions {
+                    base_branch: &refreshed.pull_request.base.branch,
+                    https_token: Some(&token),
+                    mapped_repository_index: fresh_mapping,
+                },
             )
             .map_err(|error| error.to_string())?;
             config::save(&catalog_path, &catalog).map_err(|error| error.to_string())?;
@@ -1302,7 +1308,6 @@ impl Controller {
             .map_err(|error| error.to_string())?;
             Ok(MaterializationOutcome {
                 path: materialized.path,
-                refreshed,
             })
         })?;
         self.materialization_progress = Some("refreshing selected pull request".to_owned());
@@ -1699,6 +1704,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(controller.completed_materialization.is_none());
+        assert!(!controller.github_in_flight);
         assert!(
             controller
                 .app
@@ -1710,40 +1716,8 @@ mod tests {
 
     #[test]
     fn successful_background_materialization_returns_the_exact_path() {
-        use crate::model::{
-            AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, GitHubRepositoryIdentity,
-            PullRequest, PullRequestIdentity, PullRequestState,
-        };
-
         let directory = tempfile::tempdir().unwrap();
         let path = std::fs::canonicalize(directory.path()).unwrap();
-        let refreshed = AuthoredPullRequest {
-            identity: CanonicalPullRequestId {
-                repository: GitHubRepositoryIdentity::canonical("github.com", "team", "project"),
-                number: 42,
-            },
-            author: "viewer".to_owned(),
-            pull_request: PullRequest {
-                number: 42,
-                title: "Test".to_owned(),
-                url: "https://github.com/team/project/pull/42".to_owned(),
-                state: PullRequestState::Open,
-                updated_at: "2026-08-06T00:00:00Z".to_owned(),
-                review_decision: None,
-                auto_merge: false,
-                base: PullRequestIdentity {
-                    repository: Some("team/project".to_owned()),
-                    branch: "main".to_owned(),
-                    oid: None,
-                },
-                head: PullRequestIdentity {
-                    repository: Some("team/project".to_owned()),
-                    branch: "topic".to_owned(),
-                    oid: Some("abc".to_owned()),
-                },
-                checks: CheckRollup::Success,
-            },
-        };
         let mut controller = Controller::new(
             directory.path().join("wt.json"),
             Catalog::default(),
@@ -1753,10 +1727,7 @@ mod tests {
         let expected = path.clone();
         controller.materialization_job = Some(
             BackgroundJob::spawn("controller-success-test", move |_context| {
-                Ok(MaterializationOutcome {
-                    path: expected,
-                    refreshed,
-                })
+                Ok(MaterializationOutcome { path: expected })
             })
             .unwrap(),
         );
@@ -1770,6 +1741,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(controller.completed_materialization, Some(path));
+        assert!(!controller.github_in_flight);
     }
 
     #[test]
