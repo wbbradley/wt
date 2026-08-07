@@ -47,7 +47,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else if app.repositories.is_empty() {
             "No repositories or authored pull requests are available. Run `wt repo add`, or authenticate GitHub to discover authored PRs."
         } else {
-            "Catalog entries are unavailable. Select a stale repository to relink or unregister it."
+            "Catalog entries are unavailable. Select an invalid or stale repository to relink or unregister it."
         };
         frame.render_widget(
             Paragraph::new(message)
@@ -68,7 +68,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let state = [
                     repository.is_bare().then_some("bare"),
                     repository.session_only.then_some("session-only"),
-                    repository.stale_error.is_some().then_some("stale"),
+                    repository.stale_error.is_some().then_some(
+                        if repository.config.path.exists() {
+                            "invalid"
+                        } else {
+                            "stale"
+                        },
+                    ),
                 ]
                 .into_iter()
                 .flatten()
@@ -416,7 +422,14 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         ));
         if let Some(error) = &repository.stale_error {
             lines.push(Line::styled(
-                format!("stale       {error}"),
+                format!(
+                    "{}       {error}",
+                    if repository.config.path.exists() {
+                        "invalid"
+                    } else {
+                        "stale"
+                    }
+                ),
                 Style::default().fg(Color::Red),
             ));
         }
@@ -1019,6 +1032,20 @@ mod tests {
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("lost [stale]"));
         assert!(content.contains("not found"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let invalid_path = directory.path().join("invalid");
+        std::fs::create_dir(&invalid_path).unwrap();
+        stale_app.repositories[0].config.path = invalid_path;
+        stale_app.repositories[0].stale_error =
+            Some("exists but is not a usable Git repository".to_owned());
+        stale_app.selected = Some(stale_app.repositories[0].id());
+        terminal
+            .draw(|frame| render(frame, &mut stale_app))
+            .unwrap();
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("lost [invalid]"));
+        assert!(content.contains("invalid       exists but is not a usable Git repository"));
     }
 
     #[test]

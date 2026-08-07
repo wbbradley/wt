@@ -140,7 +140,7 @@ pub fn bootstrap_repository(
         .map_err(|_| BootstrapError::InvalidClone)?;
 
     let stale_index = catalog.repositories.iter().position(|repository| {
-        !repository.path.exists()
+        git::resolve_repository(git_runner, &repository.path).is_err()
             && repository
                 .github_remotes
                 .values()
@@ -663,10 +663,11 @@ mod tests {
     }
 
     #[test]
-    fn stale_entry_is_relinked_without_touching_stale_path_or_metadata() {
+    fn invalid_entry_is_relinked_without_touching_existing_path_or_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let stale_path = directory.path().join("gone.git");
-        let marker = directory.path().join("marker");
+        fs::create_dir(&stale_path).unwrap();
+        let marker = stale_path.join("user-file");
         fs::write(&marker, b"safe").unwrap();
         let mut stale_remotes = std::collections::BTreeMap::new();
         stale_remotes.insert("upstream".to_owned(), identity());
@@ -713,7 +714,7 @@ mod tests {
                 .lines()
                 .any(|remote| remote == "upstream")
         );
-        assert!(!stale_path.exists());
+        assert!(stale_path.is_dir());
         assert_eq!(fs::read(marker).unwrap(), b"safe");
         assert!(result.repository.path.exists());
     }

@@ -908,12 +908,19 @@ impl Controller {
         let discover_authored_pull_requests = self.discover_authored_pull_requests;
         std::thread::spawn(move || {
             let mut inputs = inputs;
+            let refreshable_paths = inputs
+                .iter()
+                .map(|input| input.repository.path.clone())
+                .collect();
             let mut cache_updates = Vec::new();
             let mut warnings = Vec::new();
             let catalog = match config::acquire_catalog_lock(&catalog_path).and_then(|_lock| {
                 let mut catalog = config::load(&catalog_path)?;
-                let refresh =
-                    crate::github::refresh_catalog_remote_identities(&SystemGit, &mut catalog);
+                let refresh = crate::github::refresh_catalog_remote_identities(
+                    &SystemGit,
+                    &mut catalog,
+                    &refreshable_paths,
+                );
                 if refresh.changed {
                     config::save(&catalog_path, &catalog)?;
                 }
@@ -1333,9 +1340,9 @@ fn load_repository_views(catalog: &Catalog, current_directory: &Path) -> Vec<Rep
                     worktrees,
                 },
                 Err(error) => RepositoryView {
+                    stale_error: Some(catalog_path_error(&repository.path, &error)),
                     config: repository,
                     session_only: false,
-                    stale_error: Some(error.to_string()),
                     expanded: true,
                     worktrees: Vec::new(),
                 },
@@ -1376,6 +1383,20 @@ fn load_repository_views(catalog: &Catalog, current_directory: &Path) -> Vec<Rep
         }
     }
     views
+}
+
+fn catalog_path_error(path: &Path, error: &git::GitError) -> String {
+    if path.exists() {
+        format!(
+            "catalog path {} exists but is not a usable Git repository; relink or unregister it ({error})",
+            path.display()
+        )
+    } else {
+        format!(
+            "catalog path {} is missing; relink or unregister it ({error})",
+            path.display()
+        )
+    }
 }
 
 fn field(label: &str, value: &str) -> FormField {
@@ -1478,6 +1499,32 @@ mod tests {
     fn empty_catalog_outside_repository_remains_empty() {
         let directory = tempfile::tempdir().unwrap();
         assert!(load_repository_views(&Catalog::default(), directory.path()).is_empty());
+    }
+
+    #[test]
+    fn startup_explains_existing_non_git_catalog_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let invalid_path = directory.path().join("not-a-repository");
+        std::fs::create_dir(&invalid_path).unwrap();
+        let catalog = Catalog {
+            repositories: vec![RepositoryConfig {
+                path: invalid_path.clone(),
+                label: Some("invalid-project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            }],
+            ..Catalog::default()
+        };
+
+        let views = load_repository_views(&catalog, directory.path());
+
+        assert_eq!(views.len(), 1);
+        let error = views[0].stale_error.as_deref().unwrap();
+        assert!(error.contains("exists but is not a usable Git repository"));
+        assert!(error.contains(&invalid_path.display().to_string()));
+        assert!(error.contains("relink or unregister it"));
     }
 
     #[test]
