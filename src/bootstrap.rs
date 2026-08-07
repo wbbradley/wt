@@ -316,6 +316,8 @@ fn clone_request(
         OsString::from("--bare"),
         OsString::from("--origin"),
         OsString::from("origin"),
+        OsString::from("--config"),
+        OsString::from("remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*"),
     ];
     if partial {
         arguments.push(OsString::from("--filter=blob:none"));
@@ -612,6 +614,9 @@ mod tests {
                 .any(|value| value == "--filter=blob:none")
         );
         for request in requests.iter() {
+            assert!(request.arguments.iter().any(|value| {
+                value == "remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*"
+            }));
             assert!(!format!("{:?}", request.arguments).contains("recognizable-secret"));
             assert!(!format!("{request:?}").contains("recognizable-secret"));
         }
