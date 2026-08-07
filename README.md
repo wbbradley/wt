@@ -62,12 +62,16 @@ Navigation keys:
 
 Direct action shortcuts:
 
-- `c`: create; `m`: move; `L`/`U`: lock/unlock; `d`: remove
+- `c`: advanced create; `n`: new tracked worktree; `m`: move; `L`/`U`: lock/unlock; `d`: remove
 - `R`: repair; `p`: prune; `a`: register; `e`: edit/relink; `x`: unregister
 
 Forms show the exact operation inputs before a separate confirmation. Disabled palette actions explain why they are unavailable.
 
 Authored pull requests appear once under their canonical base `owner/repository`. A grey `[no local repo]` marker means the base repository is not yet registered, and `[virtual]` means no ordinary local worktree represents that PR. Virtual rows are Enter-only: direct selectors and action-palette commands never create PR worktrees.
+
+Press `n` on a repository or one of its worktrees for the common new-worktree flow. The form pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk branch. The new local branch tracks that remote branch; after creation `wt` caches the worktree, exits, and changes the invoking shell into it.
+
+Local worktrees are nested by nearest commit ancestry. Local ancestry takes precedence over pull-request stack metadata, and each branch is rendered only once. Worktrees are always enumerated from each tracked repository's centralized `git worktree list --porcelain` data, including linked worktrees outside configured roots.
 
 ## Scriptable worktree operations
 

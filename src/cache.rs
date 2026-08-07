@@ -151,6 +151,24 @@ impl RemoteCache {
         self.active_pull_requests.dedup();
         self.updated_at_epoch_seconds = epoch_seconds();
     }
+
+    pub fn record_created_worktree(&mut self, worktree: &Path, branch: &str) {
+        let branch = format!("refs/heads/{branch}");
+        self.branches.retain(|cached| cached.worktree != worktree);
+        self.branches.push(CachedBranch {
+            worktree: worktree.to_owned(),
+            branch,
+            data: GitHubBranchData {
+                pull_request: None,
+                warnings: Vec::new(),
+                rate_limit: None,
+            },
+        });
+        self.branches.sort_by(|left, right| {
+            (&left.worktree, &left.branch).cmp(&(&right.worktree, &right.branch))
+        });
+        self.updated_at_epoch_seconds = epoch_seconds();
+    }
 }
 
 #[derive(Debug, Error)]

@@ -95,6 +95,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             VisibleRow::Worktree {
                 repository_index,
                 worktree_index,
+                stack_depth,
                 ..
             } => {
                 let worktree = &app.repositories[*repository_index].worktrees[*worktree_index];
@@ -137,7 +138,11 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let github_color = github_summary_color(app.github.get(&worktree.path));
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        if current { "  ● " } else { "    " },
+                        format!(
+                            "{}{}",
+                            " ".repeat(stack_depth * 2),
+                            if current { "  ● " } else { "    " }
+                        ),
                         Style::default().fg(Color::Green),
                     ),
                     Span::raw(identity),
@@ -555,8 +560,10 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
             active,
         } => {
             let mut lines = Vec::new();
-            if *action == crate::app::Action::Create
-                && let Some((repository, _)) = app.selected_repository()
+            if matches!(
+                action,
+                crate::app::Action::Create | crate::app::Action::NewWorktree
+            ) && let Some((repository, _)) = app.selected_repository()
             {
                 lines.push(Line::from(vec![
                     Span::styled(

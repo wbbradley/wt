@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,6 +109,67 @@ pub fn discover_catalog(runner: &dyn GitRunner, catalog: &Catalog) -> Vec<Reposi
             RepositoryDiscovery { repository, result }
         })
         .collect()
+}
+
+pub fn infer_worktree_parents(
+    runner: &dyn GitRunner,
+    repository: &RepositoryConfig,
+    worktrees: &[Worktree],
+) -> Result<HashMap<PathBuf, PathBuf>, GitError> {
+    let branches = worktrees
+        .iter()
+        .filter(|worktree| worktree.navigable() && worktree.branch.is_some())
+        .filter_map(|worktree| {
+            worktree
+                .head
+                .as_deref()
+                .map(|head| (worktree.path.clone(), head))
+        })
+        .collect::<Vec<_>>();
+    let mut parents = HashMap::new();
+    for (child_path, child_head) in &branches {
+        let mut candidates = Vec::new();
+        for (parent_path, parent_head) in &branches {
+            if parent_path == child_path || parent_head == child_head {
+                continue;
+            }
+            if !git_succeeds(
+                runner,
+                &repository.path,
+                &[
+                    OsString::from("merge-base"),
+                    OsString::from("--is-ancestor"),
+                    OsString::from(parent_head),
+                    OsString::from(child_head),
+                ],
+            )? {
+                continue;
+            }
+            let range = format!("{parent_head}..{child_head}");
+            let count = run_git(
+                runner,
+                &repository.path,
+                &[
+                    OsString::from("rev-list"),
+                    OsString::from("--count"),
+                    OsString::from(range),
+                ],
+            )?;
+            let Ok(distance) = String::from_utf8_lossy(&count).trim().parse::<u64>() else {
+                continue;
+            };
+            candidates.push((distance, parent_path.clone()));
+        }
+        candidates.sort();
+        if let Some((distance, parent)) = candidates.first()
+            && candidates
+                .get(1)
+                .is_none_or(|candidate| candidate.0 != *distance)
+        {
+            parents.insert(child_path.clone(), parent.clone());
+        }
+    }
+    Ok(parents)
 }
 
 pub fn canonical_common_dir(
@@ -417,6 +479,58 @@ mod tests {
         assert_eq!(main_identity, linked_identity);
         assert_eq!(main_identity.anchor, fs::canonicalize(main).unwrap());
         assert!(!main_identity.bare);
+    }
+
+    #[test]
+    fn infers_nearest_local_worktree_parent_from_commit_ancestry() {
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("main");
+        let parent = directory.path().join("parent");
+        let child = directory.path().join("child");
+        git(
+            directory.path(),
+            &["init", "-b", "main", main.to_str().unwrap()],
+        );
+        git(&main, &["config", "user.email", "test@example.com"]);
+        git(&main, &["config", "user.name", "Test User"]);
+        git(&main, &["commit", "--allow-empty", "-m", "initial"]);
+        git(
+            &main,
+            &["worktree", "add", "-b", "parent", parent.to_str().unwrap()],
+        );
+        git(&parent, &["commit", "--allow-empty", "-m", "parent"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "child",
+                child.to_str().unwrap(),
+                "parent",
+            ],
+        );
+        git(&child, &["commit", "--allow-empty", "-m", "child"]);
+        let config = RepositoryConfig {
+            path: fs::canonicalize(&main).unwrap(),
+            label: None,
+            worktree_root: None,
+            github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
+        };
+        let worktrees = discover_worktrees(&SystemGit, &config.path).unwrap();
+
+        let parents = infer_worktree_parents(&SystemGit, &config, &worktrees).unwrap();
+
+        assert_eq!(
+            parents[&fs::canonicalize(&parent).unwrap()],
+            fs::canonicalize(&main).unwrap()
+        );
+        assert_eq!(
+            parents[&fs::canonicalize(&child).unwrap()],
+            fs::canonicalize(&parent).unwrap()
+        );
     }
 
     #[test]

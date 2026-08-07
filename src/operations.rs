@@ -60,6 +60,10 @@ pub enum OperationError {
     BranchCheckedOut(String),
     #[error("commit-ish {0:?} does not resolve to a commit")]
     InvalidCommit(String),
+    #[error("repository has no configured Git remote")]
+    MissingRemote,
+    #[error("cannot resolve the remote trunk branch for {0:?}")]
+    MissingRemoteTrunk(String),
     #[error("cannot remove the bare repository anchor")]
     BareAnchor,
     #[error("cannot remove the main worktree")]
@@ -192,6 +196,103 @@ pub fn create(
         }
     }
     Ok(())
+}
+
+pub fn create_tracking(
+    runner: &dyn GitRunner,
+    repository: &RepositoryConfig,
+    destination: &Path,
+    branch: &str,
+    upstream: &str,
+) -> Result<(), OperationError> {
+    let mode = CreateMode::NewBranch {
+        branch: branch.to_owned(),
+        start_point: upstream.to_owned(),
+    };
+    validate_create(runner, repository, destination, &mode, false)?;
+    prepare_destination_parent(repository, destination, false)?;
+    git::run_git(
+        runner,
+        &repository.path,
+        &[
+            OsString::from("worktree"),
+            OsString::from("add"),
+            OsString::from("--track"),
+            OsString::from("-b"),
+            OsString::from(branch),
+            destination.as_os_str().to_owned(),
+            OsString::from(upstream),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn tracking_start(
+    runner: &dyn GitRunner,
+    repository: &RepositoryConfig,
+    requested_branch: &str,
+) -> Result<String, OperationError> {
+    let remotes = git_output_optional(runner, &repository.path, &["remote"])?
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let preferred = repository
+        .github_remote
+        .as_ref()
+        .or(repository.github_preferred_remote.as_ref())
+        .filter(|remote| remotes.contains(remote))
+        .cloned()
+        .or_else(|| remotes.iter().find(|remote| *remote == "origin").cloned())
+        .or_else(|| remotes.first().cloned())
+        .ok_or(OperationError::MissingRemote)?;
+    let requested = requested_branch.trim();
+    if !requested.is_empty() {
+        let requested = requested.strip_prefix("refs/remotes/").unwrap_or(requested);
+        let candidate = if remotes
+            .iter()
+            .any(|remote| requested.starts_with(&format!("{remote}/")))
+        {
+            requested.to_owned()
+        } else {
+            format!("{preferred}/{requested}")
+        };
+        validate_commit(runner, &repository.path, &candidate)?;
+        return Ok(candidate);
+    }
+
+    let symbolic = format!("refs/remotes/{preferred}/HEAD");
+    if let Some(head) = git_output_optional(
+        runner,
+        &repository.path,
+        &["symbolic-ref", "--quiet", "--short", &symbolic],
+    )? {
+        let head = head.trim();
+        if !head.is_empty() {
+            return Ok(head.to_owned());
+        }
+    }
+    for trunk in ["main", "master"] {
+        let candidate = format!("{preferred}/{trunk}");
+        if validate_commit(runner, &repository.path, &candidate).is_ok() {
+            return Ok(candidate);
+        }
+    }
+    Err(OperationError::MissingRemoteTrunk(preferred))
+}
+
+fn git_output_optional(
+    runner: &dyn GitRunner,
+    repository: &Path,
+    arguments: &[&str],
+) -> Result<Option<String>, OperationError> {
+    let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+    let output = runner.run(repository, &arguments)?;
+    Ok(output
+        .success
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
 pub fn validate_create(

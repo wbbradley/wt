@@ -182,6 +182,7 @@ pub enum VisibleRow {
     Worktree {
         repository_index: usize,
         worktree_index: usize,
+        stack_depth: usize,
         id: RowId,
     },
     VirtualRepository {
@@ -217,6 +218,7 @@ pub enum Pane {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     Create,
+    NewWorktree,
     Move,
     Lock,
     Unlock,
@@ -229,8 +231,9 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Create,
+        Self::NewWorktree,
         Self::Move,
         Self::Lock,
         Self::Unlock,
@@ -245,6 +248,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Self::Create => "create worktree",
+            Self::NewWorktree => "new tracked worktree",
             Self::Move => "move worktree",
             Self::Lock => "lock worktree",
             Self::Unlock => "unlock worktree",
@@ -260,6 +264,7 @@ impl Action {
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::Create => "c",
+            Self::NewWorktree => "n",
             Self::Move => "m",
             Self::Lock => "L",
             Self::Unlock => "U",
@@ -338,6 +343,7 @@ pub struct App {
     pub inline_error: Option<String>,
     pub progress: Option<String>,
     pub statuses: HashMap<PathBuf, StatusState>,
+    pub branch_parents: HashMap<PathBuf, PathBuf>,
     pub github: HashMap<PathBuf, GitHubState>,
     pub github_generation: u64,
     pub github_loading: bool,
@@ -368,6 +374,7 @@ impl App {
             inline_error: None,
             progress: None,
             statuses: HashMap::new(),
+            branch_parents: HashMap::new(),
             github: HashMap::new(),
             github_generation: 0,
             github_loading: false,
@@ -437,11 +444,42 @@ impl App {
                 id: repository.id(),
             });
             if repository.expanded || !filter.is_empty() {
-                for worktree_index in matching_worktrees {
+                let mut included_worktrees: BTreeSet<usize> =
+                    matching_worktrees.into_iter().collect();
+                if !repository_matches {
+                    let indexes = repository
+                        .worktrees
+                        .iter()
+                        .enumerate()
+                        .map(|(index, worktree)| (worktree.path.clone(), index))
+                        .collect::<HashMap<_, _>>();
+                    for mut index in included_worktrees.clone() {
+                        let mut visited = BTreeSet::new();
+                        while let Some(parent) = self
+                            .branch_parents
+                            .get(&repository.worktrees[index].path)
+                            .and_then(|path| indexes.get(path))
+                            .copied()
+                        {
+                            if !visited.insert(parent) {
+                                break;
+                            }
+                            included_worktrees.insert(parent);
+                            index = parent;
+                        }
+                    }
+                }
+                for tree_row in nested_worktrees(
+                    &repository.worktrees,
+                    &self.branch_parents,
+                    &included_worktrees,
+                ) {
+                    let worktree_index = tree_row.index;
                     let worktree = &repository.worktrees[worktree_index];
                     rows.push(VisibleRow::Worktree {
                         repository_index,
                         worktree_index,
+                        stack_depth: tree_row.depth,
                         id: RowId::Worktree(worktree.path.clone()),
                     });
                 }
@@ -901,7 +939,7 @@ impl App {
                     enabled()
                 }
             }
-            Action::Create | Action::Prune => enabled(),
+            Action::Create | Action::NewWorktree | Action::Prune => enabled(),
             Action::Move | Action::Lock | Action::Unlock | Action::Remove | Action::Repair => {
                 let Some((_, worktree, worktree_index)) = self.selected_worktree() else {
                     return disabled("select a linked worktree");
@@ -1155,6 +1193,7 @@ impl App {
     fn direct_action(&mut self, character: char) -> Intent {
         let action = match character {
             'c' => Action::Create,
+            'n' => Action::NewWorktree,
             'm' => Action::Move,
             'L' => Action::Lock,
             'U' => Action::Unlock,
@@ -1380,6 +1419,80 @@ fn virtual_repository_matches(repository: &VirtualRepositoryView, filter: &str) 
             .host
             .to_ascii_lowercase()
             .contains(filter)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NestedWorktree {
+    index: usize,
+    depth: usize,
+}
+
+fn nested_worktrees(
+    worktrees: &[Worktree],
+    branch_parents: &HashMap<PathBuf, PathBuf>,
+    included: &BTreeSet<usize>,
+) -> Vec<NestedWorktree> {
+    let indexes = worktrees
+        .iter()
+        .enumerate()
+        .map(|(index, worktree)| (worktree.path.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut parents = vec![None; worktrees.len()];
+    for index in included {
+        parents[*index] = branch_parents
+            .get(&worktrees[*index].path)
+            .and_then(|path| indexes.get(path))
+            .copied()
+            .filter(|parent| included.contains(parent) && parent != index);
+    }
+    let mut cyclic = BTreeSet::new();
+    for start in included {
+        let mut path = Vec::new();
+        let mut current = Some(*start);
+        while let Some(index) = current {
+            if let Some(cycle_start) = path.iter().position(|candidate| *candidate == index) {
+                cyclic.extend(path[cycle_start..].iter().copied());
+                break;
+            }
+            path.push(index);
+            current = parents[index];
+        }
+    }
+    for index in cyclic {
+        parents[index] = None;
+    }
+    let mut children = vec![Vec::new(); worktrees.len()];
+    for index in included {
+        if let Some(parent) = parents[*index] {
+            children[parent].push(*index);
+        }
+    }
+    let mut result = Vec::with_capacity(included.len());
+    let mut visited = vec![false; worktrees.len()];
+    for root in included
+        .iter()
+        .copied()
+        .filter(|index| parents[*index].is_none())
+    {
+        append_worktree_subtree(root, 0, &children, &mut visited, &mut result);
+    }
+    result
+}
+
+fn append_worktree_subtree(
+    index: usize,
+    depth: usize,
+    children: &[Vec<usize>],
+    visited: &mut [bool],
+    result: &mut Vec<NestedWorktree>,
+) {
+    if std::mem::replace(&mut visited[index], true) {
+        return;
+    }
+    result.push(NestedWorktree { index, depth });
+    for child in &children[index] {
+        append_worktree_subtree(*child, depth + 1, children, visited, result);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1751,6 +1864,34 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(filtered, vec![(10, 0), (11, 1), (12, 2)]);
+    }
+
+    #[test]
+    fn local_branch_ancestry_nests_each_worktree_once() {
+        let mut repository = repository("/repo", true);
+        repository
+            .worktrees
+            .push(worktree("/repo-child", "child", false));
+        let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        app.branch_parents
+            .insert(PathBuf::from("/repo-topic"), PathBuf::from("/repo"));
+        app.branch_parents
+            .insert(PathBuf::from("/repo-child"), PathBuf::from("/repo-topic"));
+
+        let nested = app
+            .visible_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                VisibleRow::Worktree {
+                    worktree_index,
+                    stack_depth,
+                    ..
+                } => Some((worktree_index, stack_depth)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(nested, vec![(0, 0), (1, 1), (2, 2)]);
     }
 
     #[test]
