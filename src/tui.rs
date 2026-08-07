@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -77,6 +78,12 @@ enum PendingAction {
         mode: CreateMode,
         create_parents: bool,
     },
+    NewWorktree {
+        repository: PathBuf,
+        destination: PathBuf,
+        branch: String,
+        upstream: String,
+    },
     Move {
         repository: PathBuf,
         worktree: PathBuf,
@@ -123,6 +130,7 @@ impl PendingAction {
     fn action(&self) -> Action {
         match self {
             Self::Create { .. } => Action::Create,
+            Self::NewWorktree { .. } => Action::NewWorktree,
             Self::Move { .. } => Action::Move,
             Self::Lock { .. } => Action::Lock,
             Self::Unlock { .. } => Action::Unlock,
@@ -149,6 +157,7 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
     app.filter = initial_filter.to_owned();
     app.filter_active = !initial_filter.is_empty();
     let mut controller = Controller::new(catalog_path, catalog, app);
+    controller.refresh_branch_parents();
     controller.load_remote_cache();
     let _panic_hook = PanicHookGuard::install();
     let mut terminal = InteractiveTerminal::open()?;
@@ -247,6 +256,7 @@ struct Controller {
     materialization_job: Option<BackgroundJob<MaterializationOutcome>>,
     materialization_progress: Option<String>,
     completed_materialization: Option<PathBuf>,
+    completed_creation: Option<PathBuf>,
 }
 
 impl Controller {
@@ -276,6 +286,7 @@ impl Controller {
             materialization_job: None,
             materialization_progress: None,
             completed_materialization: None,
+            completed_creation: None,
         }
     }
 
@@ -415,6 +426,10 @@ impl Controller {
                 }
                 self.execute(pending)?;
                 self.app.progress = None;
+                if let Some(path) = self.completed_creation.take() {
+                    let absolute = std::fs::canonicalize(&path).unwrap_or(path);
+                    return Ok(ControlFlow::Exit(Some(absolute)));
+                }
                 self.refresh_local()?;
                 Ok(ControlFlow::Continue)
             }
@@ -442,6 +457,22 @@ impl Controller {
                     field("create missing parents (yes/no)", "no"),
                 ],
             ),
+            Action::NewWorktree => {
+                let username = self.github_username(&repository.config).ok_or_else(|| {
+                    TuiError::InvalidForm {
+                        field: "GitHub username",
+                        message: "unable to determine it; set GH_USERNAME or authenticate gh"
+                            .to_owned(),
+                    }
+                })?;
+                self.app.open_form(
+                    action,
+                    vec![
+                        field("new branch", &format!("{username}/")),
+                        field("starting branch (blank = remote trunk)", ""),
+                    ],
+                );
+            }
             Action::Move => {
                 self.require_selected_worktree()?;
                 self.app.open_form(
@@ -611,6 +642,33 @@ impl Controller {
                     ],
                 );
             }
+            Action::NewWorktree => {
+                require_len(&values, 2, "new tracked worktree")?;
+                let branch = nonempty(&values[0], "new branch")?.to_owned();
+                let upstream =
+                    operations::tracking_start(&SystemGit, &repository, values[1].trim())?;
+                let mode = CreateMode::NewBranch {
+                    branch: branch.clone(),
+                    start_point: upstream.clone(),
+                };
+                let destination = operations::suggested_destination(&repository, &mode);
+                operations::validate_create(&SystemGit, &repository, &destination, &mode, false)?;
+                let pending = PendingAction::NewWorktree {
+                    repository: repository.path.clone(),
+                    destination: destination.clone(),
+                    branch: branch.clone(),
+                    upstream: upstream.clone(),
+                };
+                self.confirm(
+                    pending,
+                    vec![
+                        format!("repository: {}", repository.display_label()),
+                        format!("branch: {branch}"),
+                        format!("start and upstream: {upstream}"),
+                        format!("destination: {}", destination.display()),
+                    ],
+                );
+            }
             Action::Move => {
                 require_len(&values, 2, "move")?;
                 let (_, worktree, _) = self.require_selected_worktree()?;
@@ -728,6 +786,26 @@ impl Controller {
             } => {
                 let repository = self.repository(&repository)?.clone();
                 operations::create(&SystemGit, &repository, &destination, &mode, create_parents)?;
+            }
+            PendingAction::NewWorktree {
+                repository,
+                destination,
+                branch,
+                upstream,
+            } => {
+                let repository = self.repository(&repository)?.clone();
+                operations::create_tracking(
+                    &SystemGit,
+                    &repository,
+                    &destination,
+                    &branch,
+                    &upstream,
+                )?;
+                let destination = std::fs::canonicalize(&destination).unwrap_or(destination);
+                let _ = cache::update(&self.remote_cache_path, |cache| {
+                    cache.record_created_worktree(&destination, &branch);
+                });
+                self.completed_creation = Some(destination);
             }
             PendingAction::Move {
                 repository,
@@ -854,6 +932,43 @@ impl Controller {
             .ok_or(TuiError::RepositoryGone)
     }
 
+    fn github_username(&self, repository: &RepositoryConfig) -> Option<String> {
+        let host = repository
+            .github_remote
+            .as_ref()
+            .or(repository.github_preferred_remote.as_ref())
+            .and_then(|remote| repository.github_remotes.get(remote))
+            .map(|identity| identity.host.as_str())
+            .unwrap_or("github.com");
+        if let Some(username) = self
+            .app
+            .authored_pull_requests
+            .visible()
+            .into_iter()
+            .filter(|pull_request| pull_request.identity.repository.host == host)
+            .map(|pull_request| pull_request.author)
+            .find(|author| !author.trim().is_empty())
+        {
+            return Some(username);
+        }
+        if let Ok(username) = env::var("GH_USERNAME")
+            && !username.trim().is_empty()
+        {
+            return Some(username.trim().to_owned());
+        }
+        let mut command = Command::new("gh");
+        command.args(["api", "user", "--hostname", host, "--jq", ".login"]);
+        if repository.path.is_dir() {
+            command.current_dir(&repository.path);
+        }
+        let output = command.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let username = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!username.is_empty()).then_some(username)
+    }
+
     fn require_selected_worktree(&self) -> Result<(&RepositoryView, &Worktree, usize), TuiError> {
         self.app.selected_worktree().ok_or(TuiError::WorktreeGone)
     }
@@ -870,7 +985,22 @@ impl Controller {
         self.github_refresh_interval = github_refresh_interval(&self.catalog);
         let repositories = load_repository_views(&self.catalog, &self.app.current_directory);
         self.app.replace_repositories(repositories);
+        self.refresh_branch_parents();
         Ok(())
+    }
+
+    fn refresh_branch_parents(&mut self) {
+        self.app.branch_parents = self
+            .app
+            .repositories
+            .iter()
+            .filter(|repository| repository.stale_error.is_none())
+            .filter_map(|repository| {
+                git::infer_worktree_parents(&SystemGit, &repository.config, &repository.worktrees)
+                    .ok()
+            })
+            .flat_map(|parents| parents.into_iter())
+            .collect();
     }
 
     fn start_status_refresh(&mut self) {
@@ -1991,6 +2121,90 @@ mod tests {
     }
 
     #[test]
+    fn new_worktree_dialog_tracks_remote_trunk_caches_and_exits() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project");
+        run_git_command(
+            directory.path(),
+            &["init", "-b", "main", repository.to_str().unwrap()],
+        );
+        run_git_command(&repository, &["config", "user.email", "test@example.com"]);
+        run_git_command(&repository, &["config", "user.name", "Test User"]);
+        run_git_command(&repository, &["commit", "--allow-empty", "-m", "initial"]);
+        run_git_command(
+            &repository,
+            &["remote", "add", "origin", repository.to_str().unwrap()],
+        );
+        run_git_command(
+            &repository,
+            &["update-ref", "refs/remotes/origin/main", "refs/heads/main"],
+        );
+        let identity = git::resolve_repository(&SystemGit, &repository).unwrap();
+        let repository_config = RepositoryConfig {
+            path: identity.anchor,
+            label: Some("project".to_owned()),
+            worktree_root: None,
+            github_remote: Some("origin".to_owned()),
+            github_remotes: Default::default(),
+            github_preferred_remote: Some("origin".to_owned()),
+        };
+        let catalog = Catalog {
+            repositories: vec![repository_config],
+            ..Catalog::default()
+        };
+        let catalog_path = directory.path().join("config/wt.json");
+        config::save(&catalog_path, &catalog).unwrap();
+        let views = load_repository_views(&catalog, &repository);
+        let app = App::new(views, repository.clone());
+        let mut controller = Controller::new(catalog_path, catalog, app);
+        controller
+            .app
+            .authored_pull_requests
+            .hydrate(vec![test_authored_pull_request("viewer")]);
+
+        let begin = controller.app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(begin, Intent::BeginAction(Action::NewWorktree));
+        controller.handle_intent(begin).unwrap();
+        assert!(matches!(
+            &controller.app.modal,
+            Some(Modal::Form { action: Action::NewWorktree, fields, .. })
+                if fields[0].value == "viewer/" && fields[1].value.is_empty()
+        ));
+
+        controller
+            .handle_intent(Intent::SubmitForm {
+                action: Action::NewWorktree,
+                values: vec!["viewer/topic".to_owned(), String::new()],
+            })
+            .unwrap();
+        let result = controller
+            .handle_intent(Intent::ConfirmAction(Action::NewWorktree))
+            .unwrap();
+        let destination = match result {
+            ControlFlow::Exit(Some(path)) => path,
+            _ => panic!("new worktree should exit with its destination"),
+        };
+        let upstream = git::run_git(
+            &SystemGit,
+            &destination,
+            &[
+                std::ffi::OsString::from("rev-parse"),
+                std::ffi::OsString::from("--abbrev-ref"),
+                std::ffi::OsString::from("@{upstream}"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&upstream).trim(), "origin/main");
+        let cached = cache::load(&controller.remote_cache_path).unwrap();
+        assert!(cached.branches.iter().any(|cached| {
+            cached.worktree == destination && cached.branch == "refs/heads/viewer/topic"
+        }));
+    }
+
+    #[test]
     fn stale_repository_edit_form_relinks_the_catalog_entry() {
         let directory = tempfile::tempdir().unwrap();
         let relocated = directory.path().join("relocated");
@@ -2040,5 +2254,39 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {arguments:?} failed");
+    }
+
+    fn test_authored_pull_request(author: &str) -> crate::model::AuthoredPullRequest {
+        use crate::model::{
+            AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, GitHubRepositoryIdentity,
+            PullRequest, PullRequestIdentity, PullRequestState,
+        };
+        AuthoredPullRequest {
+            identity: CanonicalPullRequestId {
+                repository: GitHubRepositoryIdentity::canonical("github.com", "team", "project"),
+                number: 1,
+            },
+            author: author.to_owned(),
+            pull_request: PullRequest {
+                number: 1,
+                title: "change".to_owned(),
+                url: "https://github.com/team/project/pull/1".to_owned(),
+                state: PullRequestState::Open,
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                review_decision: None,
+                auto_merge: false,
+                base: PullRequestIdentity {
+                    repository: Some("team/project".to_owned()),
+                    branch: "main".to_owned(),
+                    oid: None,
+                },
+                head: PullRequestIdentity {
+                    repository: Some(format!("{author}/project")),
+                    branch: format!("{author}/topic"),
+                    oid: None,
+                },
+                checks: CheckRollup::Success,
+            },
+        }
     }
 }
