@@ -51,6 +51,12 @@ pub struct BootstrapResult {
     pub created: bool,
 }
 
+pub struct BootstrapOptions<'a> {
+    pub base_branch: &'a str,
+    pub https_token: Option<&'a ResolvedToken>,
+    pub mapped_repository_index: Option<usize>,
+}
+
 #[derive(Debug, Error)]
 pub enum BootstrapError {
     #[error("all repository bootstrap paths are occupied by unrelated files")]
@@ -78,10 +84,9 @@ pub fn bootstrap_repository(
     catalog: &mut Catalog,
     repository_root: &Path,
     identity: &GitHubRepositoryIdentity,
-    https_token: Option<&ResolvedToken>,
-    mapped_repository_index: Option<usize>,
+    options: BootstrapOptions<'_>,
 ) -> Result<BootstrapResult, BootstrapError> {
-    if let Some(index) = mapped_repository_index
+    if let Some(index) = options.mapped_repository_index
         && let Some(repository) = catalog.repositories.get(index)
         && repository_matches(git_runner, &repository.path, identity)
     {
@@ -118,7 +123,8 @@ pub fn bootstrap_repository(
             repository_root,
             &target,
             identity,
-            https_token,
+            options.base_branch,
+            options.https_token,
         )?;
     }
     if !repository_matches(git_runner, &target, identity) {
@@ -232,6 +238,7 @@ fn clone_repository(
     repository_root: &Path,
     target: &Path,
     identity: &GitHubRepositoryIdentity,
+    base_branch: &str,
     https_token: Option<&ResolvedToken>,
 ) -> Result<(), BootstrapError> {
     let staging = tempfile::Builder::new()
@@ -246,7 +253,7 @@ fn clone_repository(
         "git@{}:{}/{}.git",
         identity.host, identity.owner, identity.repository
     );
-    let ssh_partial = clone_request(&ssh_url, &clone_path, true, None);
+    let ssh_partial = clone_request(&ssh_url, &clone_path, base_branch, true, None);
     let ssh_output = run_clone(clone_runner, &ssh_partial, https_token)?;
     let mut success = ssh_output.success;
     let mut last_error = ssh_output.stderr;
@@ -254,7 +261,7 @@ fn clone_repository(
         clean_clone_path(&clone_path, staging.path())?;
         let output = run_clone(
             clone_runner,
-            &clone_request(&ssh_url, &clone_path, false, None),
+            &clone_request(&ssh_url, &clone_path, base_branch, false, None),
             https_token,
         )?;
         success = output.success;
@@ -270,7 +277,7 @@ fn clone_repository(
         );
         let output = run_clone(
             clone_runner,
-            &clone_request(&https_url, &clone_path, true, Some(token)),
+            &clone_request(&https_url, &clone_path, base_branch, true, Some(token)),
             https_token,
         )?;
         success = output.success;
@@ -279,7 +286,7 @@ fn clone_repository(
             clean_clone_path(&clone_path, staging.path())?;
             let output = run_clone(
                 clone_runner,
-                &clone_request(&https_url, &clone_path, false, Some(token)),
+                &clone_request(&https_url, &clone_path, base_branch, false, Some(token)),
                 https_token,
             )?;
             success = output.success;
@@ -308,6 +315,7 @@ fn clone_repository(
 fn clone_request(
     url: &str,
     destination: &Path,
+    base_branch: &str,
     partial: bool,
     token: Option<&ResolvedToken>,
 ) -> CloneRequest {
@@ -316,6 +324,9 @@ fn clone_request(
         OsString::from("--bare"),
         OsString::from("--origin"),
         OsString::from("origin"),
+        OsString::from("--single-branch"),
+        OsString::from("--branch"),
+        OsString::from(base_branch),
         OsString::from("--config"),
         OsString::from("remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*"),
     ];
@@ -541,8 +552,11 @@ mod tests {
             &mut Catalog::default(),
             directory.path(),
             &identity(),
-            None,
-            None,
+            BootstrapOptions {
+                base_branch: "main",
+                https_token: None,
+                mapped_repository_index: None,
+            },
         );
         assert!(matches!(result, Err(BootstrapError::CandidateCollision)));
         for candidate in repository_candidates(directory.path(), &identity()) {
@@ -565,8 +579,11 @@ mod tests {
             &mut Catalog::default(),
             directory.path(),
             &identity(),
-            None,
-            None,
+            BootstrapOptions {
+                base_branch: "main",
+                https_token: None,
+                mapped_repository_index: None,
+            },
         )
         .unwrap();
         assert!(result.repository.path.ends_with("team-project.git"));
@@ -588,8 +605,11 @@ mod tests {
             &mut Catalog::default(),
             directory.path(),
             &identity(),
-            Some(&token),
-            None,
+            BootstrapOptions {
+                base_branch: "main",
+                https_token: Some(&token),
+                mapped_repository_index: None,
+            },
         )
         .unwrap();
         assert!(result.created);
@@ -614,6 +634,18 @@ mod tests {
                 .any(|value| value == "--filter=blob:none")
         );
         for request in requests.iter() {
+            assert!(
+                request
+                    .arguments
+                    .iter()
+                    .any(|value| value == "--single-branch")
+            );
+            assert!(
+                request
+                    .arguments
+                    .windows(2)
+                    .any(|values| values[0] == "--branch" && values[1] == "main")
+            );
             assert!(request.arguments.iter().any(|value| {
                 value == "remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*"
             }));
@@ -651,8 +683,11 @@ mod tests {
             &mut Catalog::default(),
             directory.path(),
             &identity(),
-            Some(&token),
-            None,
+            BootstrapOptions {
+                base_branch: "main",
+                https_token: Some(&token),
+                mapped_repository_index: None,
+            },
         );
         let message = result.unwrap_err().to_string();
         assert!(!message.contains("recognizable-secret"));
@@ -693,8 +728,11 @@ mod tests {
             &mut catalog,
             directory.path(),
             &identity(),
-            None,
-            None,
+            BootstrapOptions {
+                base_branch: "main",
+                https_token: None,
+                mapped_repository_index: None,
+            },
         )
         .unwrap();
         assert_eq!(result.repository_index, 0);
@@ -759,8 +797,11 @@ mod tests {
             &mut catalog,
             directory.path(),
             &identity(),
-            None,
-            None,
+            BootstrapOptions {
+                base_branch: "main",
+                https_token: None,
+                mapped_repository_index: None,
+            },
         )
         .unwrap();
         assert!(!result.created);
