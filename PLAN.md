@@ -1,42 +1,5 @@
 # Next Up
 
-## Copy scoped agent prompts
-
-Provide fast clipboard prompts for addressing check failures and review feedback at item, section, PR-stack, and repository scopes.
-
-Requires Add selectable PR details.
-
-Affected areas: `src/app.rs`, `src/tui.rs`, a small clipboard/prompt module if useful, `Cargo.toml`, README, and tests.
-
-- Add `C` as the agent-prompt shortcut and expose it in the action palette, leaving the existing lowercase `c` create shortcut unchanged.
-- Scope prompts as follows:
-  - selected check: that check;
-  - selected feedback item: that comment or review summary;
-  - Checks or Feedback section: actionable items of that class on the PR;
-  - PR summary/worktree/virtual PR: that PR and its GitHub-stacked descendants;
-  - repository: every non-backburnered actionable PR represented for that repository.
-- Aggregate unresolved feedback plus failed/error checks. Include optional failed checks while labeling that they are not merge-required.
-- Group output by branch and PR with title, URL, stable comment/review IDs, concise body excerpts, paths, and check URLs.
-- Use stored GitHub IDs in investigation commands and instructions.
-- Report “nothing to address here” without modifying the clipboard for empty scopes.
-- Surface clipboard errors in the footer without crashing.
-- Keep prompt gathering independent of collapsed UI state.
-
-Complete when:
-
-- Copying a single item excludes unrelated items.
-- PR, stack, and repository prompts include all and only their actionable descendants in deterministic order.
-- Prompts remain useful when a check/comment URL or database ID is absent.
-- Clipboard access is isolated behind an injectable interface for tests.
-
-Verification:
-
-- Add exact prompt-format tests for comments, review summaries, checks, mixed stacks, forks/hosts, missing IDs/URLs, optional failures, and empty scopes.
-- Add scope tests proving collapse state does not change prompt contents.
-- Add success/failure clipboard tests using a fake clipboard.
-- Update the README key guide and prompt examples.
-- Run the formatting, clippy, and full test gates.
-
 ## Persist Backburner and attention navigation
 
 Allow users to quiet a PR stack without hiding local worktrees, using canonical host-aware identities.

@@ -667,3 +667,86 @@ Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" sectio
 2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
 
 If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
+
+
+## Copy scoped agent prompts
+
+Added `C` and a palette action that copy deterministic agent-ready prompts scoped to a selected check, feedback item, detail section, PR stack, or repository. Canonical scope collection ignores collapsed UI state, deduplicates local and virtual PR representations, includes failed/error required and optional checks plus unresolved feedback, and preserves host-aware IDs, paths, URLs, excerpts, and investigation commands. Added a pure formatter, injectable platform clipboard boundary, empty/error footer handling, README examples, and exact formatter/scope/controller tests.
+
+## Copy scoped agent prompts
+
+Provide fast clipboard prompts for addressing check failures and review feedback at item, section, PR-stack, and repository scopes.
+
+Requires Add selectable PR details.
+
+Affected areas: `src/app.rs`, `src/tui.rs`, a small clipboard/prompt module if useful, `Cargo.toml`, README, and tests.
+
+- Add `C` as the agent-prompt shortcut and expose it in the action palette, leaving the existing lowercase `c` create shortcut unchanged.
+- Scope prompts as follows:
+  - selected check: that check;
+  - selected feedback item: that comment or review summary;
+  - Checks or Feedback section: actionable items of that class on the PR;
+  - PR summary/worktree/virtual PR: that PR and its GitHub-stacked descendants;
+  - repository: every non-backburnered actionable PR represented for that repository.
+- Aggregate unresolved feedback plus failed/error checks. Include optional failed checks while labeling that they are not merge-required.
+- Group output by branch and PR with title, URL, stable comment/review IDs, concise body excerpts, paths, and check URLs.
+- Use stored GitHub IDs in investigation commands and instructions.
+- Report “nothing to address here” without modifying the clipboard for empty scopes.
+- Surface clipboard errors in the footer without crashing.
+- Keep prompt gathering independent of collapsed UI state.
+
+Complete when:
+
+- Copying a single item excludes unrelated items.
+- PR, stack, and repository prompts include all and only their actionable descendants in deterministic order.
+- Prompts remain useful when a check/comment URL or database ID is absent.
+- Clipboard access is isolated behind an injectable interface for tests.
+
+Verification:
+
+- Add exact prompt-format tests for comments, review summaries, checks, mixed stacks, forks/hosts, missing IDs/URLs, optional failures, and empty scopes.
+- Add scope tests proving collapse state does not change prompt contents.
+- Add success/failure clipboard tests using a fake clipboard.
+- Update the README key guide and prompt examples.
+- Run the formatting, clippy, and full test gates.
+
+### Implementation plan
+
+- Add a pure `src/prompt.rs` projection/formatter for actionable failed or errored checks and unresolved feedback, preserving stable GitHub identities, useful missing-data fallbacks, concise excerpts, and deterministic PR/item ordering.
+- Extend `src/app.rs` with a Copy Agent Prompt action and `C` shortcut, selection-aware scopes for detail items/sections, PR stacks, and repositories, and scope collection from canonical app state rather than visible or collapsed rows.
+- Extend `src/tui.rs` with an injectable clipboard interface, production platform clipboard commands, success/empty/error footer behavior, and controller tests that never access the real clipboard.
+- Add exact formatter and app scope tests covering checks, comments, review summaries, mixed stacks, hosts/forks, missing IDs/URLs, optional failures, empty scopes, and collapse independence.
+- Update `README.md` with the shortcut, scope behavior, and a prompt example; then run formatting, strict clippy, and the full test suite.
+
+Risks: local PRs and authored virtual PRs can describe the same canonical identity, so scope collection must deduplicate by canonical ID while retaining the richest PR metadata. Stack descendants must be derived from base/head relationships in the canonical repository model, not from collapsed visible rows. Clipboard commands vary by platform and must receive prompt content through stdin without shell interpolation.
+
+## Post-Plan Execution Steps
+
+Execute these steps in order:
+
+### Implement
+Execute the plan above.
+
+**Naming gate:** before creating any file, identifier, run-id, or env var, ask "would this name
+make sense to someone who never read the plan?" If it encodes a sequence position (`Stage N` /
+`Phase N` / `stepN`), rename it now — cheap before a checkpoint or downstream reference pins it.
+
+### Verify
+
+1. Run the project's build/lint command. Fix all warnings.
+2. Run the project's test suite.
+3. If tests fail, fix them before proceeding.
+4. If test coverage for the new work is insufficient, add tests.
+
+### Commit
+
+Use Conventional Commits commit message style. If there are pre-existing modified files and they don't look harmful, go ahead and commit them, too.
+
+### Update PLAN.md
+
+Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" section — do not leave it in place with a [DONE] tag, strikethrough, or any other marker. The task and its related subsections should no longer appear in PLAN.md at all. PLAN.md should not have any sort of "Done" section. Then append a new entry to `COMPLETED.md` with two parts, in this order:
+
+1. A brief summary, written now, of what was actually implemented.
+2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
+
+If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.
