@@ -139,13 +139,17 @@ pub fn materialize_pull_request(
     let real_fetch = real_remote.map(|remote| {
         let branch = authored.pull_request.head.branch.clone();
         let target = format!("refs/remotes/{remote}/{branch}");
-        let result = fetch_ref(
-            fetch_runner,
-            &repository.path,
-            &remote,
-            &format!("+refs/heads/{branch}:{target}"),
-            https_token,
-        );
+        let result = ensure_remote_tracking_configuration(runner, &repository.path, &remote)
+            .map_err(MaterializeError::from)
+            .and_then(|()| {
+                fetch_ref(
+                    fetch_runner,
+                    &repository.path,
+                    &remote,
+                    &format!("+refs/heads/{branch}:{target}"),
+                    https_token,
+                )
+            });
         (
             result,
             branch,
@@ -374,6 +378,37 @@ fn fetch_ref(
             token.map(ResolvedToken::expose),
         )))
     }
+}
+
+fn ensure_remote_tracking_configuration(
+    runner: &dyn GitRunner,
+    repository: &Path,
+    remote: &str,
+) -> Result<(), git::GitError> {
+    let key = format!("remote.{remote}.fetch");
+    let existing = runner.run(
+        repository,
+        &[
+            OsString::from("config"),
+            OsString::from("--get-all"),
+            OsString::from(&key),
+        ],
+    )?;
+    if existing.success && !existing.stdout.is_empty() {
+        return Ok(());
+    }
+    git::run_git(
+        runner,
+        repository,
+        &[
+            OsString::from("config"),
+            OsString::from("--local"),
+            OsString::from("--add"),
+            OsString::from(key),
+            OsString::from(format!("+refs/heads/*:refs/remotes/{remote}/*")),
+        ],
+    )?;
+    Ok(())
 }
 
 fn git_transport_environment(token: Option<&ResolvedToken>) -> Vec<(OsString, OsString)> {
@@ -655,6 +690,20 @@ mod tests {
     fn real_head_remote_tracks_branch_marks_it_and_reuses_worktree() {
         let fixture = Fixture::new();
         let repository = fixture.local_repository(true);
+        git(
+            &repository.path,
+            &["config", "--unset-all", "remote.fork.fetch"],
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repository.path)
+                .args(["config", "--get-all", "remote.fork.fetch"])
+                .status()
+                .unwrap()
+                .code()
+                .is_some_and(|code| code != 0)
+        );
         let authored = fixture.authored(42, "feature/topic", "contributor/project");
 
         let materialized = materialize_pull_request(
@@ -677,6 +726,13 @@ mod tests {
                 &["rev-parse", "--abbrev-ref", "@{upstream}"]
             ),
             "fork/feature/topic"
+        );
+        assert_eq!(
+            git_stdout(
+                &repository.path,
+                &["config", "--get-all", "remote.fork.fetch"]
+            ),
+            "+refs/heads/*:refs/remotes/fork/*"
         );
         assert_eq!(
             marker(&repository.path, "feature/topic"),
