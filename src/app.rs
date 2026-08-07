@@ -17,6 +17,7 @@ pub enum RowId {
     Repository(PathBuf),
     Worktree(PathBuf),
     VirtualRepository(GitHubRepositoryIdentity),
+    Backburner(GitHubRepositoryIdentity),
     VirtualPullRequest(CanonicalPullRequestId),
 }
 
@@ -199,6 +200,10 @@ pub enum VisibleRow {
         stack_depth: usize,
         id: RowId,
     },
+    Backburner {
+        virtual_repository_index: usize,
+        id: RowId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Hash, Ord, PartialEq, PartialOrd, Eq)]
@@ -232,6 +237,7 @@ impl VisibleRow {
             Self::Repository { id, .. }
             | Self::Worktree { id, .. }
             | Self::VirtualRepository { id, .. }
+            | Self::Backburner { id, .. }
             | Self::VirtualPullRequest { id, .. } => id,
         }
     }
@@ -351,6 +357,7 @@ pub enum Intent {
     ConfirmAction(Action),
     MaterializePullRequest(CanonicalPullRequestId),
     OpenUrl(String),
+    PersistBackburner,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,6 +395,8 @@ pub struct App {
     pub active_pull_requests: HashSet<CanonicalPullRequestId>,
     pub pull_request_details: BTreeMap<CanonicalPullRequestId, PullRequestDetails>,
     pub pull_request_detail_errors: BTreeMap<CanonicalPullRequestId, String>,
+    pub backburner: BTreeSet<CanonicalPullRequestId>,
+    pub backburner_expanded: BTreeSet<GitHubRepositoryIdentity>,
     pub authored_mappings: Vec<PullRequestMapping>,
     pub current_directory: PathBuf,
     pub generation: u64,
@@ -424,6 +433,8 @@ impl App {
             active_pull_requests: HashSet::new(),
             pull_request_details: BTreeMap::new(),
             pull_request_detail_errors: BTreeMap::new(),
+            backburner: BTreeSet::new(),
+            backburner_expanded: BTreeSet::new(),
             authored_mappings: Vec::new(),
             current_directory,
             generation: 0,
@@ -587,7 +598,24 @@ impl App {
                     }
                 }
             }
-            if included_pull_requests.is_empty() {
+            let normal_pull_requests: BTreeSet<_> = included_pull_requests
+                .iter()
+                .copied()
+                .filter(|index| {
+                    !self
+                        .backburner
+                        .contains(&repository.pull_requests[*index].identity)
+                })
+                .collect();
+            let backburner_pull_requests: BTreeSet<_> = included_pull_requests
+                .iter()
+                .copied()
+                .filter(|index| {
+                    self.backburner
+                        .contains(&repository.pull_requests[*index].identity)
+                })
+                .collect();
+            if normal_pull_requests.is_empty() && backburner_pull_requests.is_empty() {
                 continue;
             }
             if show_repository_header {
@@ -599,7 +627,7 @@ impl App {
             if !show_repository_header || repository.expanded || !filter.is_empty() {
                 for tree_row in pull_request_tree
                     .iter()
-                    .filter(|row| included_pull_requests.contains(&row.index))
+                    .filter(|row| normal_pull_requests.contains(&row.index))
                 {
                     let pull_request = &repository.pull_requests[tree_row.index];
                     rows.push(VisibleRow::VirtualPullRequest {
@@ -609,6 +637,28 @@ impl App {
                         stack_depth: tree_row.depth,
                         id: RowId::VirtualPullRequest(pull_request.identity.clone()),
                     });
+                }
+                if !backburner_pull_requests.is_empty() {
+                    rows.push(VisibleRow::Backburner {
+                        virtual_repository_index,
+                        id: RowId::Backburner(repository.identity.clone()),
+                    });
+                    if self.backburner_expanded.contains(&repository.identity) || !filter.is_empty()
+                    {
+                        for tree_row in pull_request_tree
+                            .iter()
+                            .filter(|row| backburner_pull_requests.contains(&row.index))
+                        {
+                            let pull_request = &repository.pull_requests[tree_row.index];
+                            rows.push(VisibleRow::VirtualPullRequest {
+                                virtual_repository_index,
+                                pull_request_index: tree_row.index,
+                                mapped_repository_index,
+                                stack_depth: tree_row.depth,
+                                id: RowId::VirtualPullRequest(pull_request.identity.clone()),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -693,6 +743,7 @@ impl App {
             )),
             VisibleRow::Repository { .. }
             | VisibleRow::VirtualRepository { .. }
+            | VisibleRow::Backburner { .. }
             | VisibleRow::VirtualPullRequest { .. } => None,
         }
     }
@@ -706,7 +757,9 @@ impl App {
             | VisibleRow::Worktree {
                 repository_index, ..
             } => repository_index,
-            VisibleRow::VirtualRepository { .. } | VisibleRow::VirtualPullRequest { .. } => {
+            VisibleRow::VirtualRepository { .. }
+            | VisibleRow::Backburner { .. }
+            | VisibleRow::VirtualPullRequest { .. } => {
                 return None;
             }
         };
@@ -1164,6 +1217,15 @@ impl App {
             }
             KeyCode::Char('/') => {
                 self.filter_active = true;
+                Intent::None
+            }
+            KeyCode::Char('b') => self.toggle_selected_backburner(),
+            KeyCode::Char(']') => {
+                self.navigate_attention(true);
+                Intent::None
+            }
+            KeyCode::Char('[') => {
+                self.navigate_attention(false);
                 Intent::None
             }
             KeyCode::Char('r') => self.request_refresh(),
@@ -1790,6 +1852,171 @@ impl App {
         format_agent_prompt(&scoped)
     }
 
+    pub fn is_backburnered(&self, identity: &CanonicalPullRequestId) -> bool {
+        self.backburner.contains(identity)
+    }
+
+    fn selected_pull_request_identity(&self) -> Option<CanonicalPullRequestId> {
+        if self.pane == Pane::Detail {
+            let identity = match self.detail_selected.as_ref() {
+                Some(DetailRowId::Summary(identity))
+                | Some(DetailRowId::Section(identity, _))
+                | Some(DetailRowId::Check(identity, _))
+                | Some(DetailRowId::ReviewRequest(identity, _))
+                | Some(DetailRowId::Review(identity, _))
+                | Some(DetailRowId::Feedback(identity, _)) => Some(identity.clone()),
+                None => None,
+            };
+            if identity.is_some() {
+                return identity;
+            }
+        }
+        match self.selected.as_ref()? {
+            RowId::VirtualPullRequest(identity) => Some(identity.clone()),
+            RowId::Worktree(path) => {
+                let repository = self.repositories.iter().find(|repository| {
+                    repository
+                        .worktrees
+                        .iter()
+                        .any(|worktree| worktree.path == *path)
+                })?;
+                let pull_request = self
+                    .github
+                    .get(path)
+                    .and_then(GitHubState::data)
+                    .and_then(|data| data.pull_request.as_ref())?;
+                self.pull_request_identity(repository, pull_request)
+            }
+            RowId::Repository(_) | RowId::VirtualRepository(_) | RowId::Backburner(_) => None,
+        }
+    }
+
+    fn toggle_selected_backburner(&mut self) -> Intent {
+        let Some(identity) = self.selected_pull_request_identity() else {
+            self.inline_error = Some("select a pull request to toggle Backburner".to_owned());
+            return Intent::None;
+        };
+        let all = self.prompt_pull_requests();
+        let identities: Vec<_> = self
+            .prompt_stack(&all, &identity)
+            .into_iter()
+            .map(|pull_request| pull_request.identity)
+            .collect();
+        let backburnering = !self.backburner.contains(&identity);
+        for identity in &identities {
+            if backburnering {
+                self.backburner.insert(identity.clone());
+            } else {
+                self.backburner.remove(identity);
+            }
+        }
+        if backburnering
+            && matches!(self.selected, Some(RowId::VirtualPullRequest(_)))
+            && !self.backburner_expanded.contains(&identity.repository)
+        {
+            self.selected = Some(RowId::Backburner(identity.repository));
+        }
+        self.reconcile_detail_selection();
+        self.ensure_selection_visible();
+        Intent::PersistBackburner
+    }
+
+    fn navigate_attention(&mut self, forward: bool) {
+        let all = self.prompt_pull_requests();
+        let mut candidates = Vec::<(CanonicalPullRequestId, RowId)>::new();
+        let mut seen = BTreeSet::new();
+        for repository in &self.repositories {
+            for worktree in &repository.worktrees {
+                let Some(pull_request) = self
+                    .github
+                    .get(&worktree.path)
+                    .and_then(GitHubState::data)
+                    .and_then(|data| data.pull_request.as_ref())
+                else {
+                    continue;
+                };
+                let Some(identity) = self.pull_request_identity(repository, pull_request) else {
+                    continue;
+                };
+                if !self.backburner.contains(&identity)
+                    && self.pull_request_is_actionable(&identity)
+                    && seen.insert(identity.clone())
+                {
+                    candidates.push((identity, RowId::Worktree(worktree.path.clone())));
+                }
+            }
+        }
+        for repository in &self.virtual_repositories {
+            for row in nested_pull_requests(&repository.pull_requests) {
+                let identity = &repository.pull_requests[row.index].identity;
+                if all.contains_key(identity)
+                    && !self.backburner.contains(identity)
+                    && self.pull_request_is_actionable(identity)
+                    && seen.insert(identity.clone())
+                {
+                    candidates.push((
+                        identity.clone(),
+                        RowId::VirtualPullRequest(identity.clone()),
+                    ));
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        let current = candidates
+            .iter()
+            .position(|(_, row)| self.selected.as_ref() == Some(row));
+        let index = if forward {
+            current.map_or(0, |index| (index + 1) % candidates.len())
+        } else {
+            current.map_or(candidates.len() - 1, |index| {
+                (index + candidates.len() - 1) % candidates.len()
+            })
+        };
+        let (identity, row) = candidates[index].clone();
+        match &row {
+            RowId::Worktree(path) => {
+                if let Some(repository) = self.repositories.iter_mut().find(|repository| {
+                    repository
+                        .worktrees
+                        .iter()
+                        .any(|worktree| worktree.path == *path)
+                }) {
+                    repository.expanded = true;
+                }
+            }
+            RowId::VirtualPullRequest(_) => {
+                if let Some(repository) = self
+                    .virtual_repositories
+                    .iter_mut()
+                    .find(|repository| repository.identity == identity.repository)
+                {
+                    repository.expanded = true;
+                    if let Some(path) = &repository.mapped_repository
+                        && let Some(local) = self
+                            .repositories
+                            .iter_mut()
+                            .find(|local| local.config.path == *path)
+                    {
+                        local.expanded = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.selected = Some(row);
+        self.pane = Pane::List;
+        self.reconcile_detail_selection();
+        self.ensure_selection_visible();
+    }
+
+    fn pull_request_is_actionable(&self, identity: &CanonicalPullRequestId) -> bool {
+        self.pull_request_details
+            .get(identity)
+            .is_some_and(|details| details.attention_summary().is_actionable())
+    }
+
     fn prompt_pull_requests(&self) -> BTreeMap<CanonicalPullRequestId, PromptPullRequest> {
         let mut pull_requests = BTreeMap::new();
         for repository in &self.virtual_repositories {
@@ -1914,13 +2141,27 @@ impl App {
                     .cloned()
                     .collect();
                 all.values()
-                    .filter(|pull_request| identities.contains(&pull_request.identity.repository))
+                    .filter(|pull_request| {
+                        identities.contains(&pull_request.identity.repository)
+                            && !self.backburner.contains(&pull_request.identity)
+                    })
                     .cloned()
                     .collect()
             }
             Some(RowId::VirtualRepository(repository)) => all
                 .values()
-                .filter(|pull_request| pull_request.identity.repository == *repository)
+                .filter(|pull_request| {
+                    pull_request.identity.repository == *repository
+                        && !self.backburner.contains(&pull_request.identity)
+                })
+                .cloned()
+                .collect(),
+            Some(RowId::Backburner(repository)) => all
+                .values()
+                .filter(|pull_request| {
+                    pull_request.identity.repository == *repository
+                        && self.backburner.contains(&pull_request.identity)
+                })
                 .cloned()
                 .collect(),
             None => Vec::new(),
@@ -1982,6 +2223,18 @@ impl App {
                     !self.virtual_repositories[virtual_repository_index].expanded;
                 Intent::None
             }
+            Some(VisibleRow::Backburner {
+                virtual_repository_index,
+                ..
+            }) => {
+                let identity = self.virtual_repositories[virtual_repository_index]
+                    .identity
+                    .clone();
+                if !self.backburner_expanded.insert(identity.clone()) {
+                    self.backburner_expanded.remove(&identity);
+                }
+                Intent::None
+            }
             Some(VisibleRow::VirtualPullRequest {
                 virtual_repository_index,
                 pull_request_index,
@@ -2027,6 +2280,15 @@ impl App {
                     self.virtual_repositories[virtual_repository_index].expanded = false;
                     self.selected = Some(self.virtual_repositories[virtual_repository_index].id());
                 }
+                VisibleRow::Backburner {
+                    virtual_repository_index,
+                    ..
+                } => {
+                    let identity = self.virtual_repositories[virtual_repository_index]
+                        .identity
+                        .clone();
+                    self.backburner_expanded.remove(&identity);
+                }
                 VisibleRow::Repository { .. } | VisibleRow::Worktree { .. } => return,
             }
             self.detail_scroll = 0;
@@ -2046,6 +2308,16 @@ impl App {
         }) = self.selected_row()
         {
             self.virtual_repositories[virtual_repository_index].expanded = true;
+        } else if let Some(VisibleRow::Backburner {
+            virtual_repository_index,
+            ..
+        }) = self.selected_row()
+        {
+            self.backburner_expanded.insert(
+                self.virtual_repositories[virtual_repository_index]
+                    .identity
+                    .clone(),
+            );
         } else {
             self.pane = Pane::Detail;
             self.reconcile_detail_selection();
@@ -3190,6 +3462,177 @@ mod tests {
         assert!(feedback.contains("feedback-1"));
         assert!(!feedback.contains("check-1"));
         assert!(!feedback.contains("PR #2"));
+    }
+
+    #[test]
+    fn backburner_groups_whole_stacks_filters_prompts_and_wraps_attention_navigation() {
+        let mut parent = authored("team", "project", 1, "2026-01-01");
+        parent.pull_request.head.branch = "stack-parent".to_owned();
+        let mut child = authored("team", "project", 2, "2026-01-02");
+        child.pull_request.base = parent.pull_request.head.clone();
+        child.pull_request.head.branch = "stack-child".to_owned();
+        let unrelated = authored("team", "project", 3, "2026-01-03");
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: parent.identity.repository.clone(),
+            mapped_repository: None,
+            expanded: true,
+            pull_requests: vec![child.clone(), unrelated.clone(), parent.clone()],
+        }];
+        for pull_request in [&parent, &child, &unrelated] {
+            app.pull_request_details.insert(
+                pull_request.identity.clone(),
+                PullRequestDetails {
+                    checks: vec![crate::model::PullRequestCheck {
+                        name: format!("failure-{}", pull_request.identity.number),
+                        state: crate::model::CheckState::Failure,
+                        target_url: None,
+                        required: true,
+                        source_order: 0,
+                        completed_at: None,
+                    }],
+                    check_contexts_complete: true,
+                    ..PullRequestDetails::default()
+                },
+            );
+        }
+        app.selected = Some(RowId::VirtualPullRequest(parent.identity.clone()));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('b'))),
+            Intent::PersistBackburner
+        );
+        assert_eq!(
+            app.backburner,
+            BTreeSet::from([parent.identity.clone(), child.identity.clone()])
+        );
+        assert_eq!(
+            app.selected,
+            Some(RowId::Backburner(parent.identity.repository.clone()))
+        );
+        let collapsed = app.visible_rows();
+        assert_eq!(
+            collapsed
+                .iter()
+                .filter(|row| matches!(row, VisibleRow::Backburner { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            collapsed
+                .iter()
+                .filter(|row| matches!(row, VisibleRow::VirtualPullRequest { .. }))
+                .count(),
+            1
+        );
+        let group_prompt = app.agent_prompt().unwrap();
+        assert!(group_prompt.contains("PR #1"));
+        assert!(group_prompt.contains("PR #2"));
+        assert!(!group_prompt.contains("PR #3"));
+
+        app.filter = "failure-1".to_owned();
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|row| { row.id() == &RowId::VirtualPullRequest(parent.identity.clone()) })
+        );
+        app.filter.clear();
+
+        app.selected = Some(RowId::VirtualRepository(parent.identity.repository.clone()));
+        let repository_prompt = app.agent_prompt().unwrap();
+        assert!(!repository_prompt.contains("PR #1"));
+        assert!(!repository_prompt.contains("PR #2"));
+        assert!(repository_prompt.contains("PR #3"));
+
+        app.selected = Some(RowId::Backburner(parent.identity.repository.clone()));
+        app.handle_key(key(KeyCode::Enter));
+        let expanded = app.visible_rows();
+        for identity in [&parent.identity, &child.identity, &unrelated.identity] {
+            assert_eq!(
+                expanded
+                    .iter()
+                    .filter(|row| row.id() == &RowId::VirtualPullRequest(identity.clone()))
+                    .count(),
+                1
+            );
+        }
+
+        app.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(
+            app.selected,
+            Some(RowId::VirtualPullRequest(unrelated.identity.clone()))
+        );
+        app.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(
+            app.selected,
+            Some(RowId::VirtualPullRequest(unrelated.identity.clone()))
+        );
+        app.handle_key(key(KeyCode::Char('[')));
+        assert_eq!(
+            app.selected,
+            Some(RowId::VirtualPullRequest(unrelated.identity.clone()))
+        );
+        app.backburner.insert(unrelated.identity);
+        let selected = app.selected.clone();
+        app.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(app.selected, selected);
+        let membership = app.backburner.clone();
+        app.rebuild_virtual_repositories();
+        assert_eq!(
+            app.backburner, membership,
+            "incomplete refreshes never prune state"
+        );
+    }
+
+    #[test]
+    fn backburnering_a_mixed_stack_keeps_the_local_worktree_and_moves_only_virtual_rows() {
+        let mut parent = authored("team", "project", 10, "2026-01-01");
+        parent.pull_request.head.branch = "stack-parent".to_owned();
+        let mut child = authored("team", "project", 11, "2026-01-02");
+        child.pull_request.base = parent.pull_request.head.clone();
+        let repository_identity = parent.identity.repository.clone();
+        let mut local = repository("/repo", true);
+        local
+            .config
+            .github_remotes
+            .insert("origin".to_owned(), repository_identity.clone());
+        let local_path = local.worktrees[1].path.clone();
+        let mut app = App::new(vec![local], PathBuf::from("/elsewhere"));
+        app.github.insert(
+            local_path.clone(),
+            GitHubState::Ready(GitHubBranchData {
+                pull_request: Some(parent.pull_request.clone()),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: repository_identity,
+            mapped_repository: Some(PathBuf::from("/repo")),
+            expanded: true,
+            pull_requests: vec![child.clone()],
+        }];
+        app.selected = Some(RowId::Worktree(local_path.clone()));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('b'))),
+            Intent::PersistBackburner
+        );
+        assert!(app.backburner.contains(&parent.identity));
+        assert!(app.backburner.contains(&child.identity));
+        let rows = app.visible_rows();
+        assert!(
+            rows.iter()
+                .any(|row| row.id() == &RowId::Worktree(local_path.clone()))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row, VisibleRow::Backburner { .. }))
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| { row.id() == &RowId::VirtualPullRequest(child.identity.clone()) })
+        );
     }
 
     #[test]

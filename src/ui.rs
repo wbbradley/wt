@@ -125,8 +125,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.pull_request_details_for(repository, pull_request)
                         .map(|(_, details)| details)
                 });
+                let backburnered = pull_request
+                    .and_then(|pull_request| app.pull_request_identity(repository, pull_request))
+                    .is_some_and(|identity| app.is_backburnered(&identity));
                 let mut suffix = pull_request
-                    .map(|pull_request| compact_pull_request_spans(pull_request, details, false))
+                    .map(|pull_request| {
+                        compact_pull_request_spans(pull_request, details, false, backburnered)
+                    })
                     .unwrap_or_default();
                 suffix.extend(github_freshness_spans(github_state));
                 suffix.extend(local_state_spans(
@@ -150,6 +155,11 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     Span::raw(truncate_label(&identity, label_width)),
                 ];
                 spans.extend(suffix);
+                if backburnered {
+                    for span in &mut spans {
+                        span.style = span.style.add_modifier(Modifier::DIM);
+                    }
+                }
                 ListItem::new(Line::from(spans))
             }
             VisibleRow::VirtualRepository {
@@ -188,9 +198,16 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     4
                 } else {
                     6
-                } + stack_depth * 2;
+                } + stack_depth * 2
+                    + usize::from(app.is_backburnered(&pull_request.identity)) * 2;
                 let details = app.pull_request_details.get(&pull_request.identity);
-                let suffix = compact_pull_request_spans(&pull_request.pull_request, details, true);
+                let backburnered = app.is_backburnered(&pull_request.identity);
+                let suffix = compact_pull_request_spans(
+                    &pull_request.pull_request,
+                    details,
+                    true,
+                    backburnered,
+                );
                 let suffix_width: usize = suffix.iter().map(|span| span.width()).sum();
                 let label_width = (area.width.saturating_sub(4) as usize)
                     .saturating_sub(indent + suffix_width)
@@ -203,7 +220,25 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     ),
                 ];
                 spans.extend(suffix);
+                if backburnered {
+                    for span in &mut spans {
+                        span.style = span.style.add_modifier(Modifier::DIM);
+                    }
+                }
                 ListItem::new(Line::from(spans))
+            }
+            VisibleRow::Backburner {
+                virtual_repository_index,
+                ..
+            } => {
+                let repository = &app.virtual_repositories[*virtual_repository_index];
+                let expanded = app.backburner_expanded.contains(&repository.identity);
+                ListItem::new(Line::styled(
+                    format!("    {} Backburner", if expanded { "▾" } else { "▸" }),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ))
             }
         })
         .collect();
@@ -240,9 +275,10 @@ fn compact_pull_request_spans(
     pull_request: &crate::model::PullRequest,
     details: Option<&PullRequestDetails>,
     virtual_row: bool,
+    backburnered: bool,
 ) -> Vec<Span<'static>> {
     let summary = details.map(PullRequestDetails::attention_summary);
-    let number_style = if summary.is_some_and(|summary| summary.is_actionable()) {
+    let number_style = if !backburnered && summary.is_some_and(|summary| summary.is_actionable()) {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -296,6 +332,9 @@ fn compact_pull_request_spans(
     }
     if virtual_row {
         spans.push(badge("V", Color::Magenta));
+    }
+    if backburnered {
+        spans.push(badge("[backburner]", Color::DarkGray));
     }
     spans
 }
@@ -661,7 +700,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else if !app.filter.is_empty() {
         format!("filter: {}", app.filter)
     } else {
-        "j/k move  h/l panes  / filter  r refresh  ? actions  Enter select/create  q/Esc cancel"
+        "j/k move  [/] attention  h/l panes  / filter  r refresh  ? actions  Enter select/create"
             .to_owned()
     };
     let bottom = app
@@ -669,7 +708,8 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .as_ref()
         .map(|error| format!("error: {error}"))
         .unwrap_or_else(|| {
-            "c create  m move  L/U lock  d remove  R repair  p prune  a/e/x catalog".to_owned()
+            "C prompt  b Backburner  c create  m move  L/U lock  d remove  R repair  q/Esc cancel"
+                .to_owned()
         });
     frame.render_widget(
         Paragraph::new(vec![
@@ -1169,7 +1209,7 @@ mod tests {
                 ..PullRequestDetails::default()
             },
         );
-        app.selected = Some(RowId::VirtualPullRequest(pull_request_id));
+        app.selected = Some(RowId::VirtualPullRequest(pull_request_id.clone()));
         let mut terminal = Terminal::new(TestBackend::new(120, 70)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -1219,6 +1259,18 @@ mod tests {
         assert!(narrow_row.contains("#42 draft C✓ O!1 R✗ F1 X V"));
         assert!(!narrow_row.contains("virtual feature"));
         assert!(!narrow_row.contains("head-sha"));
+
+        app.backburner.insert(pull_request_id.clone());
+        app.selected = Some(RowId::Backburner(pull_request_id.repository.clone()));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let collapsed = buffer_text(terminal.backend().buffer());
+        assert!(collapsed.contains("Backburner"));
+        assert!(!collapsed.contains("#42"));
+        app.backburner_expanded
+            .insert(pull_request_id.repository.clone());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let expanded = buffer_text(terminal.backend().buffer());
+        assert!(expanded.contains("#42 draft C✓ O!1 R✗ F1 X V [backburner]"));
     }
 
     #[test]
