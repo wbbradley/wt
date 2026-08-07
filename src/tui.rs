@@ -3,6 +3,7 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -240,6 +241,29 @@ enum ControlFlow {
     Exit(Option<PathBuf>),
 }
 
+trait UrlOpener: Send + Sync {
+    fn open(&self, url: &str) -> Result<(), String>;
+}
+
+struct SystemUrlOpener;
+
+impl UrlOpener for SystemUrlOpener {
+    fn open(&self, url: &str) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        let status = Command::new("open").arg(url).status();
+        #[cfg(target_os = "windows")]
+        let status = Command::new("cmd").args(["/C", "start", "", url]).status();
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let status = Command::new("xdg-open").arg(url).status();
+        let status = status.map_err(|error| format!("cannot launch URL opener: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("URL opener exited with {status}"))
+        }
+    }
+}
+
 struct MaterializationOutcome {
     path: PathBuf,
 }
@@ -264,6 +288,7 @@ struct Controller {
     materialization_progress: Option<String>,
     completed_materialization: Option<PathBuf>,
     completed_creation: Option<PathBuf>,
+    url_opener: Arc<dyn UrlOpener>,
 }
 
 impl Controller {
@@ -294,7 +319,20 @@ impl Controller {
             materialization_progress: None,
             completed_materialization: None,
             completed_creation: None,
+            url_opener: Arc::new(SystemUrlOpener),
         }
+    }
+
+    #[cfg(test)]
+    fn with_url_opener(
+        catalog_path: PathBuf,
+        catalog: Catalog,
+        app: App,
+        url_opener: Arc<dyn UrlOpener>,
+    ) -> Self {
+        let mut controller = Self::new(catalog_path, catalog, app);
+        controller.url_opener = url_opener;
+        controller
     }
 
     fn load_remote_cache(&mut self) {
@@ -452,6 +490,12 @@ impl Controller {
             }
             Intent::MaterializePullRequest(identity) => {
                 self.start_pull_request_materialization(identity)?;
+                Ok(ControlFlow::Continue)
+            }
+            Intent::OpenUrl(url) => {
+                if let Err(error) = self.url_opener.open(&url) {
+                    self.app.inline_error = Some(format!("unable to open {url}: {error}"));
+                }
                 Ok(ControlFlow::Continue)
             }
         }
@@ -1697,6 +1741,60 @@ mod tests {
     use super::*;
     use crate::app::Modal;
     use std::process::Command;
+    use std::sync::Mutex;
+
+    struct FakeUrlOpener {
+        opened: Mutex<Vec<String>>,
+        error: Option<String>,
+    }
+
+    impl UrlOpener for FakeUrlOpener {
+        fn open(&self, url: &str) -> Result<(), String> {
+            self.opened.lock().unwrap().push(url.to_owned());
+            self.error.clone().map_or(Ok(()), Err)
+        }
+    }
+
+    #[test]
+    fn injected_url_opener_handles_success_and_surfaces_failure_inline() {
+        let directory = tempfile::tempdir().unwrap();
+        let opener = Arc::new(FakeUrlOpener {
+            opened: Mutex::new(Vec::new()),
+            error: None,
+        });
+        let mut controller = Controller::with_url_opener(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            App::new(Vec::new(), directory.path().to_owned()),
+            opener.clone(),
+        );
+        assert!(matches!(
+            controller
+                .handle_intent(Intent::OpenUrl("https://example/pr/1".to_owned()))
+                .unwrap(),
+            ControlFlow::Continue
+        ));
+        assert_eq!(
+            opener.opened.lock().unwrap().as_slice(),
+            ["https://example/pr/1"]
+        );
+
+        let failing = Arc::new(FakeUrlOpener {
+            opened: Mutex::new(Vec::new()),
+            error: Some("no browser".to_owned()),
+        });
+        controller.url_opener = failing;
+        controller
+            .handle_intent(Intent::OpenUrl("https://example/pr/2".to_owned()))
+            .unwrap();
+        assert!(
+            controller
+                .app
+                .inline_error
+                .as_deref()
+                .is_some_and(|error| error.contains("no browser"))
+        );
+    }
 
     #[test]
     fn empty_catalog_inside_repository_creates_session_only_onboarding() {
