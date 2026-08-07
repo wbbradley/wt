@@ -588,3 +588,82 @@ Verification:
 - Test badge precedence, attention classification, filtering hidden detail text, ancestry, deduplication, and selection preservation.
 - Update the README's TUI examples and status legend.
 - Run the formatting, clippy, and full test gates.
+
+
+## Add selectable PR details
+
+Added stable, selectable PR Detail rows for summaries, actionable attention, checks, reviews, and feedback, with item-aware keyboard navigation and refresh reconciliation. Details now show canonical local and GitHub metadata, loading/stale warnings, readable review states, required/optional check distinctions, and normalized feedback. Enter routes item URLs through an injectable platform opener with PR fallback and inline errors, while non-PR details retain safe read-only behavior. Updated the README and added focused navigation, rendering, URL-routing, and opener coverage.
+
+## Add selectable PR details
+
+Turn the existing scroll-only Details pane into a structured, selectable view for PR metadata, checks, reviewers, and feedback while preserving ordinary worktree details.
+
+Requires Hydrate canonical PR attention data. It may proceed alongside Render a compact PR-attention tree once the detailed model is stable.
+
+Affected areas: `src/app.rs`, `src/ui.rs`, `src/tui.rs`, and focused tests.
+
+- Introduce stable detail-row identities and sections for Attention, Checks, Reviews, and Feedback.
+- Show PR title/URL, base and head, state, update time, auto-merge, conflict state, local status/path, warnings, and stale/loading state.
+- Sort checks attention-first while preserving source order within equal states; mark required and optional checks explicitly.
+- Show requested users/teams and each reviewer's latest state.
+- Show unresolved inline threads and review summaries with author, normalized body, path, outdated marker, and permalink.
+- Make `l` focus Details and `h` return to the tree. In Details, make `j`/`k`, arrows, `g`/`G`, and paging move among selectable detail rows rather than raw wrapped lines.
+- Make `Enter` open the selected check, comment, review, or PR URL; rows without their own URL fall back to the owning PR.
+- Preserve the selected detail identity across refreshes when it still exists, otherwise choose the nearest sensible row.
+- Continue supporting read-only scrolling/details for selections without a PR.
+
+Complete when:
+
+- Every detailed check, reviewer, and feedback item can be reached by keyboard.
+- Selection and viewport remain valid after resize, wrapping, refresh, collapse, and disappearing items.
+- Opening a detail item never materializes or selects a worktree accidentally.
+- Loading/stale data remains usable and visibly labeled.
+
+Verification:
+
+- Test navigation, focus, resize/wrapping, refresh reconciliation, URL routing, empty sections, and non-PR selections.
+- Inject the URL opener in tests; do not launch external applications.
+- Update the README key guide and Details description.
+- Run the formatting, clippy, and full test gates.
+
+### Implementation plan
+
+- Modify `src/app.rs` with stable canonical detail-row identities and sections, owned row projections for PR summary/attention/check/review/feedback content, attention-first check sorting, selected-detail reconciliation, item-based viewport state, and URL-routing intents that fall back to the owning PR.
+- Modify `src/app.rs` keyboard handling so Detail focus owns `j`/`k`, arrows, `g`/`G`, half-page movement, and `Enter`, while `h` returns to the tree and non-PR selections retain read-only scrolling without accepting/materializing a worktree from Detail focus.
+- Modify `src/ui.rs` to render structured PR Details as selectable multi-line items with visible section headers, required/optional annotations, metadata/loading/stale/warning labels, and wrapped feedback bodies; retain the existing ordinary worktree/repository detail paragraph.
+- Modify `src/tui.rs` with an injectable URL opener used only for `Intent::OpenUrl`, production platform dispatch, inline failure reporting, and fake-opener tests proving URL routing never invokes worktree selection or materialization.
+- Extend app/render/controller tests for stable identity preservation and nearest fallback, empty sections, attention-first ordering, focus/navigation/paging, wrapping/resize viewport validity, refresh/disappearing rows, local and virtual PRs, non-PR read-only behavior, and own-URL versus PR fallback routing.
+- Update `README.md` navigation and Details documentation for selectable sections/items and Enter-to-open behavior.
+
+Risks and open questions: wrapped rows have variable visual height, so the renderer must let Ratatui's item-aware list state reconcile offsets rather than treating wrapped lines as fixed-height indices. Local PR identity resolution can fail when remote metadata is unavailable; those selections must keep the legacy read-only details instead of inventing a canonical key. URL opener failures should stay inline and never exit the TUI.
+
+## Post-Plan Execution Steps
+
+Execute these steps in order:
+
+### Implement
+Execute the plan above.
+
+**Naming gate:** before creating any file, identifier, run-id, or env var, ask "would this name
+make sense to someone who never read the plan?" If it encodes a sequence position (`Stage N` /
+`Phase N` / `stepN`), rename it now — cheap before a checkpoint or downstream reference pins it.
+
+### Verify
+
+1. Run the project's build/lint command. Fix all warnings.
+2. Run the project's test suite.
+3. If tests fail, fix them before proceeding.
+4. If test coverage for the new work is insufficient, add tests.
+
+### Commit
+
+Use Conventional Commits commit message style. If there are pre-existing modified files and they don't look harmful, go ahead and commit them, too.
+
+### Update PLAN.md
+
+Read `PLAN.md`. **Remove** the completed task entirely from the "Next Up" section — do not leave it in place with a [DONE] tag, strikethrough, or any other marker. The task and its related subsections should no longer appear in PLAN.md at all. PLAN.md should not have any sort of "Done" section. Then append a new entry to `COMPLETED.md` with two parts, in this order:
+
+1. A brief summary, written now, of what was actually implemented.
+2. The full text of the PLAN.md entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
+
+If upcoming PLAN.md items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If PLAN.md or COMPLETED.md are ignored, don't force add them, otherwise commit them with other changes.

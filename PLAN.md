@@ -1,37 +1,5 @@
 # Next Up
 
-## Add selectable PR details
-
-Turn the existing scroll-only Details pane into a structured, selectable view for PR metadata, checks, reviewers, and feedback while preserving ordinary worktree details.
-
-Requires Hydrate canonical PR attention data. It may proceed alongside Render a compact PR-attention tree once the detailed model is stable.
-
-Affected areas: `src/app.rs`, `src/ui.rs`, `src/tui.rs`, and focused tests.
-
-- Introduce stable detail-row identities and sections for Attention, Checks, Reviews, and Feedback.
-- Show PR title/URL, base and head, state, update time, auto-merge, conflict state, local status/path, warnings, and stale/loading state.
-- Sort checks attention-first while preserving source order within equal states; mark required and optional checks explicitly.
-- Show requested users/teams and each reviewer's latest state.
-- Show unresolved inline threads and review summaries with author, normalized body, path, outdated marker, and permalink.
-- Make `l` focus Details and `h` return to the tree. In Details, make `j`/`k`, arrows, `g`/`G`, and paging move among selectable detail rows rather than raw wrapped lines.
-- Make `Enter` open the selected check, comment, review, or PR URL; rows without their own URL fall back to the owning PR.
-- Preserve the selected detail identity across refreshes when it still exists, otherwise choose the nearest sensible row.
-- Continue supporting read-only scrolling/details for selections without a PR.
-
-Complete when:
-
-- Every detailed check, reviewer, and feedback item can be reached by keyboard.
-- Selection and viewport remain valid after resize, wrapping, refresh, collapse, and disappearing items.
-- Opening a detail item never materializes or selects a worktree accidentally.
-- Loading/stale data remains usable and visibly labeled.
-
-Verification:
-
-- Test navigation, focus, resize/wrapping, refresh reconciliation, URL routing, empty sections, and non-PR selections.
-- Inject the URL opener in tests; do not launch external applications.
-- Update the README key guide and Details description.
-- Run the formatting, clippy, and full test gates.
-
 ## Copy scoped agent prompts
 
 Provide fast clipboard prompts for addressing check failures and review feedback at item, section, PR-stack, and repository scopes.
