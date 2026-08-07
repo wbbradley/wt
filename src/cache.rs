@@ -59,6 +59,7 @@ impl RemoteCache {
         let current_branches: BTreeMap<PathBuf, String> = inputs
             .iter()
             .flat_map(|input| input.worktrees.iter())
+            .filter(|worktree| worktree.navigable())
             .filter_map(|worktree| {
                 worktree
                     .branch
@@ -114,6 +115,40 @@ impl RemoteCache {
             unique.insert(pull_request.identity.clone(), pull_request);
         }
         self.authored_pull_requests = unique.into_values().collect();
+        self.updated_at_epoch_seconds = epoch_seconds();
+    }
+
+    pub fn record_materialized_pull_request(
+        &mut self,
+        worktree: &Path,
+        branch: &str,
+        pull_request: AuthoredPullRequest,
+    ) {
+        let branch = format!("refs/heads/{branch}");
+        self.branches.retain(|cached| cached.worktree != worktree);
+        self.branches.push(CachedBranch {
+            worktree: worktree.to_owned(),
+            branch,
+            data: GitHubBranchData {
+                pull_request: Some(pull_request.pull_request.clone()),
+                warnings: Vec::new(),
+                rate_limit: None,
+            },
+        });
+        self.branches.sort_by(|left, right| {
+            (&left.worktree, &left.branch).cmp(&(&right.worktree, &right.branch))
+        });
+
+        let identity = pull_request.identity.clone();
+        self.authored_pull_requests
+            .retain(|cached| cached.identity != identity);
+        self.authored_pull_requests.push(pull_request);
+        self.authored_pull_requests
+            .sort_by(|left, right| left.identity.cmp(&right.identity));
+
+        self.active_pull_requests.push(identity);
+        self.active_pull_requests.sort();
+        self.active_pull_requests.dedup();
         self.updated_at_epoch_seconds = epoch_seconds();
     }
 }
@@ -399,6 +434,57 @@ mod tests {
         cache.merge_branch_refresh(&[input(&path, "other")], &failed);
         assert!(cache.branches.is_empty());
         assert!(cache.active_pull_requests.is_empty());
+    }
+
+    #[test]
+    fn materialized_pull_request_replaces_cached_branch_and_deduplicates_identity() {
+        let path = PathBuf::from("/repo/topic");
+        let mut cache = RemoteCache {
+            branches: vec![CachedBranch {
+                worktree: path.clone(),
+                branch: "refs/heads/old".to_owned(),
+                data: GitHubBranchData {
+                    pull_request: None,
+                    warnings: vec!["stale".to_owned()],
+                    rate_limit: None,
+                },
+            }],
+            authored_pull_requests: vec![authored(2), authored(1)],
+            active_pull_requests: vec![authored(1).identity, authored(2).identity.clone()],
+            ..RemoteCache::default()
+        };
+        let refreshed = authored(2);
+
+        cache.record_materialized_pull_request(&path, "topic-2", refreshed.clone());
+
+        assert_eq!(cache.branches.len(), 1);
+        assert_eq!(cache.branches[0].worktree, path);
+        assert_eq!(cache.branches[0].branch, "refs/heads/topic-2");
+        assert_eq!(
+            cache.branches[0]
+                .data
+                .pull_request
+                .as_ref()
+                .map(|pull_request| pull_request.number),
+            Some(2)
+        );
+        assert_eq!(
+            cache
+                .authored_pull_requests
+                .iter()
+                .map(|pull_request| pull_request.identity.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            cache
+                .active_pull_requests
+                .iter()
+                .map(|identity| identity.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(cache.updated_at_epoch_seconds > 0);
     }
 
     #[test]

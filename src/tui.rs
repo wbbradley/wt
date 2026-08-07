@@ -287,28 +287,28 @@ impl Controller {
                 return;
             }
         };
-        let current_branches: std::collections::HashMap<&Path, &str> = self
+        let current_branches: std::collections::BTreeSet<(PathBuf, String)> = self
             .app
             .repositories
             .iter()
             .flat_map(|repository| repository.worktrees.iter())
+            .filter(|worktree| worktree.navigable())
             .filter_map(|worktree| {
                 worktree
                     .branch
                     .as_deref()
-                    .map(|branch| (worktree.path.as_path(), branch))
+                    .filter(|branch| branch.starts_with("refs/heads/"))
+                    .map(|branch| (worktree.path.clone(), branch.to_owned()))
             })
             .collect();
-        let cache_topology_matches = remote_cache.branches.iter().all(|cached| {
-            current_branches
-                .get(cached.worktree.as_path())
-                .is_some_and(|branch| **branch == cached.branch)
-        });
+        let cached_branches: std::collections::BTreeSet<(PathBuf, String)> = remote_cache
+            .branches
+            .iter()
+            .map(|cached| (cached.worktree.clone(), cached.branch.clone()))
+            .collect();
+        let cache_topology_matches = current_branches == cached_branches;
         for cached in remote_cache.branches {
-            if current_branches
-                .get(cached.worktree.as_path())
-                .is_some_and(|branch| **branch == cached.branch)
-            {
+            if current_branches.contains(&(cached.worktree.clone(), cached.branch.clone())) {
                 self.app
                     .github
                     .insert(cached.worktree, crate::app::GitHubState::Ready(cached.data));
@@ -1247,6 +1247,7 @@ impl Controller {
                     .to_owned()
             });
         let catalog_path = self.catalog_path.clone();
+        let remote_cache_path = self.remote_cache_path.clone();
         let service = self.github_service.clone();
         let job = BackgroundJob::spawn("wt-pr-materialization", move |context| {
             context.progress("refreshing selected pull request");
@@ -1306,6 +1307,13 @@ impl Controller {
                 Some(&token),
             )
             .map_err(|error| error.to_string())?;
+            let _ = cache::update(&remote_cache_path, |cache| {
+                cache.record_materialized_pull_request(
+                    &materialized.path,
+                    &materialized.branch,
+                    refreshed,
+                );
+            });
             Ok(MaterializationOutcome {
                 path: materialized.path,
             })
@@ -1668,6 +1676,26 @@ mod tests {
                 .identity
                 .number,
             virtual_pr.identity.number
+        );
+
+        controller.app.repositories[0].worktrees.push(Worktree {
+            path: directory.path().join("new-worktree"),
+            head: Some("head-3".to_owned()),
+            branch: Some("refs/heads/new-topic".to_owned()),
+            detached: false,
+            bare: false,
+            locked: None,
+            prunable: None,
+        });
+        controller.load_remote_cache();
+
+        assert!(controller.app.active_pull_requests.is_empty());
+        assert!(
+            controller
+                .app
+                .authored_mappings
+                .iter()
+                .any(|mapping| mapping.identity == local.identity)
         );
     }
 
