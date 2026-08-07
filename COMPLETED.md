@@ -551,3 +551,40 @@ Verification:
 - Run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
 
 Risks: `isRequired` needs a literal PR number and cannot be finalized reliably inside the broad search query, so keep a bounded direct-PR hydration path. Large repositories can exceed a single 100-context page; truncation must remain visibly unknown. Deleted users, bots, teams, inaccessible threads, and null GraphQL actors must degrade gracefully.
+
+
+## Render a compact PR-attention tree
+
+Replaced path-, SHA-, and title-heavy child rows with width-aware branch/PR lines and independently colored compact indicators for required checks, optional failures, reviews, unresolved feedback, conflicts, PR state, dirty/locked/prunable local state, virtual rows, and freshness. Added canonical local/virtual detail resolution, actionable-attention classification, hidden detailed-text filtering, 80-column and wide rendering coverage, and a README indicator legend.
+
+## Render a compact PR-attention tree
+
+Make the main tree answer “what needs attention?” without spending horizontal space on information better shown in Details.
+
+Requires Hydrate canonical PR attention data.
+
+Affected areas: `src/app.rs`, `src/ui.rs`, and their unit/render tests.
+
+- Keep repository and existing local/PR ancestry behavior, including local ancestry taking precedence over GitHub stack metadata.
+- Render worktree and virtual-PR rows with the branch, PR number, compact check/review/feedback indicators, and essential local state.
+- Remove PR titles, full paths, and commit SHAs from ordinary child rows; retain them in Details and in filter matching.
+- Distinguish required-check readiness from actionable optional failures.
+- Define actionable attention as a failed/error check, changes requested, unresolved feedback, or merge conflict. Pending checks and outstanding review requests are waiting states, not actionable attention.
+- Show unresolved-feedback counts and clear semantic colors/glyphs for success, failure, pending, unknown, draft, dirty, virtual, and conflict states.
+- Keep rendering useful at narrow terminal widths without horizontal overflow; truncate only branch/repository labels as a last resort.
+- Preserve selection, collapse state, filtering, scrolling, current-worktree marking, and materialization behavior.
+
+Complete when:
+
+- Common rows fit within an 80-column terminal without emitting long paths, SHAs, or PR titles.
+- Required and optional check failures are visually distinguishable.
+- Review changes, unresolved feedback counts, conflicts, dirty state, and virtual/local status are legible at a glance.
+- Filtering still finds hidden title/path/check/reviewer/comment text.
+- Every local worktree remains represented exactly once.
+
+Verification:
+
+- Add render assertions at narrow and wide widths.
+- Test badge precedence, attention classification, filtering hidden detail text, ancestry, deduplication, and selection preservation.
+- Update the README's TUI examples and status legend.
+- Run the formatting, clippy, and full test gates.
