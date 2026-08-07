@@ -48,15 +48,15 @@ An ambiguous qualified selector opens the TUI prefiltered instead of guessing. T
 
 ## TUI
 
-The initial selection is the worktree containing the current directory. Repository rows can be collapsed, and the detail pane shows local status, administrative state, and GitHub PR data when available.
+The initial selection is the worktree containing the current directory. Repository rows can be collapsed, and the detail pane shows local status and administrative state. For PR selections, Details is a structured list of Summary, Attention, Checks, Reviews, and Feedback; checks are ordered with failures first and every check, reviewer/request, review, and feedback item is keyboard-selectable. Loading or stale snapshots remain visible and labeled.
 
 Navigation keys:
 
-- `j`/`k` or arrows: move; `g`/`G`: first/last; `Ctrl-d`/`Ctrl-u`: half-page
-- `h`/`l` or left/right: collapse, expand, or switch panes
+- `j`/`k` or arrows: move; `g`/`G`: first/last; `Ctrl-d`/`Ctrl-u`: half-page (tree rows or selectable Detail items according to focus)
+- `h`/`l` or left/right: collapse, expand, or switch panes; `h` always returns from Details to the tree
 - `/`: filter across repository, path, branch, status, PR, checks, review, warning, and error text
 - `r`: coalesced local and GitHub refresh
-- `Enter`: select a worktree, toggle a repository, or materialize a virtual authored-PR row
+- `Enter`: in the tree, select a worktree, toggle a repository, or materialize a virtual authored-PR row; in PR Details, open the selected check/comment/review URL, falling back to the PR URL
 - `q`/`Esc`/`Ctrl-c`: cancel; during PR materialization, Ctrl-C cancels the operation and returns to the TUI
 - `?` or Space: action palette
 

@@ -200,6 +200,31 @@ pub enum VisibleRow {
     },
 }
 
+#[derive(Clone, Copy, Debug, Hash, Ord, PartialEq, PartialOrd, Eq)]
+pub enum DetailSection {
+    Attention,
+    Checks,
+    Reviews,
+    Feedback,
+}
+
+#[derive(Clone, Debug, Hash, Ord, PartialEq, PartialOrd, Eq)]
+pub enum DetailRowId {
+    Summary(CanonicalPullRequestId),
+    Section(CanonicalPullRequestId, DetailSection),
+    Check(CanonicalPullRequestId, String),
+    ReviewRequest(CanonicalPullRequestId, String),
+    Review(CanonicalPullRequestId, String),
+    Feedback(CanonicalPullRequestId, String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailRow {
+    pub id: DetailRowId,
+    pub lines: Vec<String>,
+    pub url: String,
+}
+
 impl VisibleRow {
     pub fn id(&self) -> &RowId {
         match self {
@@ -320,6 +345,7 @@ pub enum Intent {
     SubmitForm { action: Action, values: Vec<String> },
     ConfirmAction(Action),
     MaterializePullRequest(CanonicalPullRequestId),
+    OpenUrl(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -342,6 +368,8 @@ pub struct App {
     viewport_initialized: bool,
     pub detail_scroll: usize,
     detail_max_scroll: usize,
+    pub detail_selected: Option<DetailRowId>,
+    detail_viewport_height: usize,
     pub modal: Option<Modal>,
     pub inline_error: Option<String>,
     pub progress: Option<String>,
@@ -376,6 +404,8 @@ impl App {
             viewport_initialized: false,
             detail_scroll: 0,
             detail_max_scroll: 0,
+            detail_selected: None,
+            detail_viewport_height: 1,
             modal: None,
             inline_error: None,
             progress: None,
@@ -695,6 +725,280 @@ impl App {
         }
     }
 
+    pub fn detail_rows(&self) -> Vec<DetailRow> {
+        let Some((identity, pull_request, details, mut context)) =
+            self.selected_pull_request_data()
+        else {
+            return Vec::new();
+        };
+        let pr_url = pull_request.url.clone();
+        context.extend([
+            format!("title: {}", pull_request.title),
+            format!("URL: {}", pull_request.url),
+            format!(
+                "base: {}:{}",
+                pull_request.base.repository.as_deref().unwrap_or("unknown"),
+                pull_request.base.branch
+            ),
+            format!(
+                "head: {}:{}",
+                pull_request.head.repository.as_deref().unwrap_or("unknown"),
+                pull_request.head.branch
+            ),
+            format!(
+                "head SHA: {}",
+                pull_request.head.oid.as_deref().unwrap_or("unknown")
+            ),
+            format!(
+                "state: {} · updated {}",
+                pull_request.state, pull_request.updated_at
+            ),
+            format!(
+                "auto-merge: {}",
+                if pull_request.auto_merge {
+                    "enabled"
+                } else {
+                    "off"
+                }
+            ),
+        ]);
+        if let Some(error) = self.pull_request_detail_errors.get(&identity) {
+            context.push(format!("details stale: {error}"));
+        }
+        if let Some(details) = &details {
+            context.push(format!("conflict: {}", debug_label(details.merge_conflict)));
+            context.extend(
+                details
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("warning: {warning}")),
+            );
+        } else {
+            context.push("attention details: loading or unavailable".to_owned());
+        }
+        let mut rows = vec![DetailRow {
+            id: DetailRowId::Summary(identity.clone()),
+            lines: context,
+            url: pr_url.clone(),
+        }];
+
+        let summary = details.as_ref().map(PullRequestDetails::attention_summary);
+        rows.push(DetailRow {
+            id: DetailRowId::Section(identity.clone(), DetailSection::Attention),
+            lines: vec![format!(
+                "Attention · checks {} · review {} · feedback {} · optional failures {} · conflict {}",
+                summary
+                    .map(|summary| debug_label(summary.required_checks))
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                summary
+                    .map(|summary| debug_label(summary.review))
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                summary.map(|summary| summary.unresolved_feedback).unwrap_or(0),
+                summary.map(|summary| summary.optional_failures).unwrap_or(0),
+                summary
+                    .map(|summary| debug_label(summary.merge_conflict))
+                    .unwrap_or_else(|| "unknown".to_owned()),
+            )],
+            url: pr_url.clone(),
+        });
+
+        let mut checks = details
+            .as_ref()
+            .map(|details| details.checks.clone())
+            .unwrap_or_default();
+        checks.sort_by_key(|check| (check_attention_rank(check.state), check.source_order));
+        rows.push(DetailRow {
+            id: DetailRowId::Section(identity.clone(), DetailSection::Checks),
+            lines: vec![if checks.is_empty() {
+                "Checks · none or unavailable".to_owned()
+            } else {
+                format!("Checks · {}", checks.len())
+            }],
+            url: pr_url.clone(),
+        });
+        rows.extend(checks.into_iter().map(|check| {
+            let mut lines = vec![format!(
+                "{} · {} · {}",
+                check.name,
+                debug_label(check.state),
+                if check.required {
+                    "required"
+                } else {
+                    "optional"
+                }
+            )];
+            if let Some(url) = &check.target_url {
+                lines.push(format!("URL: {url}"));
+            }
+            DetailRow {
+                id: DetailRowId::Check(identity.clone(), check.name),
+                lines,
+                url: check.target_url.unwrap_or_else(|| pr_url.clone()),
+            }
+        }));
+
+        let review_requests = details
+            .as_ref()
+            .map(|details| details.review_requests.clone())
+            .unwrap_or_default();
+        let reviewer_reviews = details
+            .as_ref()
+            .map(|details| details.reviewer_reviews.clone())
+            .unwrap_or_default();
+        rows.push(DetailRow {
+            id: DetailRowId::Section(identity.clone(), DetailSection::Reviews),
+            lines: vec![
+                if review_requests.is_empty() && reviewer_reviews.is_empty() {
+                    "Reviews · none or unavailable".to_owned()
+                } else {
+                    format!(
+                        "Reviews · {} requested · {} submitted",
+                        review_requests.len(),
+                        reviewer_reviews.len()
+                    )
+                },
+            ],
+            url: pr_url.clone(),
+        });
+        rows.extend(review_requests.into_iter().map(|request| DetailRow {
+            id: DetailRowId::ReviewRequest(identity.clone(), request.id.clone()),
+            lines: vec![format!(
+                "requested: {} ({}) · github id {}",
+                request.name,
+                debug_label(request.kind),
+                request.id
+            )],
+            url: pr_url.clone(),
+        }));
+        rows.extend(reviewer_reviews.into_iter().map(|review| DetailRow {
+            id: DetailRowId::Review(identity.clone(), review.id.clone()),
+            lines: vec![format!(
+                "{} · {} · github id {}{}",
+                review.reviewer,
+                debug_label(review.state),
+                review.id,
+                review
+                    .database_id
+                    .map(|id| format!(" · review id {id}"))
+                    .unwrap_or_default()
+            )],
+            url: pr_url.clone(),
+        }));
+
+        let feedback = details
+            .as_ref()
+            .map(|details| details.feedback.clone())
+            .unwrap_or_default();
+        rows.push(DetailRow {
+            id: DetailRowId::Section(identity.clone(), DetailSection::Feedback),
+            lines: vec![if feedback.is_empty() {
+                "Feedback · none or unavailable".to_owned()
+            } else {
+                format!("Feedback · {}", feedback.len())
+            }],
+            url: pr_url.clone(),
+        });
+        rows.extend(feedback.into_iter().map(|feedback| {
+            let mut metadata = vec![
+                debug_label(feedback.kind),
+                feedback.author,
+                format!("github id {}", feedback.id),
+            ];
+            if let Some(id) = feedback.database_id {
+                metadata.push(format!("id {id}"));
+            }
+            if let Some(path) = feedback.path {
+                metadata.push(path);
+            }
+            if let Some(thread_id) = feedback.thread_id {
+                metadata.push(format!("thread {thread_id}"));
+            }
+            if feedback.outdated {
+                metadata.push("outdated".to_owned());
+            }
+            let url = feedback.permalink.unwrap_or_else(|| pr_url.clone());
+            metadata.push(format!("permalink {url}"));
+            DetailRow {
+                id: DetailRowId::Feedback(identity.clone(), feedback.id),
+                lines: vec![
+                    metadata.join(" · "),
+                    feedback
+                        .body
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ],
+                url,
+            }
+        }));
+        rows
+    }
+
+    fn selected_pull_request_data(
+        &self,
+    ) -> Option<(
+        CanonicalPullRequestId,
+        PullRequest,
+        Option<PullRequestDetails>,
+        Vec<String>,
+    )> {
+        if let Some((repository, authored)) = self.selected_virtual_pull_request() {
+            let mut context = vec![format!("repository: {}", repository.identity.full_name())];
+            context.push(format!(
+                "local repo: {}",
+                repository
+                    .mapped_repository
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "none (virtual)".to_owned())
+            ));
+            context.push(format!("author: {}", authored.author));
+            if self.authored_pull_requests.loading {
+                context.push("GitHub: refreshing".to_owned());
+            } else if let Some(error) = &self.authored_pull_requests.stale_error {
+                context.push(format!("GitHub stale: {error}"));
+            }
+            return Some((
+                authored.identity.clone(),
+                authored.pull_request.clone(),
+                self.pull_request_details.get(&authored.identity).cloned(),
+                context,
+            ));
+        }
+        let (repository, worktree, _) = self.selected_worktree()?;
+        let github_state = self.github.get(&worktree.path)?;
+        let data = github_state.data()?;
+        let pull_request = data.pull_request.as_ref()?;
+        let identity = self.pull_request_identity(repository, pull_request)?;
+        let mut context = vec![
+            format!("repository: {}", repository.config.display_label()),
+            format!("local path: {}", worktree.path.display()),
+        ];
+        if let Some(status) = self.statuses.get(&worktree.path) {
+            context.push(match status {
+                StatusState::Pending => "local status: loading".to_owned(),
+                StatusState::Ready(status) => format!("local status: {}", status.summary()),
+                StatusState::Error(error) => format!("local status error: {error}"),
+            });
+        }
+        match github_state {
+            GitHubState::Loading { .. } => context.push("GitHub: refreshing".to_owned()),
+            GitHubState::Stale { error, .. } => context.push(format!("GitHub stale: {error}")),
+            GitHubState::Ready(_) => {}
+        }
+        context.extend(
+            data.warnings
+                .iter()
+                .map(|warning| format!("warning: {warning}")),
+        );
+        Some((
+            identity.clone(),
+            pull_request.clone(),
+            self.pull_request_details.get(&identity).cloned(),
+            context,
+        ))
+    }
+
     pub fn pull_request_identity(
         &self,
         repository: &RepositoryView,
@@ -764,11 +1068,29 @@ impl App {
             return match key.code {
                 KeyCode::Char('c') => Intent::Cancel,
                 KeyCode::Char('d') => {
-                    self.move_selection((self.viewport_height / 2).max(1) as isize);
+                    if self.pane == Pane::Detail {
+                        let distance = (self.detail_viewport_height / 2).max(1) as isize;
+                        if self.detail_rows().is_empty() {
+                            self.scroll_detail(distance);
+                        } else {
+                            self.move_detail_selection(distance);
+                        }
+                    } else {
+                        self.move_selection((self.viewport_height / 2).max(1) as isize);
+                    }
                     Intent::None
                 }
                 KeyCode::Char('u') => {
-                    self.move_selection(-((self.viewport_height / 2).max(1) as isize));
+                    if self.pane == Pane::Detail {
+                        let distance = (self.detail_viewport_height / 2).max(1) as isize;
+                        if self.detail_rows().is_empty() {
+                            self.scroll_detail(-distance);
+                        } else {
+                            self.move_detail_selection(-distance);
+                        }
+                    } else {
+                        self.move_selection(-((self.viewport_height / 2).max(1) as isize));
+                    }
                     Intent::None
                 }
                 _ => Intent::None,
@@ -777,7 +1099,11 @@ impl App {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.pane == Pane::Detail {
-                    self.scroll_detail(1);
+                    if self.detail_rows().is_empty() {
+                        self.scroll_detail(1);
+                    } else {
+                        self.move_detail_selection(1);
+                    }
                     Intent::None
                 } else {
                     self.move_and_continue(1)
@@ -785,20 +1111,41 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if self.pane == Pane::Detail {
-                    self.scroll_detail(-1);
+                    if self.detail_rows().is_empty() {
+                        self.scroll_detail(-1);
+                    } else {
+                        self.move_detail_selection(-1);
+                    }
                     Intent::None
                 } else {
                     self.move_and_continue(-1)
                 }
             }
             KeyCode::Char('g') => {
-                self.select_index(0);
+                if self.pane == Pane::Detail {
+                    if self.detail_rows().is_empty() {
+                        self.detail_scroll = 0;
+                    } else {
+                        self.select_detail_index(0);
+                    }
+                } else {
+                    self.select_index(0);
+                }
                 Intent::None
             }
             KeyCode::Char('G') => {
-                let length = self.visible_rows().len();
-                if length > 0 {
-                    self.select_index(length - 1);
+                if self.pane == Pane::Detail {
+                    let detail_rows = self.detail_rows();
+                    if detail_rows.is_empty() {
+                        self.detail_scroll = self.detail_max_scroll;
+                    } else {
+                        self.select_detail_index(detail_rows.len() - 1);
+                    }
+                } else {
+                    let length = self.visible_rows().len();
+                    if length > 0 {
+                        self.select_index(length - 1);
+                    }
                 }
                 Intent::None
             }
@@ -821,7 +1168,13 @@ impl App {
             }
             KeyCode::Char('q') => Intent::Cancel,
             KeyCode::Char(character) => self.direct_action(character),
-            KeyCode::Enter => self.accept_or_toggle(),
+            KeyCode::Enter => {
+                if self.pane == Pane::Detail {
+                    self.open_selected_detail()
+                } else {
+                    self.accept_or_toggle()
+                }
+            }
             KeyCode::Esc => Intent::Cancel,
             _ => Intent::None,
         }
@@ -1155,6 +1508,7 @@ impl App {
                 }
             }
         }
+        self.reconcile_detail_selection();
         true
     }
 
@@ -1272,6 +1626,7 @@ impl App {
             })
             .or_else(|| current_rows.first().map(|row| row.id().clone()));
             self.detail_scroll = 0;
+            self.detail_selected = None;
         }
         self.ensure_selected_in_view();
     }
@@ -1289,6 +1644,71 @@ impl App {
     pub fn set_detail_max_scroll(&mut self, max_scroll: usize) {
         self.detail_max_scroll = max_scroll;
         self.detail_scroll = self.detail_scroll.min(max_scroll);
+    }
+
+    pub fn set_detail_viewport_height(&mut self, height: usize) {
+        self.detail_viewport_height = height.max(1);
+        self.reconcile_detail_selection();
+    }
+
+    pub fn set_detail_scroll(&mut self, scroll: usize) {
+        self.detail_scroll = scroll;
+    }
+
+    fn reconcile_detail_selection(&mut self) {
+        let rows = self.detail_rows();
+        if rows.is_empty() {
+            self.detail_selected = None;
+            return;
+        }
+        let previous_index = self
+            .detail_selected
+            .as_ref()
+            .and_then(|selected| rows.iter().position(|row| &row.id == selected));
+        if previous_index.is_some() {
+            return;
+        }
+        let fallback = self.detail_selected.as_ref().map_or(0, |selected| {
+            rows.iter()
+                .position(|row| row.id > *selected)
+                .unwrap_or_else(|| rows.len().saturating_sub(1))
+        });
+        self.detail_selected = rows.get(fallback).map(|row| row.id.clone());
+        self.detail_scroll = self.detail_scroll.min(fallback);
+    }
+
+    fn move_detail_selection(&mut self, delta: isize) {
+        let rows = self.detail_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let current = self
+            .detail_selected
+            .as_ref()
+            .and_then(|selected| rows.iter().position(|row| &row.id == selected))
+            .unwrap_or(0);
+        let next = (current as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
+        self.detail_selected = Some(rows[next].id.clone());
+    }
+
+    fn select_detail_index(&mut self, index: usize) {
+        if let Some(row) = self.detail_rows().get(index) {
+            self.detail_selected = Some(row.id.clone());
+        }
+    }
+
+    fn open_selected_detail(&mut self) -> Intent {
+        let rows = self.detail_rows();
+        if rows.is_empty() {
+            return Intent::None;
+        }
+        let row = self
+            .detail_selected
+            .as_ref()
+            .and_then(|selected| rows.iter().find(|row| &row.id == selected))
+            .or_else(|| rows.first());
+        row.map(|row| Intent::OpenUrl(row.url.clone()))
+            .unwrap_or(Intent::None)
     }
 
     fn direct_action(&mut self, character: char) -> Intent {
@@ -1368,6 +1788,7 @@ impl App {
             self.repositories[repository_index].expanded = false;
             self.selected = Some(self.repositories[repository_index].id());
             self.detail_scroll = 0;
+            self.detail_selected = None;
             self.ensure_selected_in_view();
         } else if let Some(row) = self.selected_row() {
             match row {
@@ -1392,6 +1813,7 @@ impl App {
                 VisibleRow::Repository { .. } | VisibleRow::Worktree { .. } => return,
             }
             self.detail_scroll = 0;
+            self.detail_selected = None;
             self.ensure_selected_in_view();
         }
     }
@@ -1409,6 +1831,7 @@ impl App {
             self.virtual_repositories[virtual_repository_index].expanded = true;
         } else {
             self.pane = Pane::Detail;
+            self.reconcile_detail_selection();
         }
     }
 
@@ -1432,6 +1855,7 @@ impl App {
         let next_id = rows[next].id().clone();
         if self.selected.as_ref() != Some(&next_id) {
             self.detail_scroll = 0;
+            self.detail_selected = None;
         }
         self.selected = Some(next_id);
         self.ensure_selected_in_view();
@@ -1447,6 +1871,7 @@ impl App {
             let id = row.id().clone();
             if self.selected.as_ref() != Some(&id) {
                 self.detail_scroll = 0;
+                self.detail_selected = None;
             }
             self.selected = Some(id);
             self.ensure_selected_in_view();
@@ -1487,6 +1912,7 @@ impl App {
         }
         if self.selected != previous {
             self.detail_scroll = 0;
+            self.detail_selected = None;
         }
         self.ensure_selected_in_view();
     }
@@ -1813,6 +2239,29 @@ fn pull_request_details_search_text(details: &PullRequestDetails) -> String {
     }));
     parts.push(format!("{:?}", details.merge_conflict));
     parts.join(" ")
+}
+
+fn check_attention_rank(state: crate::model::CheckState) -> u8 {
+    match state {
+        crate::model::CheckState::Failure | crate::model::CheckState::Error => 0,
+        crate::model::CheckState::Pending | crate::model::CheckState::Expected => 1,
+        crate::model::CheckState::Unknown => 2,
+        crate::model::CheckState::Success
+        | crate::model::CheckState::Neutral
+        | crate::model::CheckState::Skipped => 3,
+    }
+}
+
+fn debug_label(value: impl std::fmt::Debug) -> String {
+    let raw = format!("{value:?}");
+    let mut label = String::new();
+    for (index, character) in raw.chars().enumerate() {
+        if index > 0 && character.is_ascii_uppercase() {
+            label.push(' ');
+        }
+        label.push(character.to_ascii_lowercase());
+    }
+    label
 }
 
 fn contains_path(worktree: &Path, candidate: &Path) -> bool {
@@ -2325,6 +2774,137 @@ mod tests {
     }
 
     #[test]
+    fn selectable_pr_details_navigate_sort_route_urls_and_reconcile() {
+        let authored = authored("team", "project", 42, "2026-01-01");
+        let identity = authored.identity.clone();
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: identity.repository.clone(),
+            mapped_repository: None,
+            expanded: true,
+            pull_requests: vec![authored.clone()],
+        }];
+        app.selected = Some(RowId::VirtualPullRequest(identity.clone()));
+        let check = |name: &str, state, order, url: Option<&str>| crate::model::PullRequestCheck {
+            name: name.to_owned(),
+            state,
+            target_url: url.map(str::to_owned),
+            required: true,
+            source_order: order,
+            completed_at: None,
+        };
+        let feedback_id = "feedback".to_owned();
+        app.pull_request_details.insert(
+            identity.clone(),
+            PullRequestDetails {
+                checks: vec![
+                    check("success", crate::model::CheckState::Success, 0, None),
+                    check(
+                        "failure",
+                        crate::model::CheckState::Failure,
+                        1,
+                        Some("https://checks/failure"),
+                    ),
+                    check("pending", crate::model::CheckState::Pending, 2, None),
+                ],
+                check_contexts_complete: true,
+                reviews_complete: true,
+                feedback: vec![crate::model::PullRequestFeedback {
+                    id: feedback_id.clone(),
+                    database_id: Some(7),
+                    thread_id: Some("thread".to_owned()),
+                    kind: crate::model::FeedbackKind::InlineThread,
+                    author: "reviewer".to_owned(),
+                    body: "line one\n line two".to_owned(),
+                    path: Some("src/lib.rs".to_owned()),
+                    permalink: Some("https://comments/7".to_owned()),
+                    outdated: false,
+                }],
+                feedback_complete: true,
+                ..PullRequestDetails::default()
+            },
+        );
+
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.pane, Pane::Detail);
+        assert!(matches!(app.detail_selected, Some(DetailRowId::Summary(_))));
+        app.authored_pull_requests.loading = true;
+        assert!(
+            app.detail_rows()[0]
+                .lines
+                .iter()
+                .any(|line| line == "GitHub: refreshing")
+        );
+        app.authored_pull_requests.loading = false;
+        app.set_detail_viewport_height(4);
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(!matches!(
+            app.detail_selected,
+            Some(DetailRowId::Summary(_))
+        ));
+        app.handle_key(key(KeyCode::Char('g')));
+        let rows = app.detail_rows();
+        let check_names: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match &row.id {
+                DetailRowId::Check(_, name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(check_names, vec!["failure", "pending", "success"]);
+
+        app.detail_selected = Some(DetailRowId::Check(identity.clone(), "failure".to_owned()));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Intent::OpenUrl("https://checks/failure".to_owned())
+        );
+        app.detail_selected = Some(DetailRowId::Check(identity.clone(), "success".to_owned()));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Intent::OpenUrl(authored.pull_request.url.clone())
+        );
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Intent::OpenUrl("https://comments/7".to_owned())
+        );
+
+        let generation = app.github_generation;
+        app.apply_pull_request_details(
+            generation,
+            BTreeMap::from([(
+                identity.clone(),
+                Ok(PullRequestDetails {
+                    check_contexts_complete: true,
+                    reviews_complete: true,
+                    feedback_complete: true,
+                    ..PullRequestDetails::default()
+                }),
+            )]),
+        );
+        assert!(
+            app.detail_selected
+                .as_ref()
+                .is_some_and(|selected| app.detail_rows().iter().any(|row| &row.id == selected))
+        );
+        assert!(app.detail_rows().iter().any(|row| {
+            matches!(row.id, DetailRowId::Section(_, DetailSection::Checks))
+                && row.lines[0].contains("none or unavailable")
+        }));
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.pane, Pane::List);
+    }
+
+    #[test]
+    fn enter_in_non_pr_details_never_accepts_the_worktree() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
+        app.pane = Pane::Detail;
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Intent::None);
+    }
+
+    #[test]
     fn refreshes_coalesce_and_stale_generations_are_rejected() {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         let paths = vec![PathBuf::from("/repo"), PathBuf::from("/repo-topic")];
@@ -2490,6 +3070,14 @@ mod tests {
                 |row| matches!(row, VisibleRow::Worktree { id: RowId::Worktree(found), .. } if found == &path)
             ));
         }
+        app.filter.clear();
+        app.selected = Some(RowId::Worktree(path));
+        assert!(
+            app.detail_rows()[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("local path: /repo-topic"))
+        );
     }
 
     #[test]

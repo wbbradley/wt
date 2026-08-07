@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{App, GitHubState, Modal, Pane, StatusState, VisibleRow};
+use crate::app::{App, DetailRowId, GitHubState, Modal, Pane, StatusState, VisibleRow};
 use crate::model::{
     CheckRollup, MergeConflictState, PullRequestDetails, PullRequestState, RequiredCheckReadiness,
     ReviewReadiness,
@@ -349,6 +349,11 @@ fn truncate_label(label: &str, width: usize) -> String {
 }
 
 fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let detail_rows = app.detail_rows();
+    if !detail_rows.is_empty() {
+        render_selectable_pr_detail(frame, app, area, detail_rows);
+        return;
+    }
     let mut lines = Vec::new();
     if let Some((repository, authored)) = app.selected_virtual_pull_request() {
         let pull_request = &authored.pull_request;
@@ -549,6 +554,97 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.set_detail_max_scroll(line_count.saturating_sub(inner.height as usize));
     let paragraph = paragraph.scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, area);
+}
+
+fn render_selectable_pr_detail(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    area: Rect,
+    rows: Vec<crate::app::DetailRow>,
+) {
+    let block = Block::default()
+        .title(" Details · Enter opens selected item ")
+        .borders(Borders::ALL)
+        .border_style(if app.pane == Pane::Detail {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        });
+    let inner = block.inner(area);
+    app.set_detail_viewport_height(inner.height as usize);
+    let width = inner.width.saturating_sub(2).max(1) as usize;
+    let items: Vec<ListItem<'_>> = rows
+        .iter()
+        .map(|row| {
+            let section = matches!(row.id, DetailRowId::Section(_, _));
+            let mut lines = Vec::new();
+            for (line_index, text) in row.lines.iter().enumerate() {
+                for wrapped in wrap_detail_text(text, width) {
+                    lines.push(Line::styled(
+                        if line_index == 0 {
+                            wrapped
+                        } else {
+                            format!("  {wrapped}")
+                        },
+                        if section {
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                        },
+                    ));
+                }
+            }
+            ListItem::new(Text::from(lines))
+        })
+        .collect();
+    let selected = app
+        .detail_selected
+        .as_ref()
+        .and_then(|selected| rows.iter().position(|row| &row.id == selected))
+        .or(Some(0));
+    let mut state = ListState::default()
+        .with_selected(selected)
+        .with_offset(app.detail_scroll);
+    let list = List::new(items)
+        .block(block)
+        .highlight_symbol("▶ ")
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(45, 55, 72))
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_stateful_widget(list, area, &mut state);
+    app.set_detail_scroll(state.offset());
+}
+
+fn wrap_detail_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if word.chars().count() > width && current.is_empty() {
+            let chars: Vec<_> = word.chars().collect();
+            for chunk in chars.chunks(width.max(1)) {
+                lines.push(chunk.iter().collect());
+            }
+            continue;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
@@ -1074,7 +1170,7 @@ mod tests {
             },
         );
         app.selected = Some(RowId::VirtualPullRequest(pull_request_id));
-        let mut terminal = Terminal::new(TestBackend::new(120, 50)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 70)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
@@ -1099,14 +1195,16 @@ mod tests {
         assert!(red.contains("F1"));
         assert!(red.contains('X'));
         assert!(!row.contains("auto-merge"));
-        assert!(
-            content
-                .contains("viewer/fork:feature/compact-attention-indicators-with-a-very-long-name")
-        );
+        assert!(content.contains("head: viewer/fork:"));
         assert!(content.contains("head-sha"));
-        assert!(content.contains("CHANGES_REQUESTED"));
-        assert!(content.contains("auto-merge enabled"));
-        assert!(content.contains("Enter to create worktree"));
+        assert!(content.contains("changes requested"));
+        assert!(content.contains("auto-merge: enabled"));
+        assert!(content.contains("Enter opens selected item"));
+        assert!(content.contains("Attention · checks ready"));
+        assert!(content.contains("Checks · 2"));
+        assert!(content.contains("Reviews · 0 requested · 1 submitted"));
+        assert!(content.contains("Feedback · 1"));
+        assert!(content.contains("fix this"));
 
         let mut narrow_terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
         narrow_terminal
