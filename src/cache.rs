@@ -12,7 +12,9 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::github::{GitHubRefresh, RepositoryGitHubInput};
-use crate::model::{AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData};
+use crate::model::{
+    AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, PullRequestDetails,
+};
 
 #[cfg(not(test))]
 pub const CACHE_PATH_ENV: &str = "WT_CACHE_PATH";
@@ -26,6 +28,12 @@ pub struct CachedBranch {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CachedPullRequestDetails {
+    pub identity: CanonicalPullRequestId,
+    pub details: PullRequestDetails,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RemoteCache {
     pub version: u32,
     #[serde(default)]
@@ -36,6 +44,8 @@ pub struct RemoteCache {
     pub authored_pull_requests: Vec<AuthoredPullRequest>,
     #[serde(default)]
     pub active_pull_requests: Vec<CanonicalPullRequestId>,
+    #[serde(default)]
+    pub pull_request_details: Vec<CachedPullRequestDetails>,
 }
 
 impl Default for RemoteCache {
@@ -46,6 +56,7 @@ impl Default for RemoteCache {
             branches: Vec::new(),
             authored_pull_requests: Vec::new(),
             active_pull_requests: Vec::new(),
+            pull_request_details: Vec::new(),
         }
     }
 }
@@ -115,6 +126,30 @@ impl RemoteCache {
             unique.insert(pull_request.identity.clone(), pull_request);
         }
         self.authored_pull_requests = unique.into_values().collect();
+        self.updated_at_epoch_seconds = epoch_seconds();
+    }
+
+    pub fn merge_pull_request_details(
+        &mut self,
+        refreshed: &BTreeMap<
+            CanonicalPullRequestId,
+            Result<PullRequestDetails, crate::github::GitHubError>,
+        >,
+    ) {
+        let mut details: BTreeMap<_, _> = self
+            .pull_request_details
+            .drain(..)
+            .map(|cached| (cached.identity, cached.details))
+            .collect();
+        for (identity, result) in refreshed {
+            if let Ok(result) = result {
+                details.insert(identity.clone(), result.clone());
+            }
+        }
+        self.pull_request_details = details
+            .into_iter()
+            .map(|(identity, details)| CachedPullRequestDetails { identity, details })
+            .collect();
         self.updated_at_epoch_seconds = epoch_seconds();
     }
 
@@ -422,6 +457,53 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn canonical_details_round_trip_and_failed_refresh_retains_stale_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("github.json");
+        let identity = authored(1).identity;
+        let details = PullRequestDetails {
+            check_contexts_complete: true,
+            reviews_complete: true,
+            feedback_complete: true,
+            ..PullRequestDetails::default()
+        };
+        update(&path, |cache| {
+            cache.merge_pull_request_details(&BTreeMap::from([(
+                identity.clone(),
+                Ok(details.clone()),
+            )]));
+        })
+        .unwrap();
+        update(&path, |cache| {
+            cache.merge_pull_request_details(&BTreeMap::from([(
+                identity.clone(),
+                Err(crate::github::GitHubError::Network("offline".to_owned())),
+            )]));
+        })
+        .unwrap();
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.pull_request_details.len(), 1);
+        assert_eq!(loaded.pull_request_details[0].identity, identity);
+        assert_eq!(loaded.pull_request_details[0].details, details);
+    }
+
+    #[test]
+    fn legacy_cache_without_detail_field_remains_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("github.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"branches":[],"authored_pull_requests":[],"active_pull_requests":[]}"#,
+        )
+        .unwrap();
+
+        let loaded = load(&path).unwrap();
+
+        assert!(loaded.pull_request_details.is_empty());
     }
 
     #[test]
