@@ -72,18 +72,17 @@ Direct action shortcuts:
 
 Forms show the exact operation inputs before a separate confirmation. Disabled palette actions explain why they are unavailable.
 
-Authored pull requests appear once under their canonical base `owner/repository`. A grey `[no local repo]` marker means the base repository is not yet registered, and `V` means no ordinary local worktree represents that PR. Enter materializes a virtual row; ordinary worktree actions and direct selectors never create PR worktrees.
+Authored pull requests appear once under their canonical base `owner/repository`. A yellow `[no local repo]` marker means the base repository is not yet registered, and `virtual-only` means no ordinary local worktree represents that PR. Enter materializes a virtual row; ordinary worktree actions and direct selectors never create PR worktrees.
 
-PR rows stay compact enough for an 80-column terminal. A typical local row looks like `feature/login #42 C✓ R… F2 D1`; a virtual draft might look like `feature/api #51 draft C? R? X? V`. Titles, full paths, and commit SHAs stay in Details, but `/` filtering still searches them as well as check names, reviewers, and feedback text.
+Tree rows use plain-language, color-coded status labels and wrap beneath the branch when needed. A typical local row might read `feature/login · PR #42 · auto-merge off · checks passed · review pending · 2 unresolved comments · 1 local change`; a virtual draft might read `feature/api · PR #51 · draft · auto-merge on · checks unknown · review unknown · conflicts unknown · virtual-only`. Titles, full paths, and commit SHAs stay in Details, but `/` filtering still searches them as well as check names, reviewers, and feedback text.
 
-Compact status legend:
+Tree status language:
 
-- `C✓`/`C✗`/`C…`/`C?`: required checks ready, failed, waiting, or unknown. Only required failures make `C` red.
-- `O!N`: `N` failed/error optional checks. They are actionable but do not make required-check readiness fail.
-- `R✓`/`R✗`/`R…`/`R?`: approved, changes requested, review requested/waiting, or unknown.
-- `FN`: `N` unresolved inline-feedback items; `X` is a merge conflict and `X?` means conflict state is unavailable.
-- `draft`, `merged`, and `closed` show non-open PR state; `D<N>` is a dirty local worktree, `L` is locked, `P` is prunable, and `V` is virtual-only.
-- `↻` means GitHub data is refreshing and `stale` means the last usable snapshot is retained after an error. Red PR numbers have actionable attention; yellow waiting indicators alone are not actionable.
+- Checks read `checks passed`, `checks failed`, `checks pending`, or `checks unknown`. Optional failures are counted separately because they are actionable but do not make required-check readiness fail.
+- Reviews read `review approved`, `changes requested`, `review pending`, or `review unknown`; unresolved feedback is shown as a comment count.
+- Conflict state is always explicit: `no conflicts`, `conflicts present`, or `conflicts unknown`. Every PR also shows `auto-merge on` or `auto-merge off`.
+- `draft`, `merged`, and `closed` show non-open PR state. Local state uses full labels such as `3 local changes`, `locked`, `prunable`, and `current`.
+- `GitHub refreshing` means remote data is loading, and `GitHub stale` means the last usable snapshot is retained after an error. Red PR numbers have actionable attention; yellow waiting indicators alone are not actionable.
 
 Press `n` on a repository or one of its worktrees for the common new-worktree flow. The form pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk branch. The new local branch tracks that remote branch; after creation `wt` caches the worktree, exits, and changes the invoking shell into it.
 
@@ -99,7 +98,7 @@ PR: https://github.com/acme/web/pull/42
   URL: https://github.com/acme/web/actions/runs/123
 ```
 
-Press `b` on a PR to toggle its entire GitHub stack in Backburner. Local worktrees stay in their ordinary ancestry position, dimmed and marked `[backburner]`; virtual-only PRs move under a collapsed Backburner group in their canonical repository. Their Details and explicit `C` prompts remain available, but repository prompts and `[`/`]` attention navigation skip them. Membership survives refreshes and virtual-to-local materialization because it is stored by host-aware canonical PR ID in `$XDG_STATE_HOME/wt/state.json` (normally `~/.local/state/wt/state.json`). Set `WT_STATE_PATH` to override that location.
+Press `b` on a PR to toggle its entire GitHub stack in Backburner. Local worktrees stay in their ordinary ancestry position, dimmed and marked `backburner`; virtual-only PRs move under a collapsed Backburner group in their canonical repository. Their Details and explicit `C` prompts remain available, but repository prompts and `[`/`]` attention navigation skip them. Membership survives refreshes and virtual-to-local materialization because it is stored by host-aware canonical PR ID in `$XDG_STATE_HOME/wt/state.json` (normally `~/.local/state/wt/state.json`). Set `WT_STATE_PATH` to override that location.
 
 Local worktrees are nested by nearest commit ancestry. Local ancestry takes precedence over pull-request stack metadata, and each branch is rendered only once. Worktrees are always enumerated from each tracked repository's centralized `git worktree list --porcelain` data, including linked worktrees outside configured roots.
 
