@@ -10,6 +10,16 @@ use crate::model::{
     ReviewReadiness,
 };
 
+const ACCENT: Color = Color::Cyan;
+const BRANCH: Color = Color::LightBlue;
+const REMOTE: Color = Color::LightMagenta;
+const LINK: Color = Color::LightBlue;
+const SUCCESS: Color = Color::Green;
+const WARNING: Color = Color::Yellow;
+const DANGER: Color = Color::Red;
+const MUTED: Color = Color::DarkGray;
+const SELECTION: Color = Color::Rgb(45, 55, 72);
+
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let vertical = Layout::default()
@@ -22,9 +32,14 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .split(area);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" wt ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-            Span::raw(" global worktrees"),
-            Span::styled(header_progress(app), Style::default().fg(Color::Yellow)),
+            Span::styled(" wt ", Style::default().fg(Color::Black).bg(ACCENT)),
+            Span::styled(
+                " global worktrees",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(header_progress(app), Style::default().fg(WARNING)),
         ])),
         vertical[0],
     );
@@ -68,33 +83,38 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } => {
                 let repository = &app.repositories[*repository_index];
                 let arrow = if repository.expanded { "▾" } else { "▸" };
-                let state = [
-                    repository.is_bare().then_some("bare"),
-                    repository.session_only.then_some("session-only"),
-                    repository.stale_error.is_some().then_some(
+                let states = [
+                    repository.is_bare().then_some(("bare", BRANCH)),
+                    repository.session_only.then_some(("session-only", WARNING)),
+                    repository.stale_error.is_some().then_some((
                         if repository.config.path.exists() {
                             "invalid"
                         } else {
                             "stale"
                         },
-                    ),
+                        DANGER,
+                    )),
                 ]
                 .into_iter()
                 .flatten()
-                .map(|state| format!(" [{state}]"))
-                .collect::<String>();
+                .collect::<Vec<_>>();
+                let state_width = states
+                    .iter()
+                    .map(|(state, _)| state.chars().count() + 3)
+                    .sum::<usize>();
                 let available = area.width.saturating_sub(7) as usize;
                 let label = truncate_label(
                     &repository.config.display_label(),
-                    available.saturating_sub(state.chars().count()),
+                    available.saturating_sub(state_width),
                 );
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{arrow} {label}"),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(state, Style::default().fg(Color::Yellow)),
-                ]))
+                let mut spans = vec![Span::styled(
+                    format!("{arrow} {label}"),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )];
+                spans.extend(states.into_iter().map(|(state, color)| {
+                    Span::styled(format!(" [{state}]"), Style::default().fg(color))
+                }));
+                ListItem::new(Line::from(spans))
             }
             VisibleRow::Worktree {
                 repository_index,
@@ -150,9 +170,12 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             " ".repeat(stack_depth * 2),
                             if current { "  ● " } else { "    " }
                         ),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(SUCCESS),
                     ),
-                    Span::raw(truncate_label(&identity, label_width)),
+                    Span::styled(
+                        truncate_label(&identity, label_width),
+                        Style::default().fg(BRANCH),
+                    ),
                 ];
                 spans.extend(suffix);
                 if backburnered {
@@ -180,9 +203,9 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("  {arrow} {label}"),
-                        Style::default().add_modifier(Modifier::BOLD),
+                        Style::default().fg(REMOTE).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(marker, Style::default().fg(Color::DarkGray)),
+                    Span::styled(marker, Style::default().fg(WARNING)),
                 ]))
             }
             VisibleRow::VirtualPullRequest {
@@ -216,7 +239,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     Span::raw(" ".repeat(indent)),
                     Span::styled(
                         truncate_label(&pull_request.pull_request.head.branch, label_width),
-                        Style::default().fg(Color::LightMagenta),
+                        Style::default().fg(REMOTE),
                     ),
                 ];
                 spans.extend(suffix);
@@ -235,9 +258,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let expanded = app.backburner_expanded.contains(&repository.identity);
                 ListItem::new(Line::styled(
                     format!("    {} Backburner", if expanded { "▾" } else { "▸" }),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
                 ))
             }
         })
@@ -251,11 +272,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .with_offset(app.scroll);
     let list = List::new(items)
         .block(list_block(app))
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(45, 55, 72))
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(Style::default().bg(SELECTION).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -265,7 +282,7 @@ fn list_block(app: &App) -> Block<'static> {
         .title(" Repositories / Worktrees / Authored PRs ")
         .borders(Borders::ALL)
         .border_style(if app.pane == Pane::List {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(ACCENT)
         } else {
             Style::default()
         })
@@ -279,9 +296,9 @@ fn compact_pull_request_spans(
 ) -> Vec<Span<'static>> {
     let summary = details.map(PullRequestDetails::attention_summary);
     let number_style = if !backburnered && summary.is_some_and(|summary| summary.is_actionable()) {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
+        Style::default().fg(BRANCH)
     };
     let mut spans = vec![Span::styled(
         format!(" #{}", pull_request.number),
@@ -460,15 +477,10 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         lines.push(field("URL", pull_request.url.clone()));
         lines.push(Line::styled(
             "Enter to create worktree",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ));
     } else if let Some((repository, worktree, _)) = app.selected_worktree() {
-        lines.push(Line::from(vec![
-            Span::styled("repository  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(repository.config.display_label()),
-        ]));
+        lines.push(field("repository", repository.config.display_label()));
         lines.push(field(
             "anchor",
             repository.config.path.display().to_string(),
@@ -501,10 +513,12 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ));
                 lines.push(field("local", status.summary()));
             }
-            Some(StatusState::Pending) => lines.push(Line::from("local       loading…")),
+            Some(StatusState::Pending) => {
+                lines.push(styled_field("local", "loading…".to_owned(), WARNING))
+            }
             Some(StatusState::Error(error)) => lines.push(Line::styled(
                 format!("status error {error}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(DANGER),
             )),
             None => {}
         }
@@ -519,7 +533,7 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Some(GitHubState::Stale { previous, error }) => {
                 lines.push(Line::styled(
                     format!("GitHub stale: {error}"),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(WARNING),
                 ));
                 if let Some(data) = previous {
                     append_github_details(&mut lines, data);
@@ -551,7 +565,7 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         "stale"
                     }
                 ),
-                Style::default().fg(Color::Red),
+                Style::default().fg(DANGER),
             ));
         }
     } else if let Some(VisibleRow::VirtualRepository {
@@ -575,13 +589,16 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             repository.pull_requests.len().to_string(),
         ));
     } else {
-        lines.push(Line::from("Select a repository or worktree."));
+        lines.push(Line::styled(
+            "Select a repository or worktree.",
+            Style::default().fg(MUTED),
+        ));
     }
     let block = Block::default()
         .title(" Details ")
         .borders(Borders::ALL)
         .border_style(if app.pane == Pane::Detail {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(ACCENT)
         } else {
             Style::default()
         });
@@ -605,7 +622,7 @@ fn render_selectable_pr_detail(
         .title(" Details · Enter/w opens selected item ")
         .borders(Borders::ALL)
         .border_style(if app.pane == Pane::Detail {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(ACCENT)
         } else {
             Style::default()
         });
@@ -626,11 +643,9 @@ fn render_selectable_pr_detail(
                             format!("  {wrapped}")
                         },
                         if section {
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD)
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default()
+                            detail_row_style(&row.id, line_index, text)
                         },
                     ));
                 }
@@ -649,11 +664,7 @@ fn render_selectable_pr_detail(
     let list = List::new(items)
         .block(block)
         .highlight_symbol("▶ ")
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(45, 55, 72))
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(Style::default().bg(SELECTION).add_modifier(Modifier::BOLD));
     frame.render_stateful_widget(list, area, &mut state);
     app.set_detail_scroll(state.offset());
 }
@@ -694,37 +705,169 @@ fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
         .sum()
 }
 
+fn detail_row_style(id: &DetailRowId, line_index: usize, text: &str) -> Style {
+    if text.starts_with("URL:") || text.contains("permalink http") {
+        return Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED);
+    }
+    let lower = text.to_ascii_lowercase();
+    match id {
+        DetailRowId::Summary(_) => semantic_text_style(&lower),
+        DetailRowId::Section(_, _) => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        DetailRowId::Check(_, _) if line_index == 0 => status_text_style(&lower),
+        DetailRowId::Check(_, _) => Style::default(),
+        DetailRowId::ReviewRequest(_, _) => Style::default().fg(WARNING),
+        DetailRowId::Review(_, _) => status_text_style(&lower),
+        DetailRowId::Feedback(_, _) if line_index == 0 => {
+            if lower.contains(" · outdated") {
+                Style::default().fg(DANGER)
+            } else {
+                Style::default().fg(REMOTE)
+            }
+        }
+        DetailRowId::Feedback(_, _) => Style::default(),
+    }
+}
+
+fn semantic_text_style(text: &str) -> Style {
+    if text.starts_with("title:") {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if text.starts_with("url:") {
+        Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED)
+    } else if text.starts_with("local repo:")
+        && (text.contains("none") || text.contains("no local repo"))
+    {
+        Style::default().fg(WARNING)
+    } else if text.starts_with("repository:") || text.starts_with("local repo:") {
+        Style::default().fg(REMOTE)
+    } else if text.starts_with("base:") || text.starts_with("head:") {
+        Style::default().fg(BRANCH)
+    } else if text.starts_with("head sha:") {
+        Style::default().fg(MUTED)
+    } else if text.starts_with("warning:") {
+        Style::default().fg(WARNING)
+    } else if text.starts_with("details stale:") {
+        Style::default().fg(DANGER)
+    } else if text.starts_with("attention details:") {
+        Style::default().fg(MUTED)
+    } else {
+        status_text_style(text)
+    }
+}
+
+fn status_text_style(text: &str) -> Style {
+    if [
+        "failure",
+        "error",
+        "changes requested",
+        "changes_requested",
+        "conflicting",
+        "cancelled",
+        "timed out",
+    ]
+    .iter()
+    .any(|status| text.contains(status))
+    {
+        Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+    } else if [
+        "pending",
+        "expected",
+        "queued",
+        "in progress",
+        "requested:",
+        "waiting",
+    ]
+    .iter()
+    .any(|status| text.contains(status))
+    {
+        Style::default().fg(WARNING)
+    } else if [
+        "success", "approved", "clean", "merged", "enabled", "open", "neutral", "skipped",
+    ]
+    .iter()
+    .any(|status| text.contains(status))
+    {
+        Style::default().fg(SUCCESS)
+    } else if text.contains("draft") {
+        Style::default().fg(BRANCH)
+    } else if text.contains("unknown")
+        || text.contains("unavailable")
+        || text.contains("off")
+        || text.contains("dismissed")
+        || text.contains("closed")
+        || text.contains("not checked")
+    {
+        Style::default().fg(MUTED)
+    } else {
+        Style::default()
+    }
+}
+
+fn shortcut_line(shortcuts: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, (key, description)) in shortcuts.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            (*key).to_owned(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {description}"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let top = if app.filter_active {
-        format!("/{}█", app.filter)
-    } else if !app.filter.is_empty() {
-        format!("filter: {}", app.filter)
-    } else {
-        "j/k move  [/] attention  h/l panes  / filter  r refresh  ? actions  Enter select/create"
-            .to_owned()
-    };
-    let bottom = app
-        .inline_error
-        .as_ref()
-        .map(|error| format!("error: {error}"))
-        .unwrap_or_else(|| {
-            "w web  C prompt  b Backburner  c create  m move  L/U lock  d remove  q/Esc cancel"
-                .to_owned()
-        });
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::raw(top),
-            Line::styled(
-                bottom,
-                Style::default().fg(if app.inline_error.is_some() {
-                    Color::Red
-                } else {
-                    Color::DarkGray
-                }),
+        Line::from(vec![
+            Span::styled(
+                "/",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-        ]),
-        area,
+            Span::styled(format!("{}█", app.filter), Style::default().fg(WARNING)),
+        ])
+    } else if !app.filter.is_empty() {
+        Line::from(vec![
+            Span::styled("filter: ", Style::default().fg(MUTED)),
+            Span::styled(app.filter.clone(), Style::default().fg(WARNING)),
+        ])
+    } else {
+        shortcut_line(&[
+            ("j/k", "move"),
+            ("[/]", "attention"),
+            ("h/l", "panes"),
+            ("/", "filter"),
+            ("r", "refresh"),
+            ("?", "actions"),
+            ("Enter", "select/create"),
+        ])
+    };
+    let bottom = app.inline_error.as_ref().map_or_else(
+        || {
+            shortcut_line(&[
+                ("w", "web"),
+                ("C", "prompt"),
+                ("b", "Backburner"),
+                ("c", "create"),
+                ("m", "move"),
+                ("L/U", "lock"),
+                ("d", "remove"),
+                ("q/Esc", "cancel"),
+            ])
+        },
+        |error| {
+            Line::styled(
+                format!("error: {error}"),
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            )
+        },
     );
+    frame.render_widget(Paragraph::new(vec![top, bottom]), area);
 }
 
 fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
@@ -740,24 +883,27 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
                         .reason
                         .map(|reason| format!(" — {reason}"))
                         .unwrap_or_default();
-                    ListItem::new(format!(
-                        "[{}] {}{}",
-                        action.shortcut(),
-                        action.label(),
-                        suffix
-                    ))
-                    .style(if availability.enabled {
+                    let style = if availability.enabled {
                         Style::default()
                     } else {
-                        Style::default().fg(Color::DarkGray)
-                    })
+                        Style::default().fg(MUTED).add_modifier(Modifier::DIM)
+                    };
+                    let shortcut_style = if availability.enabled {
+                        Style::default().fg(ACCENT)
+                    } else {
+                        style
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("[{}]", action.shortcut()), shortcut_style),
+                        Span::styled(format!(" {}{suffix}", action.label()), style),
+                    ]))
                 })
                 .collect();
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(
                 List::new(items)
                     .block(Block::default().title(" Actions ").borders(Borders::ALL))
-                    .highlight_style(Style::default().bg(Color::Blue)),
+                    .highlight_style(Style::default().bg(SELECTION).add_modifier(Modifier::BOLD)),
                 popup,
                 &mut state,
             );
@@ -782,7 +928,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
                 ]));
                 lines.push(Line::styled(
                     format!("Path: {}", display_path(&repository.config.path)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(MUTED),
                 ));
                 lines.push(Line::raw(""));
             }
@@ -795,7 +941,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
                         if index == *active { "█" } else { "" }
                     ),
                     if index == *active {
-                        Style::default().fg(Color::Cyan)
+                        Style::default().fg(ACCENT)
                     } else {
                         Style::default()
                     },
@@ -808,7 +954,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
                     format!("error: {error}"),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(DANGER),
                 ));
             }
             frame.render_widget(
@@ -828,14 +974,14 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
             lines.push(Line::raw(""));
             lines.push(Line::styled(
                 "Enter/y confirms · n/Esc cancels",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(WARNING),
             ));
             frame.render_widget(
                 Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                     Block::default()
                         .title(format!(" Confirm {} ", action.label()))
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow)),
+                        .border_style(Style::default().fg(WARNING)),
                 ),
                 popup,
             );
@@ -844,17 +990,57 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
 }
 
 fn field(label: &str, value: String) -> Line<'static> {
+    let value_style = field_value_style(label, &value);
     Line::from(vec![
-        Span::styled(format!("{label:<11}"), Style::default().fg(Color::DarkGray)),
-        Span::raw(value),
+        Span::styled(format!("{label:<11}"), Style::default().fg(MUTED)),
+        Span::styled(value, value_style),
     ])
 }
 
 fn styled_field(label: &str, value: String, color: Color) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<11}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{label:<11}"), Style::default().fg(MUTED)),
         Span::styled(value, Style::default().fg(color)),
     ])
+}
+
+fn field_value_style(label: &str, value: &str) -> Style {
+    let label = label.to_ascii_lowercase();
+    let value = value.to_ascii_lowercase();
+    match label.as_str() {
+        "url" => Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED),
+        "branch" | "base" | "head" | "upstream" => Style::default().fg(BRANCH),
+        "repository" | "host" | "pr" | "pull request" => Style::default().fg(REMOTE),
+        "anchor" | "path" | "head sha" | "pr updated" | "rate limit" => Style::default().fg(MUTED),
+        "state" | "review" | "auto-merge" => status_text_style(&value),
+        "locked" | "prunable" => {
+            if value == "no" || value == "-" {
+                Style::default().fg(MUTED)
+            } else {
+                Style::default().fg(WARNING)
+            }
+        }
+        "catalog" => {
+            if value == "registered" {
+                Style::default().fg(SUCCESS)
+            } else {
+                Style::default().fg(WARNING)
+            }
+        }
+        "local repo" if value.contains("no local repo") || value.contains("none") => {
+            Style::default().fg(WARNING)
+        }
+        "local repo" => Style::default().fg(REMOTE),
+        "github" if value.contains("loading") => Style::default().fg(WARNING),
+        "local" => {
+            if value.starts_with("0 staged, 0 modified, 0 untracked") {
+                Style::default().fg(SUCCESS)
+            } else {
+                Style::default().fg(DANGER)
+            }
+        }
+        _ => Style::default(),
+    }
 }
 
 fn header_progress(app: &App) -> String {
@@ -1224,9 +1410,9 @@ mod tests {
         ));
         assert!(!row.contains("virtual feature"));
         assert!(!row.contains("head-sha"));
-        assert_eq!(
-            colored_text(buffer, Color::LightMagenta),
-            "feature/compact-attention-indicators-with-a-very-long-name"
+        assert!(
+            colored_text(buffer, Color::LightMagenta)
+                .contains("feature/compact-attention-indicators-with-a-very-long-name")
         );
         assert!(colored_text(buffer, Color::Green).contains("C✓"));
         assert!(colored_text(buffer, Color::LightRed).contains("O!1"));
@@ -1279,6 +1465,31 @@ mod tests {
         assert_eq!(check_color(CheckRollup::Failure), Color::Red);
         assert_eq!(check_color(CheckRollup::Error), Color::Red);
         assert_eq!(check_color(CheckRollup::Pending), Color::Yellow);
+    }
+
+    #[test]
+    fn semantic_palette_covers_navigation_identity_metadata_and_status() {
+        assert_eq!(
+            field_value_style("URL", "https://example.test").fg,
+            Some(LINK)
+        );
+        assert_eq!(
+            field_value_style("branch", "feature/colors").fg,
+            Some(BRANCH)
+        );
+        assert_eq!(
+            field_value_style("repository", "team/project").fg,
+            Some(REMOTE)
+        );
+        assert_eq!(field_value_style("path", "/tmp/project").fg, Some(MUTED));
+        assert_eq!(status_text_style("success").fg, Some(SUCCESS));
+        assert_eq!(status_text_style("pending").fg, Some(WARNING));
+        assert_eq!(status_text_style("failure").fg, Some(DANGER));
+        assert_eq!(status_text_style("unknown").fg, Some(MUTED));
+
+        let footer = shortcut_line(&[("j/k", "move")]);
+        assert_eq!(footer.spans[0].style.fg, Some(ACCENT));
+        assert_eq!(footer.spans[1].style.fg, Some(MUTED));
     }
 
     #[test]
