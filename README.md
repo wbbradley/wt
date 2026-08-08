@@ -54,6 +54,7 @@ Navigation keys:
 
 - `j`/`k` or arrows: move; `g`/`G`: first/last; `Ctrl-d`/`Ctrl-u`: half-page (tree rows or selectable Detail items according to focus)
 - `]`/`[`: next/previous actionable PR, wrapping and skipping Backburner
+- `Tab`: toggle between the tree and Details panes
 - `h`/`l` or left/right: collapse, expand, or switch panes; `h` always returns from Details to the tree
 - `/`: filter across repository, path, branch, status, PR, checks, review, warning, and error text
 - `r`: coalesced local and GitHub refresh

@@ -911,7 +911,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         shortcut_line(&[
             ("j/k", "move"),
             ("[/]", "attention"),
-            ("h/l", "panes"),
+            ("Tab", "pane"),
             ("/", "filter"),
             ("r", "refresh"),
             ("?", "actions"),
