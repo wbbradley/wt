@@ -690,7 +690,7 @@ fn render_selectable_pr_detail(
     rows: Vec<crate::app::DetailRow>,
 ) {
     let block = Block::default()
-        .title(" Details · Enter/w opens selected item ")
+        .title(" Details · h/l collapse/expand · Enter/w opens selected item ")
         .borders(Borders::ALL)
         .border_style(if app.pane == Pane::Detail {
             Style::default().fg(ACCENT)
@@ -699,29 +699,11 @@ fn render_selectable_pr_detail(
         });
     let inner = block.inner(area);
     app.set_detail_viewport_height(inner.height as usize);
-    let width = inner.width.saturating_sub(2).max(1) as usize;
     let items: Vec<ListItem<'_>> = rows
         .iter()
         .map(|row| {
-            let section = matches!(row.id, DetailRowId::Section(_, _));
-            let mut lines = Vec::new();
-            for (line_index, text) in row.lines.iter().enumerate() {
-                for wrapped in wrap_detail_text(text, width) {
-                    lines.push(Line::styled(
-                        if line_index == 0 {
-                            wrapped
-                        } else {
-                            format!("  {wrapped}")
-                        },
-                        if section {
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-                        } else {
-                            detail_row_style(&row.id, line_index, text)
-                        },
-                    ));
-                }
-            }
-            ListItem::new(Text::from(lines))
+            let text = row.lines.first().map(String::as_str).unwrap_or_default();
+            ListItem::new(Line::from(detail_row_spans(row, text)))
         })
         .collect();
     let selected = app
@@ -740,32 +722,62 @@ fn render_selectable_pr_detail(
     app.set_detail_scroll(state.offset());
 }
 
-fn wrap_detail_text(text: &str, width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
+fn detail_row_spans(row: &crate::app::DetailRow, text: &str) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        row.tree_prefix.clone(),
+        Style::default().fg(MUTED),
+    )];
+    if let Some(expanded) = row.expanded {
+        spans.push(Span::styled(
+            if expanded { "▾ " } else { "▸ " },
+            Style::default().fg(MUTED),
+        ));
     }
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
-            lines.push(std::mem::take(&mut current));
+    if matches!(row.id, DetailRowId::Section(_, _)) {
+        let (label, summary) = text.split_once(" · ").unwrap_or((text, ""));
+        spans.push(Span::styled(
+            label.to_owned(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        if !summary.is_empty() {
+            spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+            spans.push(Span::styled(
+                summary.to_owned(),
+                detail_section_summary_style(&row.id, summary),
+            ));
         }
-        if word.chars().count() > width && current.is_empty() {
-            let chars: Vec<_> = word.chars().collect();
-            for chunk in chars.chunks(width.max(1)) {
-                lines.push(chunk.iter().collect());
-            }
-            continue;
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
+        return spans;
     }
-    if !current.is_empty() {
-        lines.push(current);
+    let base_style = if text.starts_with("URL:") {
+        Style::default().fg(MUTED)
+    } else {
+        detail_row_style(&row.id, text)
+    };
+    spans.extend(url_spans(text, base_style));
+    spans
+}
+
+fn url_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let start = text.find("https://").or_else(|| text.find("http://"));
+    let Some(start) = start else {
+        return vec![Span::styled(text.to_owned(), base_style)];
+    };
+    let end = text[start..]
+        .find(char::is_whitespace)
+        .map(|offset| start + offset)
+        .unwrap_or(text.len());
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled(text[..start].to_owned(), base_style));
     }
-    lines
+    spans.push(Span::styled(
+        text[start..end].to_owned(),
+        Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED),
+    ));
+    if end < text.len() {
+        spans.push(Span::styled(text[end..].to_owned(), base_style));
+    }
+    spans
 }
 
 fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
@@ -776,26 +788,38 @@ fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
         .sum()
 }
 
-fn detail_row_style(id: &DetailRowId, line_index: usize, text: &str) -> Style {
-    if text.starts_with("URL:") || text.contains("permalink http") {
-        return Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED);
-    }
+fn detail_row_style(id: &DetailRowId, text: &str) -> Style {
     let lower = text.to_ascii_lowercase();
     match id {
-        DetailRowId::Summary(_) => semantic_text_style(&lower),
+        DetailRowId::Summary(_) => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
         DetailRowId::Section(_, _) => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        DetailRowId::Check(_, _) if line_index == 0 => status_text_style(&lower),
-        DetailRowId::Check(_, _) => Style::default(),
+        DetailRowId::Metadata(_, _) => semantic_text_style(&lower),
+        DetailRowId::Check(_, _) => status_text_style(&lower),
         DetailRowId::ReviewRequest(_, _) => Style::default().fg(WARNING),
         DetailRowId::Review(_, _) => status_text_style(&lower),
-        DetailRowId::Feedback(_, _) if line_index == 0 => {
+        DetailRowId::Feedback(_, _) => {
             if lower.contains(" · outdated") {
                 Style::default().fg(DANGER)
             } else {
                 Style::default().fg(REMOTE)
             }
         }
-        DetailRowId::Feedback(_, _) => Style::default(),
+    }
+}
+
+fn detail_section_summary_style(id: &DetailRowId, summary: &str) -> Style {
+    match id {
+        DetailRowId::Section(_, crate::app::DetailSection::Feedback) => {
+            if summary == "none" {
+                Style::default().fg(MUTED)
+            } else {
+                Style::default().fg(DANGER)
+            }
+        }
+        DetailRowId::Section(_, _) => status_text_style(&summary.to_ascii_lowercase()),
+        _ => Style::default(),
     }
 }
 
@@ -805,7 +829,7 @@ fn semantic_text_style(text: &str) -> Style {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
     } else if text.starts_with("url:") {
-        Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED)
+        Style::default().fg(MUTED)
     } else if text.starts_with("local repo:")
         && (text.contains("none") || text.contains("no local repo"))
     {
@@ -1467,6 +1491,15 @@ mod tests {
             },
         );
         app.selected = Some(RowId::VirtualPullRequest(pull_request_id.clone()));
+        app.pane = Pane::Detail;
+        app.detail_selected = Some(DetailRowId::Section(
+            pull_request_id.clone(),
+            crate::app::DetailSection::Attention,
+        ));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         let mut terminal = Terminal::new(TestBackend::new(120, 70)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -1494,11 +1527,11 @@ mod tests {
         assert!(content.contains("head-sha"));
         assert!(content.contains("changes requested"));
         assert!(content.contains("auto-merge: enabled"));
-        assert!(content.contains("Enter/w opens selected item"));
-        assert!(content.contains("Attention · checks ready"));
-        assert!(content.contains("Checks · 2"));
-        assert!(content.contains("Reviews · 0 requested · 1 submitted"));
-        assert!(content.contains("Feedback · 1"));
+        assert!(content.contains("h/l collapse/expand · Enter/w opens selected item"));
+        assert!(content.contains("Overview · draft · auto-merge enabled · conflicts conflicting"));
+        assert!(content.contains("Checks · success · 1/1 required · 2 total · 1 optional failure"));
+        assert!(content.contains("Reviews · changes requested · 0 requested · 1 submitted"));
+        assert!(content.contains("Feedback · 1 unresolved"));
         assert!(content.contains("fix this"));
 
         let mut narrow_terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
@@ -1573,6 +1606,16 @@ mod tests {
         let footer = shortcut_line(&[("j/k", "move")]);
         assert_eq!(footer.spans[0].style.fg, Some(ACCENT));
         assert_eq!(footer.spans[1].style.fg, Some(MUTED));
+
+        let url = url_spans(
+            "URL: https://example.test/path trailing",
+            Style::default().fg(MUTED),
+        );
+        assert_eq!(url.len(), 3);
+        assert!(!url[0].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(url[1].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(url[1].content.as_ref(), "https://example.test/path");
+        assert!(!url[2].style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]
