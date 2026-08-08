@@ -602,7 +602,7 @@ fn render_selectable_pr_detail(
     rows: Vec<crate::app::DetailRow>,
 ) {
     let block = Block::default()
-        .title(" Details · Enter opens selected item ")
+        .title(" Details · Enter/w opens selected item ")
         .borders(Borders::ALL)
         .border_style(if app.pane == Pane::Detail {
             Style::default().fg(Color::Cyan)
@@ -708,7 +708,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .as_ref()
         .map(|error| format!("error: {error}"))
         .unwrap_or_else(|| {
-            "C prompt  b Backburner  c create  m move  L/U lock  d remove  R repair  q/Esc cancel"
+            "w web  C prompt  b Backburner  c create  m move  L/U lock  d remove  q/Esc cancel"
                 .to_owned()
         });
     frame.render_widget(
@@ -1239,7 +1239,7 @@ mod tests {
         assert!(content.contains("head-sha"));
         assert!(content.contains("changes requested"));
         assert!(content.contains("auto-merge: enabled"));
-        assert!(content.contains("Enter opens selected item"));
+        assert!(content.contains("Enter/w opens selected item"));
         assert!(content.contains("Attention · checks ready"));
         assert!(content.contains("Checks · 2"));
         assert!(content.contains("Reviews · 0 requested · 1 submitted"));

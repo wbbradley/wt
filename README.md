@@ -58,12 +58,14 @@ Navigation keys:
 - `/`: filter across repository, path, branch, status, PR, checks, review, warning, and error text
 - `r`: coalesced local and GitHub refresh
 - `Enter`: in the tree, select a worktree, toggle a repository, or materialize a virtual authored-PR row; in PR Details, open the selected check/comment/review URL, falling back to the PR URL
+- `w`: on a local or virtual PR branch, open the PR page; in PR Details, open the selected item's URL with the same PR fallback as Enter
 - `q`/`Esc`/`Ctrl-c`: cancel; during PR materialization, Ctrl-C cancels the operation and returns to the TUI
 - `?` or Space: action palette
 
 Direct action shortcuts:
 
 - `C`: copy an agent-ready prompt for the selected check, feedback item, section, PR stack, or repository
+- `w`: open the selected branch's pull request in a browser
 - `b`: move the selected PR and its stacked descendants into or out of Backburner
 - `c`: advanced create; `n`: new tracked worktree; `m`: move; `L`/`U`: lock/unlock; `d`: remove
 - `R`: repair; `p`: prune; `a`: register; `e`: edit/relink; `x`: unregister
