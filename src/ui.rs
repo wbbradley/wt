@@ -150,7 +150,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     .is_some_and(|identity| app.is_backburnered(&identity));
                 let mut suffix = pull_request
                     .map(|pull_request| {
-                        compact_pull_request_spans(pull_request, details, false, backburnered)
+                        pull_request_tree_spans(pull_request, details, false, backburnered)
                     })
                     .unwrap_or_default();
                 suffix.extend(github_freshness_spans(github_state));
@@ -158,17 +158,15 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.statuses.get(&worktree.path),
                     worktree,
                 ));
-                let prefix_width = stack_depth * 2 + 4;
-                let suffix_width: usize = suffix.iter().map(|span| span.width()).sum();
-                let label_width = (area.width.saturating_sub(4) as usize)
-                    .saturating_sub(prefix_width + suffix_width)
-                    .max(4);
+                let prefix_width = stack_depth * 2 + 8;
+                let line_width = area.width.saturating_sub(4) as usize;
+                let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
                     Span::styled(
                         format!(
                             "{}{}",
                             " ".repeat(stack_depth * 2),
-                            if current { "  ● " } else { "    " }
+                            if current { "current " } else { "        " }
                         ),
                         Style::default().fg(SUCCESS),
                     ),
@@ -183,7 +181,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         span.style = span.style.add_modifier(Modifier::DIM);
                     }
                 }
-                ListItem::new(Line::from(spans))
+                wrapped_tree_item(spans, line_width, prefix_width)
             }
             VisibleRow::VirtualRepository {
                 virtual_repository_index,
@@ -225,16 +223,14 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     + usize::from(app.is_backburnered(&pull_request.identity)) * 2;
                 let details = app.pull_request_details.get(&pull_request.identity);
                 let backburnered = app.is_backburnered(&pull_request.identity);
-                let suffix = compact_pull_request_spans(
+                let suffix = pull_request_tree_spans(
                     &pull_request.pull_request,
                     details,
                     true,
                     backburnered,
                 );
-                let suffix_width: usize = suffix.iter().map(|span| span.width()).sum();
-                let label_width = (area.width.saturating_sub(4) as usize)
-                    .saturating_sub(indent + suffix_width)
-                    .max(4);
+                let line_width = area.width.saturating_sub(4) as usize;
+                let label_width = line_width.saturating_sub(indent).max(4);
                 let mut spans = vec![
                     Span::raw(" ".repeat(indent)),
                     Span::styled(
@@ -248,7 +244,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         span.style = span.style.add_modifier(Modifier::DIM);
                     }
                 }
-                ListItem::new(Line::from(spans))
+                wrapped_tree_item(spans, line_width, indent)
             }
             VisibleRow::Backburner {
                 virtual_repository_index,
@@ -275,6 +271,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .highlight_style(Style::default().bg(SELECTION).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     frame.render_stateful_widget(list, area, &mut state);
+    app.scroll = state.offset();
 }
 
 fn list_block(app: &App) -> Block<'static> {
@@ -288,7 +285,7 @@ fn list_block(app: &App) -> Block<'static> {
         })
 }
 
-fn compact_pull_request_spans(
+fn pull_request_tree_spans(
     pull_request: &crate::model::PullRequest,
     details: Option<&PullRequestDetails>,
     virtual_row: bool,
@@ -301,65 +298,93 @@ fn compact_pull_request_spans(
         Style::default().fg(BRANCH)
     };
     let mut spans = vec![Span::styled(
-        format!(" #{}", pull_request.number),
+        format!(" · PR #{}", pull_request.number),
         number_style,
     )];
     match pull_request.state {
-        PullRequestState::Draft => spans.push(badge("draft", Color::LightBlue)),
-        PullRequestState::Merged => spans.push(badge("merged", Color::Green)),
-        PullRequestState::Closed => spans.push(badge("closed", Color::DarkGray)),
+        PullRequestState::Draft => spans.push(tree_label("draft", Color::LightBlue)),
+        PullRequestState::Merged => spans.push(tree_label("merged", Color::Green)),
+        PullRequestState::Closed => spans.push(tree_label("closed", Color::DarkGray)),
         PullRequestState::Open => {}
     }
+    spans.push(tree_label(
+        if pull_request.auto_merge {
+            "auto-merge on"
+        } else {
+            "auto-merge off"
+        },
+        if pull_request.auto_merge {
+            SUCCESS
+        } else {
+            MUTED
+        },
+    ));
     let required_checks = summary
         .map(|summary| summary.required_checks)
         .unwrap_or(RequiredCheckReadiness::Unknown);
     spans.push(match required_checks {
-        RequiredCheckReadiness::Ready => badge("C✓", Color::Green),
-        RequiredCheckReadiness::Failure => badge("C✗", Color::Red),
-        RequiredCheckReadiness::Pending => badge("C…", Color::Yellow),
-        RequiredCheckReadiness::Unknown => badge("C?", Color::DarkGray),
+        RequiredCheckReadiness::Ready => tree_label("checks passed", Color::Green),
+        RequiredCheckReadiness::Failure => tree_label("checks failed", Color::Red),
+        RequiredCheckReadiness::Pending => tree_label("checks pending", Color::Yellow),
+        RequiredCheckReadiness::Unknown => tree_label("checks unknown", Color::DarkGray),
     });
     if let Some(optional_failures) = summary
         .map(|summary| summary.optional_failures)
         .filter(|failures| *failures > 0)
     {
-        spans.push(badge(&format!("O!{optional_failures}"), Color::LightRed));
+        spans.push(tree_label(
+            &format!(
+                "{optional_failures} optional {}",
+                pluralize(optional_failures, "failure", "failures")
+            ),
+            Color::LightRed,
+        ));
     }
     let review = summary
         .map(|summary| summary.review)
         .unwrap_or(ReviewReadiness::Unknown);
     spans.push(match review {
-        ReviewReadiness::Approved => badge("R✓", Color::Green),
-        ReviewReadiness::ChangesRequested => badge("R✗", Color::Red),
-        ReviewReadiness::Waiting => badge("R…", Color::Yellow),
-        ReviewReadiness::Unknown => badge("R?", Color::DarkGray),
+        ReviewReadiness::Approved => tree_label("review approved", Color::Green),
+        ReviewReadiness::ChangesRequested => tree_label("changes requested", Color::Red),
+        ReviewReadiness::Waiting => tree_label("review pending", Color::Yellow),
+        ReviewReadiness::Unknown => tree_label("review unknown", Color::DarkGray),
     });
     if let Some(feedback) = summary
         .map(|summary| summary.unresolved_feedback)
         .filter(|feedback| *feedback > 0)
     {
-        spans.push(badge(&format!("F{feedback}"), Color::Red));
+        spans.push(tree_label(
+            &format!(
+                "{feedback} unresolved {}",
+                pluralize(feedback, "comment", "comments")
+            ),
+            Color::Red,
+        ));
     }
     match summary.map(|summary| summary.merge_conflict) {
-        Some(MergeConflictState::Conflicting) => spans.push(badge("X", Color::Red)),
-        Some(MergeConflictState::Unknown) | None => {
-            spans.push(badge("X?", Color::DarkGray));
+        Some(MergeConflictState::Conflicting) => {
+            spans.push(tree_label("conflicts present", Color::Red));
         }
-        Some(MergeConflictState::Clean) => {}
+        Some(MergeConflictState::Unknown) | None => {
+            spans.push(tree_label("conflicts unknown", Color::DarkGray));
+        }
+        Some(MergeConflictState::Clean) => {
+            spans.push(tree_label("no conflicts", Color::Green));
+        }
     }
     if virtual_row {
-        spans.push(badge("V", Color::Magenta));
+        spans.push(tree_label("virtual-only", Color::Magenta));
     }
     if backburnered {
-        spans.push(badge("[backburner]", Color::DarkGray));
+        spans.push(tree_label("backburner", Color::DarkGray));
     }
     spans
 }
 
 fn github_freshness_spans(state: Option<&GitHubState>) -> Vec<Span<'static>> {
     match state {
-        Some(GitHubState::Loading { .. }) => vec![badge("↻", Color::Yellow)],
-        Some(GitHubState::Stale { .. }) => vec![badge("stale", Color::Yellow)],
+        Some(GitHubState::Loading { .. }) => vec![tree_label("GitHub refreshing", Color::Yellow)],
+        Some(GitHubState::Stale { .. }) => vec![tree_label("GitHub stale", Color::Yellow)],
         Some(GitHubState::Ready(_)) | None => Vec::new(),
     }
 }
@@ -370,25 +395,71 @@ fn local_state_spans(
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     match state {
-        Some(StatusState::Pending) => spans.push(badge("local…", Color::DarkGray)),
-        Some(StatusState::Ready(status)) if status.is_dirty() => spans.push(badge(
-            &format!("D{}", status.staged + status.modified + status.untracked),
+        Some(StatusState::Pending) => {
+            spans.push(tree_label("local status loading", Color::DarkGray))
+        }
+        Some(StatusState::Ready(status)) if status.is_dirty() => spans.push(tree_label(
+            &format!(
+                "{} local {}",
+                status.staged + status.modified + status.untracked,
+                pluralize(
+                    status.staged + status.modified + status.untracked,
+                    "change",
+                    "changes"
+                )
+            ),
             Color::Red,
         )),
-        Some(StatusState::Error(_)) => spans.push(badge("local!", Color::Yellow)),
+        Some(StatusState::Error(_)) => {
+            spans.push(tree_label("local status unavailable", Color::Yellow));
+        }
         Some(StatusState::Ready(_)) | None => {}
     }
     if worktree.locked.is_some() {
-        spans.push(badge("L", Color::Yellow));
+        spans.push(tree_label("locked", Color::Yellow));
     }
     if worktree.prunable.is_some() {
-        spans.push(badge("P", Color::Yellow));
+        spans.push(tree_label("prunable", Color::Yellow));
     }
     spans
 }
 
-fn badge(text: &str, color: Color) -> Span<'static> {
-    Span::styled(format!(" {text}"), Style::default().fg(color))
+fn tree_label(text: &str, color: Color) -> Span<'static> {
+    Span::styled(format!(" · {text}"), Style::default().fg(color))
+}
+
+fn wrapped_tree_item(
+    spans: Vec<Span<'static>>,
+    line_width: usize,
+    continuation_indent: usize,
+) -> ListItem<'static> {
+    let line_width = line_width.max(1);
+    let mut lines = Vec::new();
+    let mut current = Vec::new();
+    let mut current_width = 0;
+    for span in spans {
+        let span_width = span.width();
+        if !current.is_empty() && current_width + span_width > line_width {
+            lines.push(Line::from(std::mem::take(&mut current)));
+            let indent = continuation_indent.min(line_width.saturating_sub(1));
+            current.push(Span::raw(" ".repeat(indent)));
+            current_width = indent;
+            let text = span.content.trim_start_matches(" · ").to_owned();
+            current_width += text.chars().count();
+            current.push(Span::styled(text, span.style));
+        } else {
+            current_width += span_width;
+            current.push(span);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+    ListItem::new(Text::from(lines))
+}
+
+fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
 }
 
 fn truncate_label(label: &str, width: usize) -> String {
@@ -1247,7 +1318,7 @@ mod tests {
             .into_iter()
             .find(|line| line.contains("main"))
             .unwrap();
-        assert!(row.contains("main D3 L P"));
+        assert!(row.contains("main · 3 local changes · locked · prunable"));
         assert!(!row.contains("/repo"));
         assert!(!row.contains("12345678"));
         let mut narrow_terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
@@ -1258,7 +1329,7 @@ mod tests {
             .into_iter()
             .find(|line| line.contains("main"))
             .unwrap();
-        assert!(narrow_row.contains("main D3 L P"));
+        assert!(narrow_row.contains("main · 3 local changes · locked · prunable"));
         assert!(!narrow_row.contains("/repo"));
         assert!(!narrow_row.contains("12345678"));
     }
@@ -1401,26 +1472,24 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
-        let row = buffer_lines(buffer)
-            .into_iter()
-            .find(|line| line.contains("#42"))
-            .unwrap();
-        assert!(row.contains(
-            "feature/compact-attention-indicators-with-a-very-long-name #42 draft C✓ O!1 R✗ F1 X V"
-        ));
-        assert!(!row.contains("virtual feature"));
-        assert!(!row.contains("head-sha"));
+        assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
+        assert!(content.contains("PR #42 · draft · auto-merge on"));
+        assert!(content.contains("checks passed"));
+        assert!(content.contains("1 optional failure"));
+        assert!(content.contains("changes requested"));
+        assert!(content.contains("1 unresolved comment"));
+        assert!(content.contains("conflicts present"));
+        assert!(content.contains("virtual-only"));
         assert!(
             colored_text(buffer, Color::LightMagenta)
                 .contains("feature/compact-attention-indicators-with-a-very-long-name")
         );
-        assert!(colored_text(buffer, Color::Green).contains("C✓"));
-        assert!(colored_text(buffer, Color::LightRed).contains("O!1"));
+        assert!(colored_text(buffer, Color::Green).contains("checks passed"));
+        assert!(colored_text(buffer, Color::LightRed).contains("1 optional failure"));
         let red = colored_text(buffer, Color::Red);
-        assert!(red.contains("R✗"));
-        assert!(red.contains("F1"));
-        assert!(red.contains('X'));
-        assert!(!row.contains("auto-merge"));
+        assert!(red.contains("changes requested"));
+        assert!(red.contains("1 unresolved comment"));
+        assert!(red.contains("conflicts present"));
         assert!(content.contains("head: viewer/fork:"));
         assert!(content.contains("head-sha"));
         assert!(content.contains("changes requested"));
@@ -1437,14 +1506,27 @@ mod tests {
             .draw(|frame| render(frame, &mut app))
             .unwrap();
         let narrow_buffer = narrow_terminal.backend().buffer();
-        let narrow_row = buffer_lines(narrow_buffer)
-            .into_iter()
-            .find(|line| line.contains("#42"))
+        let narrow_content = buffer_text(narrow_buffer);
+        assert!(narrow_content.contains("PR #42"));
+        assert!(narrow_content.contains("draft"));
+        assert!(narrow_content.contains("auto-merge on"));
+        assert!(narrow_content.contains("checks passed"));
+        assert!(narrow_content.contains("1 optional failure"));
+        assert!(narrow_content.contains("changes requested"));
+        assert!(narrow_content.contains("1 unresolved comment"));
+        assert!(narrow_content.contains("conflicts present"));
+        assert!(narrow_content.contains("virtual-only"));
+
+        app.virtual_repositories[0].pull_requests[0]
+            .pull_request
+            .auto_merge = false;
+        narrow_terminal
+            .draw(|frame| render(frame, &mut app))
             .unwrap();
-        assert!(narrow_row.contains('…'), "narrow row: {narrow_row:?}");
-        assert!(narrow_row.contains("#42 draft C✓ O!1 R✗ F1 X V"));
-        assert!(!narrow_row.contains("virtual feature"));
-        assert!(!narrow_row.contains("head-sha"));
+        assert!(buffer_text(narrow_terminal.backend().buffer()).contains("auto-merge off"));
+        app.virtual_repositories[0].pull_requests[0]
+            .pull_request
+            .auto_merge = true;
 
         app.backburner.insert(pull_request_id.clone());
         app.selected = Some(RowId::Backburner(pull_request_id.repository.clone()));
@@ -1456,7 +1538,8 @@ mod tests {
             .insert(pull_request_id.repository.clone());
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let expanded = buffer_text(terminal.backend().buffer());
-        assert!(expanded.contains("#42 draft C✓ O!1 R✗ F1 X V [backburner]"));
+        assert!(expanded.contains("PR #42 · draft · auto-merge on"));
+        assert!(expanded.contains("backburner"));
     }
 
     #[test]
@@ -1574,7 +1657,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let loading = buffer_text(terminal.backend().buffer());
         assert!(loading.contains("loading GitHub PRs"));
-        assert!(loading.contains("↻"));
+        assert!(loading.contains("GitHub refreshing"));
 
         let previous = GitHubBranchData {
             pull_request: None,
