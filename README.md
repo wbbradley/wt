@@ -75,15 +75,15 @@ Forms show the exact operation inputs before a separate confirmation. Disabled p
 
 Authored pull requests appear once under their canonical base `owner/repository`. A yellow `[no local repo]` marker means the base repository is not yet registered, and `virtual-only` means no ordinary local worktree represents that PR. Enter materializes a virtual row; ordinary worktree actions and direct selectors never create PR worktrees.
 
-Tree rows use plain-language, color-coded status labels and wrap beneath the branch when needed. A typical local row might read `feature/login · PR #42 · auto-merge off · checks passed · review pending · 2 unresolved comments · 1 local change`; a virtual draft might read `feature/api · PR #51 · draft · auto-merge on · checks unknown · review unknown · conflicts unknown · virtual-only`. Titles, full paths, and commit SHAs stay in Details, but `/` filtering still searches them as well as check names, reviewers, and feedback text.
+Tree rows reserve their compact, color-coded status labels for states that need attention. A typical local row might read `● feature/login · PR #42 · checks failing · review required · 2 unresolved comments · 1 local change`; a virtual draft might read `feature/api · PR #51 · draft · [auto-merge] · virtual-only`. The green circle marks the worktree containing the current directory, and PR numbers are orange throughout the UI. Titles, full paths, and commit SHAs stay in Details, but `/` filtering still searches them as well as check names, reviewers, and feedback text.
 
 Tree status language:
 
-- Checks read `checks passed`, `checks failed`, `checks pending`, or `checks unknown`. Optional failures are counted separately because they are actionable but do not make required-check readiness fail.
-- Reviews read `review approved`, `changes requested`, `review pending`, or `review unknown`; unresolved feedback is shown as a comment count.
-- Conflict state is always explicit: `no conflicts`, `conflicts present`, or `conflicts unknown`. Every PR also shows `auto-merge on` or `auto-merge off`.
-- `draft`, `merged`, and `closed` show non-open PR state. Local state uses full labels such as `3 local changes`, `locked`, `prunable`, and `current`.
-- `GitHub refreshing` means remote data is loading, and `GitHub stale` means the last usable snapshot is retained after an error. Red PR numbers have actionable attention; yellow waiting indicators alone are not actionable.
+- Failed required checks read `checks failing`; successful, pending, and unknown checks stay out of the main tree line. Optional failures remain available in Details.
+- Outstanding reviews read `review required`, changes requests remain explicit, and unresolved feedback is shown as a comment count. Approved and unknown review states stay out of the main tree line.
+- Only actual merge conflicts appear in the tree. `[auto-merge]` appears only when auto-merge is enabled.
+- `draft`, `merged`, and `closed` show non-open PR state. Local state uses full labels such as `3 local changes`, `locked`, and `prunable`; `●` marks the current worktree.
+- `GitHub refreshing` means remote data is loading, and `GitHub stale` means the last usable snapshot is retained after an error. PR numbers are always orange.
 
 Press `n` on a repository or one of its worktrees for the common new-worktree flow. The form pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk branch. The new local branch tracks that remote branch; after creation `wt` caches the worktree, exits, and changes the invoking shell into it.
 

@@ -17,8 +17,10 @@ const LINK: Color = Color::LightBlue;
 const SUCCESS: Color = Color::Green;
 const WARNING: Color = Color::Yellow;
 const DANGER: Color = Color::Red;
+const PR_NUMBER: Color = Color::Rgb(255, 165, 0);
 const MUTED: Color = Color::DarkGray;
 const SELECTION: Color = Color::Rgb(45, 55, 72);
+const TREE_INDENT: usize = 2;
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -158,15 +160,15 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.statuses.get(&worktree.path),
                     worktree,
                 ));
-                let prefix_width = stack_depth * 2 + 8;
+                let prefix_width = stack_depth * TREE_INDENT + TREE_INDENT;
                 let line_width = area.width.saturating_sub(4) as usize;
                 let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
                     Span::styled(
                         format!(
                             "{}{}",
-                            " ".repeat(stack_depth * 2),
-                            if current { "current " } else { "        " }
+                            " ".repeat(stack_depth * TREE_INDENT),
+                            if current { "● " } else { "  " }
                         ),
                         Style::default().fg(SUCCESS),
                     ),
@@ -215,12 +217,11 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } => {
                 let pull_request = &app.virtual_repositories[*virtual_repository_index]
                     .pull_requests[*pull_request_index];
-                let indent = if mapped_repository_index.is_some() {
-                    4
-                } else {
-                    6
-                } + stack_depth * 2
-                    + usize::from(app.is_backburnered(&pull_request.identity)) * 2;
+                let indent = virtual_pull_request_indent(
+                    mapped_repository_index.is_some(),
+                    *stack_depth,
+                    app.is_backburnered(&pull_request.identity),
+                );
                 let details = app.pull_request_details.get(&pull_request.identity);
                 let backburnered = app.is_backburnered(&pull_request.identity);
                 let suffix = pull_request_tree_spans(
@@ -274,6 +275,19 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.scroll = state.offset();
 }
 
+fn virtual_pull_request_indent(
+    directly_under_repository: bool,
+    stack_depth: usize,
+    under_backburner: bool,
+) -> usize {
+    (if directly_under_repository {
+        TREE_INDENT
+    } else {
+        TREE_INDENT * 2
+    }) + stack_depth * TREE_INDENT
+        + usize::from(under_backburner) * TREE_INDENT
+}
+
 fn list_block(app: &App) -> Block<'static> {
     Block::default()
         .title(" Repositories / Worktrees / Authored PRs ")
@@ -292,14 +306,9 @@ fn pull_request_tree_spans(
     backburnered: bool,
 ) -> Vec<Span<'static>> {
     let summary = details.map(PullRequestDetails::attention_summary);
-    let number_style = if !backburnered && summary.is_some_and(|summary| summary.is_actionable()) {
-        Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(BRANCH)
-    };
     let mut spans = vec![Span::styled(
         format!(" · PR #{}", pull_request.number),
-        number_style,
+        Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD),
     )];
     match pull_request.state {
         PullRequestState::Draft => spans.push(tree_label("draft", Color::LightBlue)),
@@ -307,48 +316,25 @@ fn pull_request_tree_spans(
         PullRequestState::Closed => spans.push(tree_label("closed", Color::DarkGray)),
         PullRequestState::Open => {}
     }
-    spans.push(tree_label(
-        if pull_request.auto_merge {
-            "auto-merge on"
-        } else {
-            "auto-merge off"
-        },
-        if pull_request.auto_merge {
-            SUCCESS
-        } else {
-            MUTED
-        },
-    ));
+    if pull_request.auto_merge {
+        spans.push(tree_label("[auto-merge]", SUCCESS));
+    }
     let required_checks = summary
         .map(|summary| summary.required_checks)
         .unwrap_or(RequiredCheckReadiness::Unknown);
-    spans.push(match required_checks {
-        RequiredCheckReadiness::Ready => tree_label("checks passed", Color::Green),
-        RequiredCheckReadiness::Failure => tree_label("checks failed", Color::Red),
-        RequiredCheckReadiness::Pending => tree_label("checks pending", Color::Yellow),
-        RequiredCheckReadiness::Unknown => tree_label("checks unknown", Color::DarkGray),
-    });
-    if let Some(optional_failures) = summary
-        .map(|summary| summary.optional_failures)
-        .filter(|failures| *failures > 0)
-    {
-        spans.push(tree_label(
-            &format!(
-                "{optional_failures} optional {}",
-                pluralize(optional_failures, "failure", "failures")
-            ),
-            Color::LightRed,
-        ));
+    if required_checks == RequiredCheckReadiness::Failure {
+        spans.push(tree_label("checks failing", DANGER));
     }
     let review = summary
         .map(|summary| summary.review)
         .unwrap_or(ReviewReadiness::Unknown);
-    spans.push(match review {
-        ReviewReadiness::Approved => tree_label("review approved", Color::Green),
-        ReviewReadiness::ChangesRequested => tree_label("changes requested", Color::Red),
-        ReviewReadiness::Waiting => tree_label("review pending", Color::Yellow),
-        ReviewReadiness::Unknown => tree_label("review unknown", Color::DarkGray),
-    });
+    match review {
+        ReviewReadiness::ChangesRequested => {
+            spans.push(tree_label("changes requested", DANGER));
+        }
+        ReviewReadiness::Waiting => spans.push(tree_label("review required", WARNING)),
+        ReviewReadiness::Approved | ReviewReadiness::Unknown => {}
+    }
     if let Some(feedback) = summary
         .map(|summary| summary.unresolved_feedback)
         .filter(|feedback| *feedback > 0)
@@ -365,12 +351,7 @@ fn pull_request_tree_spans(
         Some(MergeConflictState::Conflicting) => {
             spans.push(tree_label("conflicts present", Color::Red));
         }
-        Some(MergeConflictState::Unknown) | None => {
-            spans.push(tree_label("conflicts unknown", Color::DarkGray));
-        }
-        Some(MergeConflictState::Clean) => {
-            spans.push(tree_label("no conflicts", Color::Green));
-        }
+        Some(MergeConflictState::Unknown | MergeConflictState::Clean) | None => {}
     }
     if virtual_row {
         spans.push(tree_label("virtual-only", Color::Magenta));
@@ -748,12 +729,42 @@ fn detail_row_spans(row: &crate::app::DetailRow, text: &str) -> Vec<Span<'static
         }
         return spans;
     }
+    if matches!(row.id, DetailRowId::Summary(_)) {
+        spans.extend(pr_number_spans(text, detail_row_style(&row.id, text)));
+        return spans;
+    }
     let base_style = if text.starts_with("URL:") {
         Style::default().fg(MUTED)
     } else {
         detail_row_style(&row.id, text)
     };
     spans.extend(url_spans(text, base_style));
+    spans
+}
+
+fn pr_number_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let Some(hash) = text.find('#') else {
+        return vec![Span::styled(text.to_owned(), base_style)];
+    };
+    let digit_count = text[hash + 1..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .count();
+    if digit_count == 0 {
+        return vec![Span::styled(text.to_owned(), base_style)];
+    }
+    let end = hash + 1 + digit_count;
+    let mut spans = Vec::new();
+    if hash > 0 {
+        spans.push(Span::styled(text[..hash].to_owned(), base_style));
+    }
+    spans.push(Span::styled(
+        text[hash..end].to_owned(),
+        Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD),
+    ));
+    if end < text.len() {
+        spans.push(Span::styled(text[end..].to_owned(), base_style));
+    }
     spans
 }
 
@@ -1086,10 +1097,16 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
 
 fn field(label: &str, value: String) -> Line<'static> {
     let value_style = field_value_style(label, &value);
-    Line::from(vec![
-        Span::styled(format!("{label:<11}"), Style::default().fg(MUTED)),
-        Span::styled(value, value_style),
-    ])
+    let mut spans = vec![Span::styled(
+        format!("{label:<11}"),
+        Style::default().fg(MUTED),
+    )];
+    if matches!(label.to_ascii_lowercase().as_str(), "pr" | "pull request") {
+        spans.extend(pr_number_spans(&value, value_style));
+    } else {
+        spans.push(Span::styled(value, value_style));
+    }
+    Line::from(spans)
 }
 
 fn styled_field(label: &str, value: String, color: Color) -> Line<'static> {
@@ -1105,7 +1122,8 @@ fn field_value_style(label: &str, value: &str) -> Style {
     match label.as_str() {
         "url" => Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED),
         "branch" | "base" | "head" | "upstream" => Style::default().fg(BRANCH),
-        "repository" | "host" | "pr" | "pull request" => Style::default().fg(REMOTE),
+        "pr" | "pull request" => Style::default().fg(PR_NUMBER),
+        "repository" | "host" => Style::default().fg(REMOTE),
         "anchor" | "path" | "head sha" | "pr updated" | "rate limit" => Style::default().fg(MUTED),
         "state" | "review" | "auto-merge" => status_text_style(&value),
         "locked" | "prunable" => {
@@ -1356,6 +1374,11 @@ mod tests {
         assert!(narrow_row.contains("main · 3 local changes · locked · prunable"));
         assert!(!narrow_row.contains("/repo"));
         assert!(!narrow_row.contains("12345678"));
+
+        app.current_directory = PathBuf::from("/repo");
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(colored_text(terminal.backend().buffer(), SUCCESS).contains("●"));
+        assert!(!buffer_text(terminal.backend().buffer()).contains("current main"));
     }
 
     #[test]
@@ -1506,9 +1529,7 @@ mod tests {
         let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
         assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
-        assert!(content.contains("PR #42 · draft · auto-merge on"));
-        assert!(content.contains("checks passed"));
-        assert!(content.contains("1 optional failure"));
+        assert!(content.contains("PR #42 · draft · [auto-merge]"));
         assert!(content.contains("changes requested"));
         assert!(content.contains("1 unresolved comment"));
         assert!(content.contains("conflicts present"));
@@ -1517,8 +1538,7 @@ mod tests {
             colored_text(buffer, Color::LightMagenta)
                 .contains("feature/compact-attention-indicators-with-a-very-long-name")
         );
-        assert!(colored_text(buffer, Color::Green).contains("checks passed"));
-        assert!(colored_text(buffer, Color::LightRed).contains("1 optional failure"));
+        assert!(colored_text(buffer, PR_NUMBER).contains("#42"));
         let red = colored_text(buffer, Color::Red);
         assert!(red.contains("changes requested"));
         assert!(red.contains("1 unresolved comment"));
@@ -1542,9 +1562,7 @@ mod tests {
         let narrow_content = buffer_text(narrow_buffer);
         assert!(narrow_content.contains("PR #42"));
         assert!(narrow_content.contains("draft"));
-        assert!(narrow_content.contains("auto-merge on"));
-        assert!(narrow_content.contains("checks passed"));
-        assert!(narrow_content.contains("1 optional failure"));
+        assert!(narrow_content.contains("[auto-merge]"));
         assert!(narrow_content.contains("changes requested"));
         assert!(narrow_content.contains("1 unresolved comment"));
         assert!(narrow_content.contains("conflicts present"));
@@ -1556,7 +1574,11 @@ mod tests {
         narrow_terminal
             .draw(|frame| render(frame, &mut app))
             .unwrap();
-        assert!(buffer_text(narrow_terminal.backend().buffer()).contains("auto-merge off"));
+        let tree_row = buffer_lines(narrow_terminal.backend().buffer())
+            .into_iter()
+            .find(|line| line.contains("feature/compact-attention"))
+            .unwrap();
+        assert!(!tree_row.contains("auto-merge"));
         app.virtual_repositories[0].pull_requests[0]
             .pull_request
             .auto_merge = true;
@@ -1571,7 +1593,7 @@ mod tests {
             .insert(pull_request_id.repository.clone());
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let expanded = buffer_text(terminal.backend().buffer());
-        assert!(expanded.contains("PR #42 · draft · auto-merge on"));
+        assert!(expanded.contains("PR #42 · draft · [auto-merge]"));
         assert!(expanded.contains("backburner"));
     }
 
@@ -1581,6 +1603,23 @@ mod tests {
         assert_eq!(check_color(CheckRollup::Failure), Color::Red);
         assert_eq!(check_color(CheckRollup::Error), Color::Red);
         assert_eq!(check_color(CheckRollup::Pending), Color::Yellow);
+    }
+
+    #[test]
+    fn local_and_virtual_repository_children_share_indentation() {
+        let local_worktree_indent = TREE_INDENT;
+        assert_eq!(
+            virtual_pull_request_indent(true, 0, false),
+            local_worktree_indent
+        );
+        assert_eq!(
+            virtual_pull_request_indent(false, 0, false),
+            local_worktree_indent + TREE_INDENT
+        );
+        assert_eq!(
+            virtual_pull_request_indent(true, 1, false),
+            local_worktree_indent + TREE_INDENT
+        );
     }
 
     #[test]
@@ -1597,6 +1636,7 @@ mod tests {
             field_value_style("repository", "team/project").fg,
             Some(REMOTE)
         );
+        assert_eq!(field_value_style("PR", "#42 open").fg, Some(PR_NUMBER));
         assert_eq!(field_value_style("path", "/tmp/project").fg, Some(MUTED));
         assert_eq!(status_text_style("success").fg, Some(SUCCESS));
         assert_eq!(status_text_style("pending").fg, Some(WARNING));
@@ -1616,6 +1656,10 @@ mod tests {
         assert!(url[1].style.add_modifier.contains(Modifier::UNDERLINED));
         assert_eq!(url[1].content.as_ref(), "https://example.test/path");
         assert!(!url[2].style.add_modifier.contains(Modifier::UNDERLINED));
+
+        let pull_request = field("PR", "#42 open".to_owned());
+        assert_eq!(pull_request.spans[1].content.as_ref(), "#42");
+        assert_eq!(pull_request.spans[1].style.fg, Some(PR_NUMBER));
     }
 
     #[test]
