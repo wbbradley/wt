@@ -1219,6 +1219,10 @@ impl App {
                 self.expand_or_focus_detail();
                 Intent::None
             }
+            KeyCode::Tab => {
+                self.toggle_pane();
+                Intent::None
+            }
             KeyCode::Char('/') => {
                 self.filter_active = true;
                 Intent::None
@@ -2347,6 +2351,16 @@ impl App {
         }
     }
 
+    fn toggle_pane(&mut self) {
+        self.pane = match self.pane {
+            Pane::List => Pane::Detail,
+            Pane::Detail => Pane::List,
+        };
+        if self.pane == Pane::Detail {
+            self.reconcile_detail_selection();
+        }
+    }
+
     fn move_and_continue(&mut self, delta: isize) -> Intent {
         self.move_selection(delta);
         Intent::None
@@ -3204,6 +3218,12 @@ mod tests {
         app.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(app.selected, Some(RowId::Repository(_))));
         app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.visible_rows().len(), 1);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.pane, Pane::Detail);
+        assert_eq!(app.visible_rows().len(), 1);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.pane, Pane::List);
         assert_eq!(app.visible_rows().len(), 1);
         app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(app.visible_rows().len(), 3);
