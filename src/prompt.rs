@@ -38,19 +38,13 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
         ));
         if !pull_request.checks.is_empty() {
             output.push_str("\n### Failing checks\n");
+            output.push_str(&format!(
+                "Inspect: gh pr checks {} --repo {}\n",
+                pull_request.identity.number,
+                repository_selector(repository),
+            ));
             for check in &pull_request.checks {
-                let requirement = if check.required {
-                    "required"
-                } else {
-                    "optional; not merge-required"
-                };
-                output.push_str(&format!(
-                    "- {} [{}; {:?}]\n  URL: {}\n",
-                    check.name,
-                    requirement,
-                    check.state,
-                    check.target_url.as_deref().unwrap_or("unavailable"),
-                ));
+                output.push_str(&format!("- {} [{:?}]\n", check.name, check.state));
             }
         }
         if !pull_request.feedback.is_empty() {
@@ -67,38 +61,56 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
                     .unwrap_or_else(|| "unavailable".to_owned());
                 let thread_id = feedback.thread_id.as_deref().unwrap_or("unavailable");
                 output.push_str(&format!(
-                    "- {kind} by {} at {path} [node ID: {}; database ID: {database_id}; thread ID: {thread_id}]{}\n  Body: {}\n  URL: {}\n",
+                    "- {kind} by {} at {path} [node ID: {}; database ID: {database_id}; thread ID: {thread_id}]{}\n  Body: {}\n",
                     feedback.author,
                     feedback.id,
                     if feedback.outdated { " [outdated]" } else { "" },
                     excerpt(&feedback.body),
-                    feedback.permalink.as_deref().unwrap_or("unavailable"),
                 ));
                 if let Some(database_id) = feedback.database_id {
-                    let endpoint = match feedback.kind {
-                        FeedbackKind::InlineThread => format!(
-                            "repos/{}/{}/pulls/comments/{database_id}",
-                            repository.owner, repository.repository
+                    let (endpoint, jq) = match feedback.kind {
+                        FeedbackKind::InlineThread => (
+                            format!(
+                                "repos/{}/{}/pulls/comments/{database_id}",
+                                repository.owner, repository.repository
+                            ),
+                            "{author: .user.login, path, line, body, diff_hunk, created_at}",
                         ),
-                        FeedbackKind::ReviewSummary => format!(
-                            "repos/{}/{}/pulls/{}/reviews/{database_id}",
-                            repository.owner, repository.repository, pull_request.identity.number
+                        FeedbackKind::ReviewSummary => (
+                            format!(
+                                "repos/{}/{}/pulls/{}/reviews/{database_id}",
+                                repository.owner,
+                                repository.repository,
+                                pull_request.identity.number
+                            ),
+                            "{author: .user.login, state, body, submitted_at}",
                         ),
                     };
                     output.push_str(&format!(
-                        "  Investigate: gh api --hostname {} {endpoint}\n",
-                        repository.host
+                        "  Inspect: gh api --hostname {} {endpoint} --jq '{}'\n",
+                        repository.host, jq
                     ));
                 } else {
                     output.push_str(&format!(
-                        "  Investigate using stored node ID {} on {}.\n",
-                        feedback.id, repository.host
+                        "  Inspect: gh api graphql --hostname {} -f query='query($id: ID!) {{ node(id: $id) {{ __typename ... on PullRequestReview {{ author {{ login }} body state submittedAt }} ... on PullRequestReviewComment {{ author {{ login }} body path diffHunk createdAt }} }} }}' -F id={}\n",
+                        repository.host, feedback.id
                     ));
                 }
             }
         }
     }
     Some(output)
+}
+
+fn repository_selector(repository: &crate::model::GitHubRepositoryIdentity) -> String {
+    if repository.host == "github.com" {
+        format!("{}/{}", repository.owner, repository.repository)
+    } else {
+        format!(
+            "{}/{}/{}",
+            repository.host, repository.owner, repository.repository
+        )
+    }
 }
 
 fn excerpt(body: &str) -> String {
@@ -199,8 +211,11 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "Address the following pull request feedback and failing checks. Preserve unrelated changes, use the stored GitHub IDs when investigating, and verify each fix.\n\n## feature — PR #42: Fix feedback\nRepository: base/project (git.example.com)\nPR: https://git.example.com/base/project/pull/42\n\n### Failing checks\n- build [required; Error]\n  URL: https://checks/build\n- lint [optional; not merge-required; Failure]\n  URL: unavailable\n\n### Feedback\n- inline comment by reviewer at src/lib.rs [node ID: IC_node; database ID: 91; thread ID: PRRT_thread]\n  Body: split this line\n  URL: https://git.example.com/comment/91\n  Investigate: gh api --hostname git.example.com repos/base/project/pulls/comments/91\n- review summary by lead at no path [node ID: PRR_node; database ID: unavailable; thread ID: unavailable] [outdated]\n  Body: Please add coverage\n  URL: unavailable\n  Investigate using stored node ID PRR_node on git.example.com.\n"
+            "Address the following pull request feedback and failing checks. Preserve unrelated changes, use the stored GitHub IDs when investigating, and verify each fix.\n\n## feature — PR #42: Fix feedback\nRepository: base/project (git.example.com)\nPR: https://git.example.com/base/project/pull/42\n\n### Failing checks\nInspect: gh pr checks 42 --repo git.example.com/base/project\n- build [Error]\n- lint [Failure]\n\n### Feedback\n- inline comment by reviewer at src/lib.rs [node ID: IC_node; database ID: 91; thread ID: PRRT_thread]\n  Body: split this line\n  Inspect: gh api --hostname git.example.com repos/base/project/pulls/comments/91 --jq '{author: .user.login, path, line, body, diff_hunk, created_at}'\n- review summary by lead at no path [node ID: PRR_node; database ID: unavailable; thread ID: unavailable] [outdated]\n  Body: Please add coverage\n  Inspect: gh api graphql --hostname git.example.com -f query='query($id: ID!) { node(id: $id) { __typename ... on PullRequestReview { author { login } body state submittedAt } ... on PullRequestReviewComment { author { login } body path diffHunk createdAt } } }' -F id=PRR_node\n"
         );
+        assert!(!actual.contains("https://checks/build"));
+        assert!(!actual.contains("https://git.example.com/comment/91"));
+        assert!(!actual.contains("not merge-required"));
     }
 
     #[test]
@@ -210,5 +225,11 @@ mod tests {
         pull_request.feedback.clear();
         assert_eq!(format_agent_prompt(&[pull_request]), None);
         assert_eq!(format_agent_prompt(&[]), None);
+    }
+
+    #[test]
+    fn github_dot_com_check_command_uses_the_native_repo_selector() {
+        let repository = GitHubRepositoryIdentity::canonical("github.com", "Acme", "Web");
+        assert_eq!(repository_selector(&repository), "acme/web");
     }
 }

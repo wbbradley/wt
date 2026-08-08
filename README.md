@@ -87,7 +87,7 @@ Tree status language:
 
 Press `n` on a repository or one of its worktrees for the common new-worktree flow. The form pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk branch. The new local branch tracks that remote branch; after creation `wt` caches the worktree, exits, and changes the invoking shell into it.
 
-Press `C` to copy a focused repair prompt. On a check or feedback detail it includes only that item; on a Checks or Feedback heading it includes actionable items of that class; on a PR it includes that PR and its stacked descendants; and on a repository it includes every represented actionable PR. Prompts group work by branch and PR, label optional failures, preserve comment/review IDs and paths, and include GitHub investigation commands when database IDs are available. Empty scopes report `nothing to address here` without changing the clipboard.
+Press `C` to copy a focused repair prompt. On a check or feedback detail it includes only that item; on a Checks or Feedback heading it includes actionable items of that class; on a PR it includes that PR and its stacked descendants; and on a repository it includes every represented actionable PR. Prompts group work by branch and PR, preserve check states plus comment/review IDs and paths, and provide `gh` commands that return readable check or feedback context instead of copying per-item URLs. Empty scopes report `nothing to address here` without changing the clipboard.
 
 ```text
 ## feature/login — PR #42: Fix login race
@@ -95,8 +95,8 @@ Repository: acme/web (github.com)
 PR: https://github.com/acme/web/pull/42
 
 ### Failing checks
-- integration [optional; not merge-required; Failure]
-  URL: https://github.com/acme/web/actions/runs/123
+Inspect: gh pr checks 42 --repo acme/web
+- integration [Failure]
 ```
 
 Press `b` on a PR to toggle its entire GitHub stack in Backburner. Local worktrees stay in their ordinary ancestry position, dimmed and marked `backburner`; virtual-only PRs move under a collapsed Backburner group in their canonical repository. Their Details and explicit `C` prompts remain available, but repository prompts and `[`/`]` attention navigation skip them. Membership survives refreshes and virtual-to-local materialization because it is stored by host-aware canonical PR ID in `$XDG_STATE_HOME/wt/state.json` (normally `~/.local/state/wt/state.json`). Set `WT_STATE_PATH` to override that location.
