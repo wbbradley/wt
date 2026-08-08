@@ -556,9 +556,7 @@ impl Controller {
                 Ok(ControlFlow::Continue)
             }
             Intent::OpenUrl(url) => {
-                if let Err(error) = self.url_opener.open(&url) {
-                    self.app.inline_error = Some(format!("unable to open {url}: {error}"));
-                }
+                self.open_url(&url);
                 Ok(ControlFlow::Continue)
             }
             Intent::PersistBackburner => {
@@ -576,6 +574,15 @@ impl Controller {
     }
 
     fn begin_action(&mut self, action: Action) -> Result<(), TuiError> {
+        if action == Action::OpenPullRequestWeb {
+            if let Some(url) = self.app.selected_pull_request_url() {
+                self.open_url(&url);
+            } else {
+                self.app.inline_error =
+                    Some("selected branch has no associated pull request".to_owned());
+            }
+            return Ok(());
+        }
         if action == Action::CopyAgentPrompt {
             self.app.progress = None;
             if let Some(prompt) = self.app.agent_prompt() {
@@ -598,6 +605,9 @@ impl Controller {
         let repository_path = repository.config.path.clone();
         match action {
             Action::CopyAgentPrompt => unreachable!("handled before repository resolution"),
+            Action::OpenPullRequestWeb => {
+                unreachable!("handled before repository resolution")
+            }
             Action::Create => self.app.open_form(
                 action,
                 vec![
@@ -739,6 +749,12 @@ impl Controller {
             }
         }
         Ok(())
+    }
+
+    fn open_url(&mut self, url: &str) {
+        if let Err(error) = self.url_opener.open(url) {
+            self.app.inline_error = Some(format!("unable to open {url}: {error}"));
+        }
     }
 
     fn submit_form(&mut self, action: Action, values: Vec<String>) -> Result<(), TuiError> {
@@ -2036,6 +2052,18 @@ mod tests {
         assert_eq!(
             opener.opened.lock().unwrap().as_slice(),
             ["https://example/pr/1"]
+        );
+
+        controller.app = prompt_app();
+        controller
+            .handle_intent(Intent::BeginAction(Action::OpenPullRequestWeb))
+            .unwrap();
+        assert_eq!(
+            opener.opened.lock().unwrap().as_slice(),
+            [
+                "https://example/pr/1",
+                "https://github.com/team/project/pull/42"
+            ]
         );
 
         let failing = Arc::new(FakeUrlOpener {

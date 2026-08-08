@@ -252,6 +252,7 @@ pub enum Pane {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     CopyAgentPrompt,
+    OpenPullRequestWeb,
     Create,
     NewWorktree,
     Move,
@@ -266,8 +267,9 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::CopyAgentPrompt,
+        Self::OpenPullRequestWeb,
         Self::Create,
         Self::NewWorktree,
         Self::Move,
@@ -284,6 +286,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Self::CopyAgentPrompt => "copy agent prompt",
+            Self::OpenPullRequestWeb => "open pull request in browser",
             Self::Create => "create worktree",
             Self::NewWorktree => "new tracked worktree",
             Self::Move => "move worktree",
@@ -301,6 +304,7 @@ impl Action {
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::CopyAgentPrompt => "C",
+            Self::OpenPullRequestWeb => "w",
             Self::Create => "c",
             Self::NewWorktree => "n",
             Self::Move => "m",
@@ -1234,6 +1238,7 @@ impl App {
                 Intent::None
             }
             KeyCode::Char('q') => Intent::Cancel,
+            KeyCode::Char('w') if self.pane == Pane::Detail => self.open_selected_detail(),
             KeyCode::Char(character) => self.direct_action(character),
             KeyCode::Enter => {
                 if self.pane == Pane::Detail {
@@ -1399,6 +1404,17 @@ impl App {
                 reason: None,
             };
         }
+        if action == Action::OpenPullRequestWeb {
+            return if self.selected_pull_request_url().is_some() {
+                ActionAvailability {
+                    action,
+                    enabled: true,
+                    reason: None,
+                }
+            } else {
+                disabled("selected branch has no associated pull request")
+            };
+        }
         if matches!(
             self.selected_row(),
             Some(VisibleRow::VirtualRepository { .. } | VisibleRow::VirtualPullRequest { .. })
@@ -1432,6 +1448,7 @@ impl App {
                 }
             }
             Action::CopyAgentPrompt => unreachable!("handled before selection validation"),
+            Action::OpenPullRequestWeb => unreachable!("handled before selection validation"),
             Action::EditRepository | Action::RemoveRepository => {
                 if repository.session_only {
                     disabled("register this session-only repository first")
@@ -1784,6 +1801,11 @@ impl App {
             .or_else(|| rows.first());
         row.map(|row| Intent::OpenUrl(row.url.clone()))
             .unwrap_or(Intent::None)
+    }
+
+    pub fn selected_pull_request_url(&self) -> Option<String> {
+        self.selected_pull_request_data()
+            .map(|(_, pull_request, _, _)| pull_request.url)
     }
 
     pub fn agent_prompt(&self) -> Option<String> {
@@ -2171,6 +2193,7 @@ impl App {
     fn direct_action(&mut self, character: char) -> Intent {
         let action = match character {
             'C' => Action::CopyAgentPrompt,
+            'w' => Action::OpenPullRequestWeb,
             'c' => Action::Create,
             'n' => Action::NewWorktree,
             'm' => Action::Move,
@@ -3059,10 +3082,14 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)),
             Intent::MaterializePullRequest(selected.identity.clone())
         );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('w'))),
+            Intent::BeginAction(Action::OpenPullRequestWeb)
+        );
         for action in Action::ALL {
             assert_eq!(
                 app.action_availability(action).enabled,
-                action == Action::CopyAgentPrompt
+                matches!(action, Action::CopyAgentPrompt | Action::OpenPullRequestWeb)
             );
         }
         app.handle_key(key(KeyCode::Char('h')));
@@ -3347,7 +3374,7 @@ mod tests {
 
         app.detail_selected = Some(DetailRowId::Check(identity.clone(), "failure".to_owned()));
         assert_eq!(
-            app.handle_key(key(KeyCode::Enter)),
+            app.handle_key(key(KeyCode::Char('w'))),
             Intent::OpenUrl("https://checks/failure".to_owned())
         );
         app.detail_selected = Some(DetailRowId::Check(identity.clone(), "success".to_owned()));
@@ -3357,7 +3384,7 @@ mod tests {
         );
         app.handle_key(key(KeyCode::Char('G')));
         assert_eq!(
-            app.handle_key(key(KeyCode::Enter)),
+            app.handle_key(key(KeyCode::Char('w'))),
             Intent::OpenUrl("https://comments/7".to_owned())
         );
 
@@ -3642,6 +3669,48 @@ mod tests {
         app.pane = Pane::Detail;
 
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Intent::None);
+        assert_eq!(app.handle_key(key(KeyCode::Char('w'))), Intent::None);
+    }
+
+    #[test]
+    fn web_action_is_enabled_only_for_branches_with_pull_requests() {
+        let authored = authored("team", "project", 42, "2026-01-01");
+        let mut repository = repository("/repo", true);
+        repository
+            .config
+            .github_remotes
+            .insert("origin".to_owned(), authored.identity.repository.clone());
+        let pr_path = repository.worktrees[1].path.clone();
+        let plain_path = repository.worktrees[0].path.clone();
+        let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        app.github.insert(
+            pr_path.clone(),
+            GitHubState::Ready(GitHubBranchData {
+                pull_request: Some(authored.pull_request.clone()),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+
+        app.selected = Some(RowId::Worktree(pr_path));
+        assert!(app.action_availability(Action::OpenPullRequestWeb).enabled);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('w'))),
+            Intent::BeginAction(Action::OpenPullRequestWeb)
+        );
+        assert_eq!(
+            app.selected_pull_request_url().as_deref(),
+            Some(authored.pull_request.url.as_str())
+        );
+
+        app.selected = Some(RowId::Worktree(plain_path));
+        let availability = app.action_availability(Action::OpenPullRequestWeb);
+        assert!(!availability.enabled);
+        assert_eq!(
+            availability.reason.as_deref(),
+            Some("selected branch has no associated pull request")
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('w'))), Intent::None);
     }
 
     #[test]
