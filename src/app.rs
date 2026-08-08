@@ -6,7 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::github::{GitHubError, PullRequestMapping};
 use crate::model::{
     AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, GitHubRepositoryIdentity,
-    PullRequest, PullRequestDetails, RepositoryConfig, Worktree, WorktreeStatus,
+    PullRequest, PullRequestDetails, RepositoryConfig, RequiredCheckReadiness, Worktree,
+    WorktreeStatus,
 };
 use crate::prompt::{PromptPullRequest, format_agent_prompt};
 
@@ -218,6 +219,7 @@ pub enum DetailSection {
 pub enum DetailRowId {
     Summary(CanonicalPullRequestId),
     Section(CanonicalPullRequestId, DetailSection),
+    Metadata(CanonicalPullRequestId, String),
     Check(CanonicalPullRequestId, String),
     ReviewRequest(CanonicalPullRequestId, String),
     Review(CanonicalPullRequestId, String),
@@ -229,6 +231,8 @@ pub struct DetailRow {
     pub id: DetailRowId,
     pub lines: Vec<String>,
     pub url: String,
+    pub tree_prefix: String,
+    pub expanded: Option<bool>,
 }
 
 impl VisibleRow {
@@ -386,6 +390,7 @@ pub struct App {
     detail_max_scroll: usize,
     pub detail_selected: Option<DetailRowId>,
     detail_viewport_height: usize,
+    detail_expanded: HashMap<(CanonicalPullRequestId, DetailSection), bool>,
     pub modal: Option<Modal>,
     pub inline_error: Option<String>,
     pub progress: Option<String>,
@@ -424,6 +429,7 @@ impl App {
             detail_max_scroll: 0,
             detail_selected: None,
             detail_viewport_height: 1,
+            detail_expanded: HashMap::new(),
             modal: None,
             inline_error: None,
             progress: None,
@@ -795,7 +801,6 @@ impl App {
         };
         let pr_url = pull_request.url.clone();
         context.extend([
-            format!("title: {}", pull_request.title),
             format!("URL: {}", pull_request.url),
             format!(
                 "base: {}:{}",
@@ -840,64 +845,135 @@ impl App {
         }
         let mut rows = vec![DetailRow {
             id: DetailRowId::Summary(identity.clone()),
-            lines: context,
+            lines: vec![format!(
+                "PR #{} · {}",
+                pull_request.number, pull_request.title
+            )],
             url: pr_url.clone(),
+            tree_prefix: String::new(),
+            expanded: None,
         }];
 
         let summary = details.as_ref().map(PullRequestDetails::attention_summary);
+        let overview_expanded = self.detail_section_expanded(&identity, DetailSection::Attention);
         rows.push(DetailRow {
             id: DetailRowId::Section(identity.clone(), DetailSection::Attention),
             lines: vec![format!(
-                "Attention · checks {} · review {} · feedback {} · optional failures {} · conflict {}",
-                summary
-                    .map(|summary| debug_label(summary.required_checks))
-                    .unwrap_or_else(|| "unknown".to_owned()),
-                summary
-                    .map(|summary| debug_label(summary.review))
-                    .unwrap_or_else(|| "unknown".to_owned()),
-                summary.map(|summary| summary.unresolved_feedback).unwrap_or(0),
-                summary.map(|summary| summary.optional_failures).unwrap_or(0),
+                "Overview · {} · auto-merge {} · conflicts {}",
+                pull_request.state,
+                if pull_request.auto_merge {
+                    "enabled"
+                } else {
+                    "off"
+                },
                 summary
                     .map(|summary| debug_label(summary.merge_conflict))
                     .unwrap_or_else(|| "unknown".to_owned()),
             )],
             url: pr_url.clone(),
+            tree_prefix: "├─ ".to_owned(),
+            expanded: Some(overview_expanded),
         });
+        if overview_expanded {
+            let count = context.len();
+            rows.extend(
+                context
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| DetailRow {
+                        id: DetailRowId::Metadata(identity.clone(), format!("overview-{index}")),
+                        lines: vec![line],
+                        url: pr_url.clone(),
+                        tree_prefix: detail_child_prefix(DetailSection::Attention, index, count),
+                        expanded: None,
+                    }),
+            );
+        }
 
         let mut checks = details
             .as_ref()
             .map(|details| details.checks.clone())
             .unwrap_or_default();
         checks.sort_by_key(|check| (check_attention_rank(check.state), check.source_order));
+        let checks_expanded = self.detail_section_expanded(&identity, DetailSection::Checks);
+        let required_total = checks.iter().filter(|check| check.required).count();
+        let required_passed = checks
+            .iter()
+            .filter(|check| {
+                check.required
+                    && matches!(
+                        check.state,
+                        crate::model::CheckState::Success
+                            | crate::model::CheckState::Neutral
+                            | crate::model::CheckState::Skipped
+                    )
+            })
+            .count();
+        let check_state = summary
+            .map(|summary| match summary.required_checks {
+                RequiredCheckReadiness::Ready => "success",
+                RequiredCheckReadiness::Failure => "failure",
+                RequiredCheckReadiness::Pending => "pending",
+                RequiredCheckReadiness::Unknown => "unknown",
+            })
+            .unwrap_or("unknown");
+        let mut checks_header = if required_total == 0 {
+            format!(
+                "Checks · {check_state} · no required checks · {} total",
+                checks.len()
+            )
+        } else {
+            format!(
+                "Checks · {check_state} · {required_passed}/{required_total} required · {} total",
+                checks.len()
+            )
+        };
+        if let Some(optional_failures) = summary
+            .map(|summary| summary.optional_failures)
+            .filter(|failures| *failures > 0)
+        {
+            checks_header.push_str(&format!(
+                " · {optional_failures} optional {}",
+                if optional_failures == 1 {
+                    "failure"
+                } else {
+                    "failures"
+                }
+            ));
+        }
         rows.push(DetailRow {
             id: DetailRowId::Section(identity.clone(), DetailSection::Checks),
-            lines: vec![if checks.is_empty() {
-                "Checks · none or unavailable".to_owned()
-            } else {
-                format!("Checks · {}", checks.len())
-            }],
+            lines: vec![checks_header],
             url: pr_url.clone(),
+            tree_prefix: "├─ ".to_owned(),
+            expanded: Some(checks_expanded),
         });
-        rows.extend(checks.into_iter().map(|check| {
-            let mut lines = vec![format!(
-                "{} · {} · {}",
-                check.name,
-                debug_label(check.state),
-                if check.required {
-                    "required"
-                } else {
-                    "optional"
+        if checks_expanded {
+            let count = checks.len();
+            rows.extend(checks.into_iter().enumerate().map(|(index, check)| {
+                let target_url = check.target_url.clone();
+                let mut line = format!(
+                    "{} · {} · {}",
+                    check.name,
+                    debug_label(check.state),
+                    if check.required {
+                        "required"
+                    } else {
+                        "optional"
+                    }
+                );
+                if let Some(url) = &target_url {
+                    line.push_str(&format!(" · {url}"));
                 }
-            )];
-            if let Some(url) = &check.target_url {
-                lines.push(format!("URL: {url}"));
-            }
-            DetailRow {
-                id: DetailRowId::Check(identity.clone(), check.name),
-                lines,
-                url: check.target_url.unwrap_or_else(|| pr_url.clone()),
-            }
-        }));
+                DetailRow {
+                    id: DetailRowId::Check(identity.clone(), check.name),
+                    lines: vec![line],
+                    url: target_url.unwrap_or_else(|| pr_url.clone()),
+                    tree_prefix: detail_child_prefix(DetailSection::Checks, index, count),
+                    expanded: None,
+                }
+            }));
+        }
 
         let review_requests = details
             .as_ref()
@@ -907,93 +983,132 @@ impl App {
             .as_ref()
             .map(|details| details.reviewer_reviews.clone())
             .unwrap_or_default();
+        let reviews_expanded = self.detail_section_expanded(&identity, DetailSection::Reviews);
+        let review_state = summary
+            .map(|summary| debug_label(summary.review))
+            .unwrap_or_else(|| "unknown".to_owned());
         rows.push(DetailRow {
             id: DetailRowId::Section(identity.clone(), DetailSection::Reviews),
-            lines: vec![
-                if review_requests.is_empty() && reviewer_reviews.is_empty() {
-                    "Reviews · none or unavailable".to_owned()
-                } else {
-                    format!(
-                        "Reviews · {} requested · {} submitted",
-                        review_requests.len(),
-                        reviewer_reviews.len()
-                    )
-                },
-            ],
+            lines: vec![format!(
+                "Reviews · {review_state} · {} requested · {} submitted",
+                review_requests.len(),
+                reviewer_reviews.len()
+            )],
             url: pr_url.clone(),
+            tree_prefix: "├─ ".to_owned(),
+            expanded: Some(reviews_expanded),
         });
-        rows.extend(review_requests.into_iter().map(|request| DetailRow {
-            id: DetailRowId::ReviewRequest(identity.clone(), request.id.clone()),
-            lines: vec![format!(
-                "requested: {} ({}) · github id {}",
-                request.name,
-                debug_label(request.kind),
-                request.id
-            )],
-            url: pr_url.clone(),
-        }));
-        rows.extend(reviewer_reviews.into_iter().map(|review| DetailRow {
-            id: DetailRowId::Review(identity.clone(), review.id.clone()),
-            lines: vec![format!(
-                "{} · {} · github id {}{}",
-                review.reviewer,
-                debug_label(review.state),
-                review.id,
-                review
-                    .database_id
-                    .map(|id| format!(" · review id {id}"))
-                    .unwrap_or_default()
-            )],
-            url: pr_url.clone(),
-        }));
+        if reviews_expanded {
+            let count = review_requests.len() + reviewer_reviews.len();
+            rows.extend(
+                review_requests
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, request)| DetailRow {
+                        id: DetailRowId::ReviewRequest(identity.clone(), request.id.clone()),
+                        lines: vec![format!(
+                            "requested: {} ({}) · github id {}",
+                            request.name,
+                            debug_label(request.kind),
+                            request.id
+                        )],
+                        url: pr_url.clone(),
+                        tree_prefix: detail_child_prefix(DetailSection::Reviews, index, count),
+                        expanded: None,
+                    }),
+            );
+            let offset = rows
+                .iter()
+                .filter(|row| matches!(row.id, DetailRowId::ReviewRequest(_, _)))
+                .count();
+            rows.extend(
+                reviewer_reviews
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, review)| DetailRow {
+                        id: DetailRowId::Review(identity.clone(), review.id.clone()),
+                        lines: vec![format!(
+                            "{} · {} · github id {}{}",
+                            review.reviewer,
+                            debug_label(review.state),
+                            review.id,
+                            review
+                                .database_id
+                                .map(|id| format!(" · review id {id}"))
+                                .unwrap_or_default()
+                        )],
+                        url: pr_url.clone(),
+                        tree_prefix: detail_child_prefix(
+                            DetailSection::Reviews,
+                            offset + index,
+                            count,
+                        ),
+                        expanded: None,
+                    }),
+            );
+        }
 
         let feedback = details
             .as_ref()
             .map(|details| details.feedback.clone())
             .unwrap_or_default();
+        let feedback_expanded = self.detail_section_expanded(&identity, DetailSection::Feedback);
         rows.push(DetailRow {
             id: DetailRowId::Section(identity.clone(), DetailSection::Feedback),
             lines: vec![if feedback.is_empty() {
-                "Feedback · none or unavailable".to_owned()
+                "Feedback · none".to_owned()
             } else {
-                format!("Feedback · {}", feedback.len())
+                format!("Feedback · {} unresolved", feedback.len())
             }],
             url: pr_url.clone(),
+            tree_prefix: "└─ ".to_owned(),
+            expanded: Some(feedback_expanded),
         });
-        rows.extend(feedback.into_iter().map(|feedback| {
-            let mut metadata = vec![
-                debug_label(feedback.kind),
-                feedback.author,
-                format!("github id {}", feedback.id),
-            ];
-            if let Some(id) = feedback.database_id {
-                metadata.push(format!("id {id}"));
-            }
-            if let Some(path) = feedback.path {
-                metadata.push(path);
-            }
-            if let Some(thread_id) = feedback.thread_id {
-                metadata.push(format!("thread {thread_id}"));
-            }
-            if feedback.outdated {
-                metadata.push("outdated".to_owned());
-            }
-            let url = feedback.permalink.unwrap_or_else(|| pr_url.clone());
-            metadata.push(format!("permalink {url}"));
-            DetailRow {
-                id: DetailRowId::Feedback(identity.clone(), feedback.id),
-                lines: vec![
-                    metadata.join(" · "),
-                    feedback
-                        .body
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                ],
-                url,
-            }
-        }));
+        if feedback_expanded {
+            let count = feedback.len();
+            rows.extend(feedback.into_iter().enumerate().map(|(index, feedback)| {
+                let body = feedback
+                    .body
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut metadata = vec![feedback.author, debug_label(feedback.kind), body];
+                if let Some(path) = feedback.path {
+                    metadata.push(path);
+                }
+                if feedback.outdated {
+                    metadata.push("outdated".to_owned());
+                }
+                let url = feedback.permalink.unwrap_or_else(|| pr_url.clone());
+                metadata.push(url.clone());
+                metadata.push(format!("github id {}", feedback.id));
+                if let Some(id) = feedback.database_id {
+                    metadata.push(format!("id {id}"));
+                }
+                if let Some(thread_id) = feedback.thread_id {
+                    metadata.push(format!("thread {thread_id}"));
+                }
+                DetailRow {
+                    id: DetailRowId::Feedback(identity.clone(), feedback.id),
+                    lines: vec![metadata.join(" · ")],
+                    url,
+                    tree_prefix: detail_child_prefix(DetailSection::Feedback, index, count),
+                    expanded: None,
+                }
+            }));
+        }
         rows
+    }
+
+    fn detail_section_expanded(
+        &self,
+        identity: &CanonicalPullRequestId,
+        section: DetailSection,
+    ) -> bool {
+        self.detail_expanded
+            .get(&(identity.clone(), section))
+            .copied()
+            .unwrap_or(section == DetailSection::Feedback)
     }
 
     fn selected_pull_request_data(
@@ -1869,6 +1984,7 @@ impl App {
                 .into_iter()
                 .collect(),
             Some(DetailRowId::Summary(identity))
+            | Some(DetailRowId::Metadata(identity, _))
             | Some(DetailRowId::Section(identity, DetailSection::Attention))
             | Some(DetailRowId::Section(identity, DetailSection::Reviews))
             | Some(DetailRowId::ReviewRequest(identity, _))
@@ -1887,6 +2003,7 @@ impl App {
             let identity = match self.detail_selected.as_ref() {
                 Some(DetailRowId::Summary(identity))
                 | Some(DetailRowId::Section(identity, _))
+                | Some(DetailRowId::Metadata(identity, _))
                 | Some(DetailRowId::Check(identity, _))
                 | Some(DetailRowId::ReviewRequest(identity, _))
                 | Some(DetailRowId::Review(identity, _))
@@ -2278,7 +2395,11 @@ impl App {
 
     fn collapse_or_focus_list(&mut self) {
         if self.pane == Pane::Detail {
-            self.pane = Pane::List;
+            if self.detail_rows().is_empty() {
+                self.pane = Pane::List;
+            } else {
+                self.collapse_detail_section();
+            }
             return;
         }
         if let Some((_, repository_index)) = self.selected_repository() {
@@ -2325,6 +2446,10 @@ impl App {
     }
 
     fn expand_or_focus_detail(&mut self) {
+        if self.pane == Pane::Detail {
+            self.expand_detail_section();
+            return;
+        }
         if matches!(self.selected_row(), Some(VisibleRow::Repository { .. })) {
             if let Some((_, index)) = self.selected_repository() {
                 self.repositories[index].expanded = true;
@@ -2349,6 +2474,38 @@ impl App {
             self.pane = Pane::Detail;
             self.reconcile_detail_selection();
         }
+    }
+
+    fn expand_detail_section(&mut self) {
+        let Some(DetailRowId::Section(identity, section)) = self.detail_selected.clone() else {
+            return;
+        };
+        self.detail_expanded.insert((identity, section), true);
+        self.reconcile_detail_selection();
+    }
+
+    fn collapse_detail_section(&mut self) -> bool {
+        let Some(selected) = self.detail_selected.clone() else {
+            return false;
+        };
+        let (identity, section) = match selected {
+            DetailRowId::Section(identity, section) => (identity, section),
+            DetailRowId::Metadata(identity, _) => (identity, DetailSection::Attention),
+            DetailRowId::Check(identity, _) => (identity, DetailSection::Checks),
+            DetailRowId::ReviewRequest(identity, _) | DetailRowId::Review(identity, _) => {
+                (identity, DetailSection::Reviews)
+            }
+            DetailRowId::Feedback(identity, _) => (identity, DetailSection::Feedback),
+            DetailRowId::Summary(_) => return false,
+        };
+        if !self.detail_section_expanded(&identity, section) {
+            return false;
+        }
+        self.detail_expanded
+            .insert((identity.clone(), section), false);
+        self.detail_selected = Some(DetailRowId::Section(identity, section));
+        self.reconcile_detail_selection();
+        true
     }
 
     fn toggle_pane(&mut self) {
@@ -2788,6 +2945,22 @@ fn debug_label(value: impl std::fmt::Debug) -> String {
         label.push(character.to_ascii_lowercase());
     }
     label
+}
+
+fn detail_child_prefix(section: DetailSection, index: usize, count: usize) -> String {
+    let ancestor = if section == DetailSection::Feedback {
+        "   "
+    } else {
+        "│  "
+    };
+    format!(
+        "{ancestor}{} ",
+        if index + 1 == count {
+            "└─"
+        } else {
+            "├─"
+        }
+    )
 }
 
 fn contains_path(worktree: &Path, candidate: &Path) -> bool {
@@ -3367,11 +3540,34 @@ mod tests {
         app.handle_key(key(KeyCode::Char('l')));
         assert_eq!(app.pane, Pane::Detail);
         assert!(matches!(app.detail_selected, Some(DetailRowId::Summary(_))));
+        let initial_rows = app.detail_rows();
+        assert!(initial_rows.iter().all(|row| row.lines.len() == 1));
+        assert!(initial_rows.iter().any(|row| {
+            matches!(row.id, DetailRowId::Section(_, DetailSection::Attention))
+                && row.expanded == Some(false)
+        }));
+        assert!(initial_rows.iter().any(|row| {
+            matches!(row.id, DetailRowId::Section(_, DetailSection::Checks))
+                && row.expanded == Some(false)
+        }));
+        assert!(initial_rows.iter().any(|row| {
+            matches!(row.id, DetailRowId::Section(_, DetailSection::Reviews))
+                && row.expanded == Some(false)
+        }));
+        assert!(initial_rows.iter().any(|row| {
+            matches!(row.id, DetailRowId::Section(_, DetailSection::Feedback))
+                && row.expanded == Some(true)
+        }));
+        app.detail_selected = Some(DetailRowId::Section(
+            identity.clone(),
+            DetailSection::Attention,
+        ));
+        app.handle_key(key(KeyCode::Char('l')));
         app.authored_pull_requests.loading = true;
         assert!(
-            app.detail_rows()[0]
-                .lines
+            app.detail_rows()
                 .iter()
+                .flat_map(|row| &row.lines)
                 .any(|line| line == "GitHub: refreshing")
         );
         app.authored_pull_requests.loading = false;
@@ -3382,6 +3578,16 @@ mod tests {
             Some(DetailRowId::Summary(_))
         ));
         app.handle_key(key(KeyCode::Char('g')));
+        assert!(
+            !app.detail_rows()
+                .iter()
+                .any(|row| matches!(row.id, DetailRowId::Check(_, _)))
+        );
+        app.detail_selected = Some(DetailRowId::Section(
+            identity.clone(),
+            DetailSection::Checks,
+        ));
+        app.handle_key(key(KeyCode::Char('l')));
         let rows = app.detail_rows();
         let check_names: Vec<_> = rows
             .iter()
@@ -3392,6 +3598,22 @@ mod tests {
             .collect();
         assert_eq!(check_names, vec!["failure", "pending", "success"]);
 
+        app.detail_selected = Some(DetailRowId::Check(identity.clone(), "failure".to_owned()));
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.pane, Pane::Detail);
+        assert_eq!(
+            app.detail_selected,
+            Some(DetailRowId::Section(
+                identity.clone(),
+                DetailSection::Checks
+            ))
+        );
+        assert!(
+            !app.detail_rows()
+                .iter()
+                .any(|row| matches!(row.id, DetailRowId::Check(_, _)))
+        );
+        app.handle_key(key(KeyCode::Char('l')));
         app.detail_selected = Some(DetailRowId::Check(identity.clone(), "failure".to_owned()));
         assert_eq!(
             app.handle_key(key(KeyCode::Char('w'))),
@@ -3428,9 +3650,9 @@ mod tests {
         );
         assert!(app.detail_rows().iter().any(|row| {
             matches!(row.id, DetailRowId::Section(_, DetailSection::Checks))
-                && row.lines[0].contains("none or unavailable")
+                && row.lines[0].contains("no required checks")
         }));
-        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.pane, Pane::List);
     }
 
@@ -3850,11 +4072,12 @@ mod tests {
                 rate_limit: None,
             }),
         );
+        let detail_id = CanonicalPullRequestId {
+            repository: repository_identity,
+            number: 42,
+        };
         app.pull_request_details.insert(
-            CanonicalPullRequestId {
-                repository: repository_identity,
-                number: 42,
-            },
+            detail_id.clone(),
             PullRequestDetails {
                 checks: vec![crate::model::PullRequestCheck {
                     name: "deep-lint".to_owned(),
@@ -3901,10 +4124,13 @@ mod tests {
         }
         app.filter.clear();
         app.selected = Some(RowId::Worktree(path));
+        app.pane = Pane::Detail;
+        app.detail_selected = Some(DetailRowId::Section(detail_id, DetailSection::Attention));
+        app.handle_key(key(KeyCode::Char('l')));
         assert!(
-            app.detail_rows()[0]
-                .lines
+            app.detail_rows()
                 .iter()
+                .flat_map(|row| &row.lines)
                 .any(|line| line.contains("local path: /repo-topic"))
         );
     }
