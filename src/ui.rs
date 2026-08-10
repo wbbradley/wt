@@ -2,7 +2,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+};
 
 use crate::app::{App, DetailRowId, GitHubState, Modal, Pane, StatusState, VisibleRow};
 use crate::model::{
@@ -20,7 +22,6 @@ const DANGER: Color = Color::Red;
 const PR_NUMBER: Color = Color::Rgb(255, 165, 0);
 const MUTED: Color = Color::DarkGray;
 const SELECTION: Color = Color::Rgb(45, 55, 72);
-const TREE_INDENT: usize = 2;
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -77,9 +78,11 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         );
         return;
     }
+    let tree_prefixes = tree_prefixes(app, &rows);
     let items: Vec<ListItem<'_>> = rows
         .iter()
-        .map(|row| match row {
+        .zip(tree_prefixes)
+        .map(|(row, tree_prefix)| match row {
             VisibleRow::Repository {
                 repository_index, ..
             } => {
@@ -121,7 +124,6 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             VisibleRow::Worktree {
                 repository_index,
                 worktree_index,
-                stack_depth,
                 ..
             } => {
                 let repository = &app.repositories[*repository_index];
@@ -160,16 +162,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.statuses.get(&worktree.path),
                     worktree,
                 ));
-                let prefix_width = stack_depth * TREE_INDENT + TREE_INDENT;
+                let prefix_width = tree_prefix.chars().count() + 2;
                 let line_width = area.width.saturating_sub(4) as usize;
                 let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
+                    Span::styled(tree_prefix, Style::default().fg(MUTED)),
                     Span::styled(
-                        format!(
-                            "{}{}",
-                            " ".repeat(stack_depth * TREE_INDENT),
-                            if current { "● " } else { "  " }
-                        ),
+                        if current { "● " } else { "  " },
                         Style::default().fg(SUCCESS),
                     ),
                     Span::styled(
@@ -198,11 +197,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 };
                 let label = truncate_label(
                     &repository.identity.full_name(),
-                    (area.width.saturating_sub(9) as usize).saturating_sub(marker.chars().count()),
+                    (area.width.saturating_sub(7) as usize)
+                        .saturating_sub(tree_prefix.chars().count() + marker.chars().count()),
                 );
                 ListItem::new(Line::from(vec![
+                    Span::styled(tree_prefix, Style::default().fg(MUTED)),
                     Span::styled(
-                        format!("  {arrow} {label}"),
+                        format!("{arrow} {label}"),
                         Style::default().fg(REMOTE).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(marker, Style::default().fg(WARNING)),
@@ -211,17 +212,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             VisibleRow::VirtualPullRequest {
                 virtual_repository_index,
                 pull_request_index,
-                mapped_repository_index,
-                stack_depth,
                 ..
             } => {
                 let pull_request = &app.virtual_repositories[*virtual_repository_index]
                     .pull_requests[*pull_request_index];
-                let indent = virtual_pull_request_indent(
-                    mapped_repository_index.is_some(),
-                    *stack_depth,
-                    app.is_backburnered(&pull_request.identity),
-                );
                 let details = app.pull_request_details.get(&pull_request.identity);
                 let backburnered = app.is_backburnered(&pull_request.identity);
                 let suffix = pull_request_tree_spans(
@@ -231,9 +225,11 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     backburnered,
                 );
                 let line_width = area.width.saturating_sub(4) as usize;
-                let label_width = line_width.saturating_sub(indent).max(4);
+                let prefix_width = tree_prefix.chars().count() + 2;
+                let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
-                    Span::raw(" ".repeat(indent)),
+                    Span::styled(tree_prefix, Style::default().fg(MUTED)),
+                    Span::raw("  "),
                     Span::styled(
                         truncate_label(&pull_request.pull_request.head.branch, label_width),
                         Style::default().fg(REMOTE),
@@ -245,7 +241,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         span.style = span.style.add_modifier(Modifier::DIM);
                     }
                 }
-                wrapped_tree_item(spans, line_width, indent)
+                wrapped_tree_item(spans, line_width, prefix_width)
             }
             VisibleRow::Backburner {
                 virtual_repository_index,
@@ -253,10 +249,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } => {
                 let repository = &app.virtual_repositories[*virtual_repository_index];
                 let expanded = app.backburner_expanded.contains(&repository.identity);
-                ListItem::new(Line::styled(
-                    format!("    {} Backburner", if expanded { "▾" } else { "▸" }),
-                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-                ))
+                ListItem::new(Line::from(vec![
+                    Span::styled(tree_prefix, Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("{} Backburner", if expanded { "▾" } else { "▸" }),
+                        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                    ),
+                ]))
             }
         })
         .collect();
@@ -270,22 +269,116 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let list = List::new(items)
         .block(list_block(app))
         .highlight_style(Style::default().bg(SELECTION).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ");
+        .highlight_symbol("▶ ")
+        .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(list, area, &mut state);
     app.scroll = state.offset();
 }
 
-fn virtual_pull_request_indent(
-    directly_under_repository: bool,
-    stack_depth: usize,
-    under_backburner: bool,
-) -> usize {
-    (if directly_under_repository {
-        TREE_INDENT
-    } else {
-        TREE_INDENT * 2
-    }) + stack_depth * TREE_INDENT
-        + usize::from(under_backburner) * TREE_INDENT
+fn tree_prefixes(app: &App, rows: &[VisibleRow]) -> Vec<String> {
+    let depths = rows
+        .iter()
+        .map(|row| visible_row_depth(app, row))
+        .collect::<Vec<_>>();
+    tree_prefixes_from_depths(&depths)
+}
+
+fn tree_prefixes_from_depths(depths: &[usize]) -> Vec<String> {
+    depths
+        .iter()
+        .enumerate()
+        .map(|(index, depth)| {
+            if *depth == 0 {
+                return String::new();
+            }
+            let mut prefix = String::new();
+            for ancestor_depth in 1..*depth {
+                let ancestor = (0..index)
+                    .rev()
+                    .find(|candidate| depths[*candidate] == ancestor_depth)
+                    .expect("visible tree depth must have an ancestor");
+                prefix.push_str(if has_later_sibling(&depths, ancestor, ancestor_depth) {
+                    "│  "
+                } else {
+                    "   "
+                });
+            }
+            prefix.push_str(if has_later_sibling(&depths, index, *depth) {
+                "├─ "
+            } else {
+                "└─ "
+            });
+            prefix
+        })
+        .collect()
+}
+
+fn has_later_sibling(depths: &[usize], index: usize, depth: usize) -> bool {
+    depths[index + 1..]
+        .iter()
+        .take_while(|candidate| **candidate >= depth)
+        .any(|candidate| *candidate == depth)
+}
+
+fn visible_row_depth(app: &App, row: &VisibleRow) -> usize {
+    match row {
+        VisibleRow::Repository { .. } => 0,
+        VisibleRow::Worktree { stack_depth, .. } => 1 + stack_depth,
+        VisibleRow::VirtualRepository {
+            virtual_repository_index,
+            ..
+        } => usize::from(
+            app.virtual_repositories[*virtual_repository_index]
+                .mapped_repository
+                .is_some(),
+        ),
+        VisibleRow::VirtualPullRequest {
+            virtual_repository_index,
+            pull_request_index,
+            mapped_repository_index,
+            stack_depth,
+            ..
+        } => {
+            let repository = &app.virtual_repositories[*virtual_repository_index];
+            let base_depth = if mapped_repository_index.is_some() {
+                1
+            } else if repository.mapped_repository.is_some() {
+                2
+            } else {
+                1
+            };
+            base_depth
+                + *stack_depth
+                + usize::from(
+                    app.is_backburnered(&repository.pull_requests[*pull_request_index].identity),
+                )
+        }
+        VisibleRow::Backburner {
+            virtual_repository_index,
+            ..
+        } => {
+            let repository = &app.virtual_repositories[*virtual_repository_index];
+            if repository.mapped_repository.is_some()
+                && virtual_repository_has_header(app, *virtual_repository_index)
+            {
+                2
+            } else {
+                1
+            }
+        }
+    }
+}
+
+fn virtual_repository_has_header(app: &App, index: usize) -> bool {
+    let repository = &app.virtual_repositories[index];
+    let Some(path) = repository.mapped_repository.as_deref() else {
+        return true;
+    };
+    app.virtual_repositories
+        .iter()
+        .filter(|candidate| candidate.mapped_repository.as_deref() == Some(path))
+        .count()
+        > 1
 }
 
 fn list_block(app: &App) -> Block<'static> {
@@ -365,8 +458,7 @@ fn pull_request_tree_spans(
 fn github_freshness_spans(state: Option<&GitHubState>) -> Vec<Span<'static>> {
     match state {
         Some(GitHubState::Loading { .. }) => vec![tree_label("GitHub refreshing", Color::Yellow)],
-        Some(GitHubState::Stale { .. }) => vec![tree_label("GitHub stale", Color::Yellow)],
-        Some(GitHubState::Ready(_)) | None => Vec::new(),
+        Some(GitHubState::Stale { .. } | GitHubState::Ready(_)) | None => Vec::new(),
     }
 }
 
@@ -582,11 +674,7 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 }
             }
             Some(GitHubState::Ready(data)) => append_github_details(&mut lines, data),
-            Some(GitHubState::Stale { previous, error }) => {
-                lines.push(Line::styled(
-                    format!("GitHub stale: {error}"),
-                    Style::default().fg(WARNING),
-                ));
+            Some(GitHubState::Stale { previous, .. }) => {
                 if let Some(data) = previous {
                     append_github_details(&mut lines, data);
                 }
@@ -1360,6 +1448,7 @@ mod tests {
             .into_iter()
             .find(|line| line.contains("main"))
             .unwrap();
+        assert!(row.contains("└─   main"));
         assert!(row.contains("main · 3 local changes · locked · prunable"));
         assert!(!row.contains("/repo"));
         assert!(!row.contains("12345678"));
@@ -1528,6 +1617,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
+        assert!(content.contains("└─   feature/compact-attention"));
         assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
         assert!(content.contains("PR #42 · draft · [auto-merge]"));
         assert!(content.contains("changes requested"));
@@ -1606,19 +1696,10 @@ mod tests {
     }
 
     #[test]
-    fn local_and_virtual_repository_children_share_indentation() {
-        let local_worktree_indent = TREE_INDENT;
+    fn tree_prefixes_render_siblings_ancestry_and_roots() {
         assert_eq!(
-            virtual_pull_request_indent(true, 0, false),
-            local_worktree_indent
-        );
-        assert_eq!(
-            virtual_pull_request_indent(false, 0, false),
-            local_worktree_indent + TREE_INDENT
-        );
-        assert_eq!(
-            virtual_pull_request_indent(true, 1, false),
-            local_worktree_indent + TREE_INDENT
+            tree_prefixes_from_depths(&[0, 1, 2, 1, 0, 1]),
+            ["", "├─ ", "│  └─ ", "└─ ", "", "└─ "]
         );
     }
 
@@ -1764,7 +1845,8 @@ mod tests {
         );
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let stale = buffer_text(terminal.backend().buffer());
-        assert!(stale.contains("GitHub stale: network unavailable"));
+        assert!(!stale.contains("GitHub stale"));
+        assert!(!stale.contains("network unavailable"));
         app.pane = Pane::Detail;
         for _ in 0..20 {
             app.handle_key(crossterm::event::KeyEvent::new(
