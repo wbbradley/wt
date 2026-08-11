@@ -424,19 +424,19 @@ pub struct WorktreeStatus {
     pub branch: Option<String>,
     pub upstream: Option<String>,
     pub staged: usize,
-    pub modified: usize,
+    pub unstaged: usize,
     pub untracked: usize,
 }
 
 impl WorktreeStatus {
     pub fn is_dirty(&self) -> bool {
-        self.staged > 0 || self.modified > 0 || self.untracked > 0
+        self.staged > 0 || self.unstaged > 0 || self.untracked > 0
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "{} staged, {} modified, {} untracked",
-            self.staged, self.modified, self.untracked
+            "{} staged, {} unstaged, {} untracked",
+            self.staged, self.unstaged, self.untracked
         )
     }
 }

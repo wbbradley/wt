@@ -72,7 +72,7 @@ fn creates_all_modes_reports_status_and_validates_conflicts() {
     let inspect = fixture.wt(&["worktree", "inspect", "project", "new/topic"]);
     assert_success(&inspect);
     assert!(stdout(&inspect).contains("upstream\t-"));
-    assert!(stdout(&inspect).contains("status\t0 staged, 0 modified, 1 untracked"));
+    assert!(stdout(&inspect).contains("status\t0 staged, 0 unstaged, 1 untracked"));
     let list = fixture.wt(&["worktree", "list", "project"]);
     assert_success(&list);
     assert!(stdout(&list).contains(detached.to_str().unwrap()));
@@ -267,7 +267,7 @@ fn removal_safeguards_force_confirmation_and_branch_preservation() {
         "dirty-branch",
     ]);
     assert_success(&forced);
-    assert!(stderr(&forced).contains("0 staged, 0 modified, 1 untracked"));
+    assert!(stderr(&forced).contains("0 staged, 0 unstaged, 1 untracked"));
     assert!(branch_exists(&fixture.anchor, "dirty-branch"));
 
     assert_success(&fixture.wt(&[

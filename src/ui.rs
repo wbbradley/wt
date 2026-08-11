@@ -479,18 +479,28 @@ fn local_state_spans(
         Some(StatusState::Pending) => {
             spans.push(tree_label("local status loading", Color::DarkGray))
         }
-        Some(StatusState::Ready(status)) if status.is_dirty() => spans.push(tree_label(
-            &format!(
-                "{} local {}",
-                status.staged + status.modified + status.untracked,
-                pluralize(
-                    status.staged + status.modified + status.untracked,
-                    "change",
-                    "changes"
-                )
-            ),
-            Color::Red,
-        )),
+        Some(StatusState::Ready(status)) if status.is_dirty() => {
+            spans.push(Span::raw(" · ["));
+            let mut needs_separator = false;
+            for (count, marker, color) in [
+                (status.staged, "+", SUCCESS),
+                (status.unstaged, "~", WARNING),
+                (status.untracked, "?", MUTED),
+            ] {
+                if count == 0 {
+                    continue;
+                }
+                if needs_separator {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(
+                    format!("{marker}{count}"),
+                    Style::default().fg(color),
+                ));
+                needs_separator = true;
+            }
+            spans.push(Span::raw("]"));
+        }
         Some(StatusState::Error(_)) => {
             spans.push(tree_label("local status unavailable", Color::Yellow));
         }
@@ -1245,7 +1255,7 @@ fn field_value_style(label: &str, value: &str) -> Style {
         "local repo" => Style::default().fg(REMOTE),
         "github" if value.contains("loading") => Style::default().fg(WARNING),
         "local" => {
-            if value.starts_with("0 staged, 0 modified, 0 untracked") {
+            if value.starts_with("0 staged, 0 unstaged, 0 untracked") {
                 Style::default().fg(SUCCESS)
             } else {
                 Style::default().fg(DANGER)
@@ -1444,7 +1454,8 @@ mod tests {
             PathBuf::from("/repo"),
             StatusState::Ready(WorktreeStatus {
                 staged: 1,
-                modified: 2,
+                unstaged: 2,
+                untracked: 3,
                 ..WorktreeStatus::default()
             }),
         );
@@ -1460,7 +1471,10 @@ mod tests {
             .find(|line| line.contains("main"))
             .unwrap();
         assert!(row.contains("└─   main"));
-        assert!(row.contains("main · 3 local changes · locked · prunable"));
+        assert!(row.contains("main · [+1 ~2 ?3] · locked · prunable"));
+        assert!(colored_text(terminal.backend().buffer(), SUCCESS).contains("+1"));
+        assert!(colored_text(terminal.backend().buffer(), WARNING).contains("~2"));
+        assert!(colored_text(terminal.backend().buffer(), MUTED).contains("?3"));
         assert!(!row.contains("/repo"));
         assert!(!row.contains("12345678"));
         let mut narrow_terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
@@ -1471,7 +1485,7 @@ mod tests {
             .into_iter()
             .find(|line| line.contains("main"))
             .unwrap();
-        assert!(narrow_row.contains("main · 3 local changes · locked · prunable"));
+        assert!(narrow_row.contains("main · [+1 ~2 ?3] · locked · prunable"));
         assert!(!narrow_row.contains("/repo"));
         assert!(!narrow_row.contains("12345678"));
 

@@ -289,7 +289,7 @@ pub fn parse_status_porcelain(input: &[u8]) -> Result<WorktreeStatus, GitError> 
                     status.staged += 1;
                 }
                 if y != b'.' {
-                    status.modified += 1;
+                    status.unstaged += 1;
                 }
                 if field[0] == b'2' {
                     if index >= fields.len() || fields[index].is_empty() {
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(status.branch.as_deref(), Some("topic"));
         assert_eq!(status.upstream.as_deref(), Some("origin/topic"));
         assert_eq!(status.staged, 1);
-        assert_eq!(status.modified, 1);
+        assert_eq!(status.unstaged, 1);
         assert_eq!(status.untracked, 1);
         assert!(status.is_dirty());
     }
