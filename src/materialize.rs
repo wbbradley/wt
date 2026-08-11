@@ -518,6 +518,42 @@ fn branch_marker(
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
 }
 
+pub(crate) fn branch_pull_request_marker(
+    runner: &dyn GitRunner,
+    repository: &Path,
+    branch: &str,
+) -> Result<Option<CanonicalPullRequestId>, String> {
+    branch_marker(runner, repository, branch)
+        .map_err(|error| error.to_string())?
+        .map(|marker| parse_pull_request_marker(&marker))
+        .transpose()
+}
+
+fn parse_pull_request_marker(marker: &str) -> Result<CanonicalPullRequestId, String> {
+    let (repository, number) = marker
+        .rsplit_once('#')
+        .ok_or_else(|| format!("invalid pull request marker {marker:?}"))?;
+    let number = number
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| format!("invalid pull request marker {marker:?}"))?;
+    let (host, full_name) = repository
+        .split_once('/')
+        .ok_or_else(|| format!("invalid pull request marker {marker:?}"))?;
+    let (owner, repository) = full_name
+        .split_once('/')
+        .filter(|(_, repository)| !repository.contains('/'))
+        .ok_or_else(|| format!("invalid pull request marker {marker:?}"))?;
+    if host.is_empty() || owner.is_empty() || repository.is_empty() {
+        return Err(format!("invalid pull request marker {marker:?}"));
+    }
+    Ok(CanonicalPullRequestId {
+        repository: GitHubRepositoryIdentity::canonical(host, owner, repository),
+        number,
+    })
+}
+
 fn set_branch_marker(
     runner: &dyn GitRunner,
     repository: &Path,
@@ -642,6 +678,23 @@ fn canonicalize_worktree(path: &Path) -> Result<PathBuf, MaterializeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pull_request_markers_parse_canonical_identity_and_reject_malformed_values() {
+        let parsed = parse_pull_request_marker("GitHub.COM/base/project#42").unwrap();
+        assert_eq!(parsed.repository.host, "github.com");
+        assert_eq!(parsed.repository.full_name(), "base/project");
+        assert_eq!(parsed.number, 42);
+        for malformed in [
+            "github.com/base/project",
+            "github.com/base/project#0",
+            "github.com/base/project#nope",
+            "github.com/base/extra/project#42",
+            "/base/project#42",
+        ] {
+            assert!(parse_pull_request_marker(malformed).is_err(), "{malformed}");
+        }
+    }
     use crate::git::SystemGit;
     use crate::model::{CheckRollup, PullRequest, PullRequestIdentity, PullRequestState};
     use std::collections::BTreeMap;

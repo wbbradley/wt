@@ -297,13 +297,13 @@ fn tree_prefixes_from_depths(depths: &[usize]) -> Vec<String> {
                     .rev()
                     .find(|candidate| depths[*candidate] == ancestor_depth)
                     .expect("visible tree depth must have an ancestor");
-                prefix.push_str(if has_later_sibling(&depths, ancestor, ancestor_depth) {
+                prefix.push_str(if has_later_sibling(depths, ancestor, ancestor_depth) {
                     "│  "
                 } else {
                     "   "
                 });
             }
-            prefix.push_str(if has_later_sibling(&depths, index, *depth) {
+            prefix.push_str(if has_later_sibling(depths, index, *depth) {
                 "├─ "
             } else {
                 "└─ "
@@ -674,11 +674,11 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 }
             }
             Some(GitHubState::Ready(data)) => append_github_details(&mut lines, data),
-            Some(GitHubState::Stale { previous, .. }) => {
-                if let Some(data) = previous {
-                    append_github_details(&mut lines, data);
-                }
-            }
+            Some(GitHubState::Stale {
+                previous: Some(data),
+                ..
+            }) => append_github_details(&mut lines, data),
+            Some(GitHubState::Stale { previous: None, .. }) => {}
             None => {}
         }
     } else if let Some((repository, _)) = app.selected_repository() {
@@ -1826,6 +1826,39 @@ mod tests {
         let loading = buffer_text(terminal.backend().buffer());
         assert!(loading.contains("loading GitHub PRs"));
         assert!(loading.contains("GitHub refreshing"));
+
+        app.github_loading = false;
+        app.github.insert(
+            path.clone(),
+            GitHubState::Ready(GitHubBranchData {
+                pull_request: Some(PullRequest {
+                    number: 42,
+                    title: "merged change".to_owned(),
+                    url: "https://github.com/base/project/pull/42".to_owned(),
+                    state: PullRequestState::Merged,
+                    updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                    review_decision: Some("APPROVED".to_owned()),
+                    auto_merge: false,
+                    base: PullRequestIdentity {
+                        repository: Some("base/project".to_owned()),
+                        branch: "main".to_owned(),
+                        oid: Some("base-sha".to_owned()),
+                    },
+                    head: PullRequestIdentity {
+                        repository: Some("base/project".to_owned()),
+                        branch: "topic".to_owned(),
+                        oid: Some("1234567890".to_owned()),
+                    },
+                    checks: CheckRollup::Success,
+                }),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let merged_buffer = terminal.backend().buffer();
+        assert!(buffer_text(merged_buffer).contains("PR #42 · merged"));
+        assert!(colored_text(merged_buffer, Color::Green).contains("merged"));
 
         let previous = GitHubBranchData {
             pull_request: None,

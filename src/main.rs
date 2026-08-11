@@ -9,6 +9,7 @@ mod config;
 mod git;
 mod github;
 mod materialize;
+mod merged_cleanup;
 mod model;
 mod operations;
 mod prompt;

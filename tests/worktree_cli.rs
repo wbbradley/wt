@@ -1,7 +1,10 @@
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
 
 #[test]
 fn creates_all_modes_reports_status_and_validates_conflicts() {
@@ -358,6 +361,197 @@ fn bare_repository_supports_crud_and_prune_preview_parity() {
     let after = fixture.wt(&["worktree", "prune-preview", "project"]);
     assert_success(&after);
     assert!(stdout(&after).is_empty());
+}
+
+#[test]
+fn remove_merged_previews_confirms_revalidates_and_preserves_branches() {
+    let fixture = Fixture::normal("remove merged");
+    let worktree = fixture.root.join("merged topic");
+    git(&fixture.anchor, &["branch", "topic"]);
+    create_existing(&fixture, &worktree, "topic");
+
+    let (base, preview_server) = fake_github_server(1);
+    git(
+        &fixture.anchor,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("{base}/base/project.git"),
+        ],
+    );
+    git(&fixture.anchor, &["config", "github.token", "test-token"]);
+    let cancelled = fixture.wt(&["worktree", "remove-merged", "project"]);
+    preview_server.join().unwrap();
+    assert_failure_contains(&cancelled, "operation cancelled");
+    assert!(stderr(&cancelled).contains("eligible\trepository=project\tbranch=topic"));
+    assert!(worktree.exists());
+
+    let (base, removal_server) = fake_github_server(2);
+    git(
+        &fixture.anchor,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &format!("{base}/base/project.git"),
+        ],
+    );
+    let removed = fixture.wt(&["worktree", "remove-merged", "project", "--yes"]);
+    removal_server.join().unwrap();
+    assert_success(&removed);
+    assert!(stdout(&removed).contains("removed\t"));
+    assert!(stderr(&removed).contains("result\tremoved=1\tskipped=1"));
+    assert!(!worktree.exists());
+    assert!(branch_exists(&fixture.anchor, "topic"));
+}
+
+#[test]
+fn remove_merged_requires_exactly_one_scope_and_completes_all() {
+    let fixture = Fixture::normal("remove merged scope");
+    let missing = fixture.wt(&["worktree", "remove-merged", "--yes"]);
+    assert_failure_contains(&missing, "required arguments were not provided");
+    let conflicting = fixture.wt(&["worktree", "remove-merged", "project", "--all", "--yes"]);
+    assert_failure_contains(&conflicting, "cannot be used with");
+    let completion = fixture.wt(&["__complete", "worktree", "remove-merged", ""]);
+    assert_success(&completion);
+    assert!(stdout(&completion).lines().any(|line| line == "--all"));
+    assert!(stdout(&completion).lines().any(|line| line == "project"));
+}
+
+#[test]
+fn remove_merged_all_cleans_every_registered_repository() {
+    let fixture = Fixture::normal("remove merged all");
+    let first_worktree = fixture.root.join("first topic");
+    git(&fixture.anchor, &["branch", "topic"]);
+    create_existing(&fixture, &first_worktree, "topic");
+
+    let second_anchor = fixture.root.join("second main");
+    let second_worktree = fixture.root.join("second topic");
+    git(
+        &fixture.root,
+        &["init", "-b", "main", second_anchor.to_str().unwrap()],
+    );
+    configure_identity(&second_anchor);
+    git(
+        &second_anchor,
+        &["commit", "--allow-empty", "-m", "initial"],
+    );
+    git(&second_anchor, &["branch", "topic-two"]);
+    assert_success(&fixture.wt(&[
+        "repo",
+        "add",
+        second_anchor.to_str().unwrap(),
+        "--label",
+        "second",
+    ]));
+    assert_success(&fixture.wt(&[
+        "worktree",
+        "create",
+        "second",
+        second_worktree.to_str().unwrap(),
+        "--branch",
+        "topic-two",
+        "--yes",
+    ]));
+
+    let (base, server) = fake_github_server(4);
+    for anchor in [&fixture.anchor, &second_anchor] {
+        git(
+            anchor,
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("{base}/base/project.git"),
+            ],
+        );
+        git(anchor, &["config", "github.token", "test-token"]);
+    }
+    let removed = fixture.wt(&["worktree", "remove-merged", "--all", "--yes"]);
+    server.join().unwrap();
+    assert_success(&removed);
+    assert!(stderr(&removed).contains("result\tremoved=2\tskipped=2"));
+    assert!(!first_worktree.exists());
+    assert!(!second_worktree.exists());
+    assert!(branch_exists(&fixture.anchor, "topic"));
+    assert!(branch_exists(&second_anchor, "topic-two"));
+}
+
+fn fake_github_server(request_count: usize) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for stream in listener.incoming().take(request_count) {
+            let mut stream = stream.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap();
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request: serde_json::Value =
+                serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+            let head = request["variables"]["branch0"].as_str().unwrap();
+            let body = serde_json::json!({
+                "data": {
+                    "repository": {
+                        "branch0": {
+                            "associatedPullRequests": {
+                                "nodes": [{
+                                    "number": 42,
+                                    "title": "merged change",
+                                    "url": "https://example.test/base/project/pull/42",
+                                    "state": "MERGED",
+                                    "isDraft": false,
+                                    "mergedAt": "2026-08-01T00:00:00Z",
+                                    "updatedAt": "2026-08-01T00:00:00Z",
+                                    "reviewDecision": "APPROVED",
+                                    "autoMergeRequest": null,
+                                    "baseRefName": "main",
+                                    "baseRefOid": "base",
+                                    "baseRepository": {"nameWithOwner": "base/project"},
+                                    "headRefName": "topic",
+                                    "headRefOid": head,
+                                    "headRepository": {"nameWithOwner": "base/project"},
+                                    "commits": {"nodes": []}
+                                }]
+                            }
+                        }
+                    },
+                    "rateLimit": {"remaining": 100, "resetAt": "2026-08-11T12:00:00Z"}
+                }
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        }
+    });
+    (format!("http://{address}"), server)
 }
 
 struct Fixture {

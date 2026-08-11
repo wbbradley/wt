@@ -9,6 +9,9 @@ use thiserror::Error;
 
 use crate::config;
 use crate::git::{self, GitRunner, SystemGit};
+use crate::merged_cleanup::{
+    self, CleanupDisposition, CleanupOutcome as MergedCleanupOutcome, LivePullRequestLookup,
+};
 use crate::model::{Catalog, RepositoryConfig};
 use crate::operations::{self, CreateMode};
 use crate::tui;
@@ -106,6 +109,8 @@ enum WorktreeCommand {
     Remove(MutationSelectorArgs),
     /// Explicitly force-remove a dirty or locked linked worktree.
     ForceRemove(ForceRemoveArgs),
+    /// Safely remove linked worktrees whose exact pull request heads are merged.
+    RemoveMerged(RemoveMergedArgs),
     /// Show exactly what Git would prune.
     PrunePreview { repository: String },
     /// Preview, confirm, and prune stale administrative records.
@@ -191,6 +196,24 @@ struct ForceRemoveArgs {
     /// Must exactly match the branch name or full worktree path.
     #[arg(long)]
     confirm: String,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("scope")
+        .required(true)
+        .multiple(false)
+        .args(["repository", "all"])
+))]
+struct RemoveMergedArgs {
+    /// Limit cleanup to one registered repository.
+    repository: Option<String>,
+    /// Clean merged-PR worktrees across the full catalog.
+    #[arg(long)]
+    all: bool,
+    /// Accept the displayed cleanup plan.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -643,6 +666,7 @@ fn complete_worktree(
                 "prune",
                 "prune-preview",
                 "remove",
+                "remove-merged",
                 "repair",
                 "unlock",
             ]
@@ -683,6 +707,7 @@ fn complete_worktree(
         "move" => &["--create-parents", "--yes"],
         "lock" => &["--reason", "--yes"],
         "unlock" | "remove" | "repair" | "prune" => &["--yes"],
+        "remove-merged" => &["--all", "--yes"],
         "force-remove" => &["--confirm"],
         _ => &[],
     };
@@ -791,6 +816,9 @@ fn worktree(
         WorktreeCommand::Remove(arguments) => remove_worktree(runner, catalog, arguments),
         WorktreeCommand::ForceRemove(arguments) => {
             force_remove_worktree(runner, catalog, arguments)
+        }
+        WorktreeCommand::RemoveMerged(arguments) => {
+            remove_merged_worktrees(runner, catalog, arguments)
         }
         WorktreeCommand::PrunePreview {
             repository: selector,
@@ -981,6 +1009,84 @@ fn force_remove_worktree(
         &arguments.confirm,
     )?;
     println!("force-removed\t{}", details.worktree.path.display());
+    Ok(())
+}
+
+fn remove_merged_worktrees(
+    runner: &dyn GitRunner,
+    catalog: &Catalog,
+    arguments: RemoveMergedArgs,
+) -> Result<(), CliError> {
+    let repositories = if arguments.all {
+        catalog.repositories.clone()
+    } else {
+        vec![
+            repository(
+                catalog,
+                arguments.repository.as_deref().expect("scope is required"),
+            )?
+            .clone(),
+        ]
+    };
+    let current = env::current_dir().map_err(CliError::CurrentDirectory)?;
+    let lookup = LivePullRequestLookup::new();
+    let plan = merged_cleanup::plan(runner, &lookup, &repositories, &current);
+    let eligible = plan.iter().filter(|record| record.eligible()).count();
+    for record in &plan {
+        let pull_request = record
+            .identity
+            .as_ref()
+            .map(|identity| {
+                format!(
+                    "{}/{}#{}",
+                    identity.repository.host,
+                    identity.repository.full_name(),
+                    identity.number
+                )
+            })
+            .unwrap_or_else(|| "-".to_owned());
+        match &record.disposition {
+            CleanupDisposition::Eligible => eprintln!(
+                "eligible\trepository={}\tbranch={}\tpath={}\tpr={pull_request}",
+                record.repository.display_label(),
+                record.branch(),
+                record.path().display(),
+            ),
+            CleanupDisposition::Skipped(reason) => eprintln!(
+                "skipped\trepository={}\tbranch={}\tpath={}\tpr={pull_request}\treason={reason}",
+                record.repository.display_label(),
+                record.branch(),
+                record.path().display(),
+            ),
+        }
+    }
+    eprintln!(
+        "preview\teligible={eligible}\tskipped={}",
+        plan.len().saturating_sub(eligible)
+    );
+    if eligible == 0 {
+        return Ok(());
+    }
+    confirm(
+        arguments.yes,
+        "Remove exactly these eligible merged-PR worktrees?",
+    )?;
+    let outcomes = merged_cleanup::execute(runner, &lookup, &plan, &current);
+    let mut removed = 0;
+    let mut skipped = plan.len().saturating_sub(eligible);
+    for outcome in outcomes {
+        match outcome {
+            MergedCleanupOutcome::Removed(path) => {
+                removed += 1;
+                println!("removed\t{}", path.display());
+            }
+            MergedCleanupOutcome::Skipped { path, reason } => {
+                skipped += 1;
+                eprintln!("skipped\tpath={}\treason={reason}", path.display());
+            }
+        }
+    }
+    eprintln!("result\tremoved={removed}\tskipped={skipped}");
     Ok(())
 }
 

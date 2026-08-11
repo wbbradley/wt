@@ -396,6 +396,12 @@ pub struct GitHubRefresh {
     pub active_pull_requests: HashSet<CanonicalPullRequestId>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssociatedPullRequest {
+    pub identity: CanonicalPullRequestId,
+    pub pull_request: PullRequest,
+}
+
 #[derive(Clone)]
 pub struct GitHubService {
     agent: ureq::Agent,
@@ -412,12 +418,19 @@ struct Suppression {
 struct BranchTarget {
     worktree: PathBuf,
     branch: String,
+    head: Option<String>,
 }
 
 struct BranchBatchRefresh {
     branches: Vec<Result<GitHubBranchData, GitHubError>>,
+    associations: Vec<Result<Vec<AssociatedPullRequest>, GitHubError>>,
     active_pull_requests: HashSet<CanonicalPullRequestId>,
 }
+
+type ParsedBatchData = (
+    Vec<Result<GitHubBranchData, GitHubError>>,
+    Vec<Result<Vec<AssociatedPullRequest>, GitHubError>>,
+);
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct FetchGroupKey {
@@ -473,6 +486,7 @@ impl GitHubService {
                         .push(BranchTarget {
                             worktree: worktree.path.clone(),
                             branch: branch.to_owned(),
+                            head: worktree.head.clone(),
                         }),
                     Err(error) => {
                         refresh.branches.insert(worktree.path.clone(), Err(error));
@@ -514,6 +528,39 @@ impl GitHubService {
             }
         }
         refresh
+    }
+
+    pub fn fetch_associated_pull_requests_with(
+        &self,
+        runner: &dyn GitRunner,
+        credentials: &dyn CredentialProvider,
+        repository: &RepositoryConfig,
+        worktree: &Worktree,
+    ) -> Result<Vec<AssociatedPullRequest>, GitHubError> {
+        let branch = worktree
+            .branch
+            .as_deref()
+            .and_then(|branch| branch.strip_prefix("refs/heads/"))
+            .ok_or_else(|| GitHubError::Malformed("worktree has no local branch".to_owned()))?;
+        let head = worktree
+            .head
+            .clone()
+            .ok_or_else(|| GitHubError::Malformed("worktree head commit is missing".to_owned()))?;
+        let remote = resolve_branch_remote(runner, repository, branch)?;
+        let token = resolve_token(credentials, &remote.host, &repository.path)?;
+        if let Some(error) = self.suppressed_error(&remote.host) {
+            return Err(error);
+        }
+        let target = BranchTarget {
+            worktree: worktree.path.clone(),
+            branch: branch.to_owned(),
+            head: Some(head),
+        };
+        let mut batch = self.fetch_batch(&remote, &token, &[target])?;
+        batch
+            .associations
+            .pop()
+            .ok_or_else(|| GitHubError::Malformed("association response is missing".to_owned()))?
     }
 
     pub fn fetch_authored_with(
@@ -994,9 +1041,17 @@ impl GitHubService {
         }
         let active_pull_requests =
             canonical_associated_pull_requests(&data, targets.len(), &remote.host);
-        let outcomes = parse_batch_data(&data, targets, &envelope.errors, &warnings, rate)?;
+        let (outcomes, associations) = parse_batch_data(
+            &data,
+            targets,
+            &envelope.errors,
+            &warnings,
+            rate,
+            &remote.host,
+        )?;
         Ok(BranchBatchRefresh {
             branches: outcomes,
+            associations,
             active_pull_requests,
         })
     }
@@ -1477,7 +1532,7 @@ fn canonical_associated_pull_requests(
     (0..target_count)
         .flat_map(|index| {
             data.pointer(&format!(
-                "/repository/branch{index}/target/associatedPullRequests/nodes"
+                "/repository/branch{index}/associatedPullRequests/nodes"
             ))
             .and_then(Value::as_array)
             .into_iter()
@@ -1712,21 +1767,24 @@ fn build_query(
         declarations.push(format!("$branch{index}: String!"));
         variables.insert(
             format!("branch{index}"),
-            Value::String(format!("refs/heads/{}", target.branch)),
+            Value::String(
+                target
+                    .head
+                    .clone()
+                    .unwrap_or_else(|| format!("refs/heads/{}", target.branch)),
+            ),
         );
         aliases.push_str(&format!(
             r#"
-            branch{index}: ref(qualifiedName: $branch{index}) {{
-              target {{
-                ... on Commit {{
-                  associatedPullRequests(first: 20) {{
-                    nodes {{
-                      number title url state isDraft mergedAt updatedAt reviewDecision
-                      autoMergeRequest {{ enabledAt }}
-                      baseRefName baseRefOid baseRepository {{ nameWithOwner }}
-                      headRefName headRefOid headRepository {{ nameWithOwner }}
-                      commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state }} }} }} }}
-                    }}
+            branch{index}: object(expression: $branch{index}) {{
+              ... on Commit {{
+                associatedPullRequests(first: 20) {{
+                  nodes {{
+                    number title url state isDraft mergedAt updatedAt reviewDecision
+                    autoMergeRequest {{ enabledAt }}
+                    baseRefName baseRefOid baseRepository {{ nameWithOwner }}
+                    headRefName headRefOid headRepository {{ nameWithOwner }}
+                    commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state }} }} }} }}
                   }}
                 }}
               }}
@@ -1752,13 +1810,15 @@ fn parse_batch_data(
     errors: &[GraphQlResponseError],
     warnings: &[String],
     rate: Option<RateLimit>,
-) -> Result<Vec<Result<GitHubBranchData, GitHubError>>, GitHubError> {
+    host: &str,
+) -> Result<ParsedBatchData, GitHubError> {
     let repository = match data.get("repository").and_then(Value::as_object) {
         Some(repository) => repository,
         None if !warnings.is_empty() => return Err(classify_graphql_errors(warnings)),
         None => return Err(GitHubError::Malformed("missing repository data".to_owned())),
     };
     let mut outcomes = Vec::with_capacity(targets.len());
+    let mut associations = Vec::with_capacity(targets.len());
     for (index, target) in targets.iter().enumerate() {
         let alias = format!("branch{index}");
         let alias_errors: Vec<String> = errors
@@ -1767,33 +1827,39 @@ fn parse_batch_data(
             .map(|error| error.message.clone())
             .collect();
         let Some(reference) = repository.get(&alias) else {
-            outcomes.push(Err(classify_graphql_errors(if alias_errors.is_empty() {
+            let error = classify_graphql_errors(if alias_errors.is_empty() {
                 warnings
             } else {
                 &alias_errors
-            })));
+            });
+            outcomes.push(Err(error.clone()));
+            associations.push(Err(error));
             continue;
         };
         if reference.is_null() {
-            outcomes.push(Err(if alias_errors.is_empty() {
+            let error = if alias_errors.is_empty() {
                 GitHubError::BranchNotFound(target.branch.clone())
             } else {
                 classify_graphql_errors(&alias_errors)
-            }));
+            };
+            outcomes.push(Err(error.clone()));
+            associations.push(Err(error));
             continue;
         }
         let nodes = reference
-            .pointer("/target/associatedPullRequests/nodes")
+            .pointer("/associatedPullRequests/nodes")
             .and_then(Value::as_array);
         let Some(nodes) = nodes else {
-            outcomes.push(Err(if alias_errors.is_empty() {
+            let error = if alias_errors.is_empty() {
                 GitHubError::Malformed(format!(
                     "missing associated pull requests for {}",
                     target.branch
                 ))
             } else {
                 classify_graphql_errors(&alias_errors)
-            }));
+            };
+            outcomes.push(Err(error.clone()));
+            associations.push(Err(error));
             continue;
         };
         let mut pull_requests = Vec::new();
@@ -1805,9 +1871,32 @@ fn parse_batch_data(
             }
         }
         if pull_requests.is_empty() && !malformed.is_empty() {
-            outcomes.push(Err(GitHubError::Malformed(malformed.join("; "))));
+            let error = GitHubError::Malformed(malformed.join("; "));
+            outcomes.push(Err(error.clone()));
+            associations.push(Err(error));
             continue;
         }
+        let strict_associations = if !warnings.is_empty() || !malformed.is_empty() {
+            let mut errors = warnings.to_vec();
+            errors.extend(malformed.clone());
+            Err(GitHubError::Malformed(errors.join("; ")))
+        } else {
+            pull_requests
+                .iter()
+                .map(|pull_request| {
+                    canonical_pull_request_id(host, pull_request)
+                        .map(|identity| AssociatedPullRequest {
+                            identity,
+                            pull_request: pull_request.clone(),
+                        })
+                        .ok_or_else(|| {
+                            GitHubError::Malformed(
+                                "associated pull request base repository is missing".to_owned(),
+                            )
+                        })
+                })
+                .collect()
+        };
         let pull_request = prefer_pull_request(pull_requests);
         let mut branch_warnings = warnings.to_vec();
         branch_warnings.extend(malformed);
@@ -1816,8 +1905,9 @@ fn parse_batch_data(
             warnings: deduplicate(branch_warnings),
             rate_limit: rate.clone(),
         }));
+        associations.push(strict_associations);
     }
-    Ok(outcomes)
+    Ok((outcomes, associations))
 }
 
 fn normalize_pull_request(node: &Value) -> Result<PullRequest, GitHubError> {
@@ -2211,7 +2301,7 @@ mod tests {
                 (
                     format!("branch{index}"),
                     serde_json::json!({
-                        "target": {"associatedPullRequests": {"nodes": []}}
+                        "associatedPullRequests": {"nodes": []}
                     }),
                 )
             })
@@ -2993,10 +3083,8 @@ mod tests {
         let data = serde_json::json!({
             "repository": {
                 "branch0": {
-                    "target": {
-                        "associatedPullRequests": {
-                            "nodes": [pull_request(1, "base"), pull_request(2, "other")]
-                        }
+                    "associatedPullRequests": {
+                        "nodes": [pull_request(1, "base"), pull_request(2, "other")]
                     }
                 }
             }
@@ -3011,6 +3099,54 @@ mod tests {
             repository: identity("github.com", "other", "project"),
             number: 2,
         }));
+    }
+
+    #[test]
+    fn strict_association_results_keep_all_prs_and_reject_partial_parsing() {
+        let target = BranchTarget {
+            worktree: PathBuf::from("/tree"),
+            branch: "topic".to_owned(),
+            head: Some("headoid".to_owned()),
+        };
+        let first = authored_node(1, "viewer", false);
+        let second = authored_node(2, "viewer", false);
+        let data = serde_json::json!({
+            "repository": {
+                "branch0": {
+                    "associatedPullRequests": {"nodes": [first, second]}
+                }
+            }
+        });
+        let (_, associations) = parse_batch_data(
+            &data,
+            std::slice::from_ref(&target),
+            &[],
+            &[],
+            None,
+            "github.com",
+        )
+        .unwrap();
+        let associations = associations.into_iter().next().unwrap().unwrap();
+        assert_eq!(associations.len(), 2);
+        assert_eq!(associations[0].identity.number, 1);
+        assert_eq!(associations[1].identity.number, 2);
+
+        let partial = serde_json::json!({
+            "repository": {
+                "branch0": {
+                    "associatedPullRequests": {
+                        "nodes": [authored_node(1, "viewer", false), {"number": 2}]
+                    }
+                }
+            }
+        });
+        let (display, associations) =
+            parse_batch_data(&partial, &[target], &[], &[], None, "github.com").unwrap();
+        assert!(
+            display[0].is_ok(),
+            "the TUI may retain the usable PR plus a warning"
+        );
+        assert!(matches!(associations[0], Err(GitHubError::Malformed(_))));
     }
 
     #[test]
@@ -3182,7 +3318,15 @@ mod tests {
                 .count();
             batch_sizes.push(branches);
             assert!(branches <= MAX_BRANCHES_PER_BATCH);
-            assert!(!body["query"].as_str().unwrap().contains("topic-0"));
+            assert!(
+                variables
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("branch"))
+                    .all(|(_, value)| value == "abcdef")
+            );
+            let query = body["query"].as_str().unwrap();
+            assert!(query.contains("object(expression: $branch0)"));
+            assert!(!query.contains("topic-0"));
         }
         batch_sizes.sort_unstable();
         assert_eq!(batch_sizes, vec![1, MAX_BRANCHES_PER_BATCH]);
@@ -3193,7 +3337,7 @@ mod tests {
         let body = serde_json::json!({
             "data": {
                 "repository": {
-                    "branch0": {"target": {"associatedPullRequests": {"nodes": []}}}
+                    "branch0": {"associatedPullRequests": {"nodes": []}}
                 },
                 "rateLimit": {"remaining": 10, "resetAt": "2026-07-30T12:00:00Z"}
             },
@@ -3236,7 +3380,7 @@ mod tests {
         ));
         let data = serde_json::json!({"repository": null});
         assert!(matches!(
-            parse_batch_data(&data, &[], &[], &errors, None),
+            parse_batch_data(&data, &[], &[], &errors, None, "github.com"),
             Err(GitHubError::Sso(_))
         ));
         assert_eq!(

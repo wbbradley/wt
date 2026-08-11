@@ -122,14 +122,26 @@ wt worktree create project ~/trees/review --detach abc123 --create-parents
 
 Mutating commands print an exact preview and prompt unless `--yes` is supplied where supported. See `wt worktree --help` for move, lock, unlock, repair, remove, force-remove, prune-preview, and prune syntax.
 
+Remove clean linked worktrees whose exact checked-out commits are the recorded heads of merged pull requests:
+
+```bash
+wt worktree remove-merged project
+wt worktree remove-merged --all
+wt worktree remove-merged --all --yes
+```
+
+`remove-merged` performs live GitHub requests and prints every eligible worktree and refusal before one confirmation. It uses a branch's canonical materialization marker when present; otherwise the exact commit must have one unambiguous associated PR. The command does not trust cached TUI data.
+
 ### Safety rules
 
 - Normal removal refuses bare anchors, main worktrees, the worktree containing `$PWD`, locked worktrees, and dirty worktrees.
 - Top-level `wt -x` is the explicit exception for the worktree containing `$PWD`; it retains the bare, main, locked, and dirty protections.
 - Removal does not delete the branch.
+- Merged-PR cleanup additionally requires a live `merged` PR whose `headRefOid` exactly equals the worktree's current HEAD. It refuses ambiguous associations, missing or partial GitHub data, local changes including untracked files, locks, main/bare/detached/current/prunable worktrees, and any candidate that changes before execution. It revalidates each candidate and never escalates to force removal.
 - Force removal is a distinct command and requires `--confirm` to exactly match the branch or full worktree path.
 - Missing parent directories at or below a repository's configured `worktree_root` are created automatically; anywhere else they need `--create-parents`.
 - Prune displays `git worktree prune --dry-run --verbose` output and confirms the same preview before acting.
+- Prune only removes stale Git administrative records; `remove-merged` is the separate command that removes live worktree directories while preserving their local branches and PR markers.
 - Catalog removal only unregisters metadata; it never deletes a repository or worktree.
 - Git is always invoked with argument arrays rather than shell command strings.
 
