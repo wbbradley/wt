@@ -22,6 +22,7 @@ const DANGER: Color = Color::Red;
 const PR_NUMBER: Color = Color::Rgb(255, 165, 0);
 const MUTED: Color = Color::DarkGray;
 const SELECTION: Color = Color::Rgb(45, 55, 72);
+const GITHUB_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -157,7 +158,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         pull_request_tree_spans(pull_request, details, false, backburnered)
                     })
                     .unwrap_or_default();
-                suffix.extend(github_freshness_spans(github_state));
+                suffix.extend(github_freshness_spans(
+                    app.github_network_active(&worktree.path),
+                    app.github_spinner_frame(),
+                ));
                 suffix.extend(local_state_spans(
                     app.statuses.get(&worktree.path),
                     worktree,
@@ -455,10 +459,14 @@ fn pull_request_tree_spans(
     spans
 }
 
-fn github_freshness_spans(state: Option<&GitHubState>) -> Vec<Span<'static>> {
-    match state {
-        Some(GitHubState::Loading { .. }) => vec![tree_label("GitHub refreshing", Color::Yellow)],
-        Some(GitHubState::Stale { .. } | GitHubState::Ready(_)) | None => Vec::new(),
+fn github_freshness_spans(network_active: bool, spinner_frame: usize) -> Vec<Span<'static>> {
+    if network_active {
+        vec![tree_label(
+            GITHUB_SPINNER_FRAMES[spinner_frame % GITHUB_SPINNER_FRAMES.len()],
+            Color::Yellow,
+        )]
+    } else {
+        Vec::new()
     }
 }
 
@@ -666,9 +674,12 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             )),
             None => {}
         }
+        let github_network_active = app.github_network_active(&worktree.path);
+        if github_network_active {
+            lines.push(field("GitHub", "loading…".to_owned()));
+        }
         match app.github.get(&worktree.path) {
             Some(GitHubState::Loading { previous }) => {
-                lines.push(field("GitHub", "loading…".to_owned()));
                 if let Some(data) = previous {
                     append_github_details(&mut lines, data);
                 }
@@ -1818,16 +1829,19 @@ mod tests {
         };
         let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
         app.selected = Some(RowId::Worktree(path.clone()));
-        app.github_loading = true;
-        app.github
-            .insert(path.clone(), GitHubState::Loading { previous: None });
+        let generation = app.begin_github_refresh(std::slice::from_ref(&path));
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let loading = buffer_text(terminal.backend().buffer());
         assert!(loading.contains("loading GitHub PRs"));
-        assert!(loading.contains("GitHub refreshing"));
+        assert!(loading.contains("· ⠋"));
+        assert!(!loading.contains("GitHub refreshing"));
 
-        app.github_loading = false;
+        app.advance_github_spinner();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("· ⠙"));
+
+        app.apply_pull_request_details(generation, Default::default());
         app.github.insert(
             path.clone(),
             GitHubState::Ready(GitHubBranchData {

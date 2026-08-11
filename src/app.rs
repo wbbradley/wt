@@ -399,6 +399,8 @@ pub struct App {
     pub github: HashMap<PathBuf, GitHubState>,
     pub github_generation: u64,
     pub github_loading: bool,
+    github_network_paths: HashSet<PathBuf>,
+    github_spinner_frame: usize,
     pub github_hosts: BTreeSet<String>,
     pub authored_pull_requests: AuthoredPullRequestState,
     pub active_pull_requests: HashSet<CanonicalPullRequestId>,
@@ -438,6 +440,8 @@ impl App {
             github: HashMap::new(),
             github_generation: 0,
             github_loading: false,
+            github_network_paths: HashSet::new(),
+            github_spinner_frame: 0,
             github_hosts: BTreeSet::new(),
             authored_pull_requests: AuthoredPullRequestState::default(),
             active_pull_requests: HashSet::new(),
@@ -1662,12 +1666,30 @@ impl App {
     pub fn begin_github_refresh(&mut self, paths: &[PathBuf]) -> u64 {
         self.github_generation = self.github_generation.wrapping_add(1);
         self.github_loading = !paths.is_empty();
+        self.github_network_paths = paths.iter().cloned().collect();
+        self.github_spinner_frame = 0;
         for path in paths {
             let previous = self.github.get(path).and_then(GitHubState::data).cloned();
             self.github
                 .insert(path.clone(), GitHubState::Loading { previous });
         }
         self.github_generation
+    }
+
+    pub fn advance_github_spinner(&mut self) {
+        self.github_spinner_frame = self.github_spinner_frame.wrapping_add(1);
+    }
+
+    pub fn github_spinner_frame(&self) -> usize {
+        self.github_spinner_frame
+    }
+
+    pub fn github_network_active(&self, path: &Path) -> bool {
+        self.github_network_paths.contains(path)
+    }
+
+    pub fn has_github_network_activity(&self) -> bool {
+        !self.github_network_paths.is_empty()
     }
 
     pub fn apply_github_refresh(
@@ -1679,6 +1701,16 @@ impl App {
         if generation != self.github_generation {
             return false;
         }
+        let detail_paths = paths
+            .iter()
+            .filter(|path| {
+                results
+                    .get(*path)
+                    .and_then(|result| result.as_ref().ok())
+                    .is_some_and(|data| data.pull_request.is_some())
+            })
+            .cloned()
+            .collect();
         for path in paths {
             let previous = self.github.get(path).and_then(GitHubState::data).cloned();
             let state = match results.remove(path) {
@@ -1695,6 +1727,9 @@ impl App {
             self.github.insert(path.clone(), state);
         }
         self.github_loading = false;
+        // Branch lookup is complete, but PR detail hydration is another network
+        // request. Keep those worktrees visibly busy until its result arrives.
+        self.github_network_paths = detail_paths;
         true
     }
 
@@ -1706,6 +1741,7 @@ impl App {
         if generation != self.github_generation {
             return false;
         }
+        self.github_network_paths.clear();
         for (identity, result) in results {
             match result {
                 Ok(details) => {
@@ -3991,6 +4027,7 @@ mod tests {
         let mut results = HashMap::new();
         results.insert(path.clone(), Ok(data.clone()));
         assert!(app.apply_github_refresh(first, std::slice::from_ref(&path), results));
+        assert!(!app.github_network_active(&path));
 
         let second = app.begin_github_refresh(std::slice::from_ref(&path));
         assert!(!app.apply_github_refresh(first, std::slice::from_ref(&path), HashMap::new(),));
@@ -4004,6 +4041,29 @@ mod tests {
                 error,
             }) if previous == &data && error.contains("authentication")
         ));
+    }
+
+    #[test]
+    fn github_network_activity_covers_branch_and_pr_detail_requests() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let path = PathBuf::from("/repo-topic");
+        let generation = app.begin_github_refresh(std::slice::from_ref(&path));
+        assert!(app.github_network_active(&path));
+
+        let data = GitHubBranchData {
+            pull_request: Some(authored("team", "project", 42, "now").pull_request),
+            warnings: Vec::new(),
+            rate_limit: None,
+        };
+        assert!(app.apply_github_refresh(
+            generation,
+            std::slice::from_ref(&path),
+            HashMap::from([(path.clone(), Ok(data))]),
+        ));
+        assert!(app.github_network_active(&path));
+
+        assert!(app.apply_pull_request_details(generation, BTreeMap::new()));
+        assert!(!app.github_network_active(&path));
     }
 
     #[test]

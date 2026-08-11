@@ -27,6 +27,7 @@ use crate::terminal::{InteractiveTerminal, PanicHookGuard};
 use crate::ui;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
 const MIN_GITHUB_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 enum GitHubMessage {
@@ -181,6 +182,7 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
     terminal
         .terminal_mut()
         .draw(|frame| ui::render(frame, &mut controller.app))?;
+    let mut next_animation = Instant::now() + ANIMATION_INTERVAL;
 
     loop {
         if controller.pump_background_results() {
@@ -193,6 +195,13 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
             return Ok(Some(selection));
         }
         if !event::poll(EVENT_POLL_INTERVAL)? {
+            if controller.app.has_github_network_activity() && Instant::now() >= next_animation {
+                controller.app.advance_github_spinner();
+                terminal
+                    .terminal_mut()
+                    .draw(|frame| ui::render(frame, &mut controller.app))?;
+                next_animation = Instant::now() + ANIMATION_INTERVAL;
+            }
             continue;
         }
         match event::read()? {

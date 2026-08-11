@@ -83,7 +83,7 @@ Tree status language:
 - Outstanding reviews read `review required`, changes requests remain explicit, and unresolved feedback is shown as a comment count. Approved and unknown review states stay out of the main tree line.
 - Only actual merge conflicts appear in the tree. `[auto-merge]` appears only when auto-merge is enabled.
 - `draft`, `merged`, and `closed` show non-open PR state. Local state uses full labels such as `3 local changes`, `locked`, and `prunable`; `●` marks the current worktree.
-- `GitHub refreshing` means remote data is loading. A previously loaded snapshot remains visible without an extra stale badge if a later refresh fails. PR numbers are always orange.
+- An animated yellow spinner means remote data is loading. A previously loaded snapshot remains visible without an extra stale badge if a later refresh fails. PR numbers are always orange.
 
 Press `n` on a repository or one of its worktrees for the common new-worktree flow. The form pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk branch. The new local branch tracks that remote branch; after creation `wt` caches the worktree, exits, and changes the invoking shell into it.
 
