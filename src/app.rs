@@ -1052,9 +1052,9 @@ impl App {
             );
         }
 
-        let feedback = details
+        let feedback: Vec<_> = details
             .as_ref()
-            .map(|details| details.feedback.clone())
+            .map(|details| details.unresolved_feedback().cloned().collect())
             .unwrap_or_default();
         let feedback_expanded = self.detail_section_expanded(&identity, DetailSection::Feedback);
         rows.push(DetailRow {
@@ -2245,7 +2245,7 @@ impl App {
                 .collect(),
             feedback: details
                 .into_iter()
-                .flat_map(|details| details.feedback.iter())
+                .flat_map(PullRequestDetails::unresolved_feedback)
                 .cloned()
                 .collect(),
         }
@@ -2937,7 +2937,7 @@ fn pull_request_details_search_text(details: &PullRequestDetails) -> String {
             format!("{:?}", review.state),
         ]
     }));
-    parts.extend(details.feedback.iter().flat_map(|feedback| {
+    parts.extend(details.unresolved_feedback().flat_map(|feedback| {
         [
             feedback.id.clone(),
             feedback
@@ -3724,7 +3724,7 @@ mod tests {
                         id: format!("feedback-{}", pull_request.identity.number),
                         database_id: None,
                         thread_id: None,
-                        kind: crate::model::FeedbackKind::ReviewSummary,
+                        kind: crate::model::FeedbackKind::InlineThread,
                         author: "reviewer".to_owned(),
                         body: format!("body {}", pull_request.identity.number),
                         path: None,

@@ -48,7 +48,7 @@ An ambiguous qualified selector opens the TUI prefiltered instead of guessing. T
 
 ## TUI
 
-The initial selection is the worktree containing the current directory. Repository rows can be collapsed, and the detail pane shows local status and administrative state. For PR selections, Details is a tree with a one-line PR summary and collapsible Overview, Checks, Reviews, and Feedback sections. Overview, Checks, and Reviews start collapsed with their rollup state and counts visible on the header; unresolved Feedback starts expanded. Expanded checks are ordered with failures first, and every check, reviewer/request, review, and feedback item is keyboard-selectable. Loading or stale snapshots remain visible and labeled.
+The initial selection is the worktree containing the current directory. Repository rows can be collapsed, and the detail pane shows local status and administrative state. For PR selections, Details is a tree with a one-line PR summary and collapsible Overview, Checks, Reviews, and Feedback sections. Overview, Checks, and Reviews start collapsed with their rollup state and counts visible on the header; unresolved Feedback starts expanded. Resolved review threads and historical review-summary bodies are omitted from Feedback. Expanded checks are ordered with failures first, and every check, reviewer/request, review, and feedback item is keyboard-selectable. Loading or stale snapshots remain visible and labeled.
 
 Navigation keys:
 

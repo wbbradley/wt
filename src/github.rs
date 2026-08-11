@@ -1173,9 +1173,6 @@ fn parse_pull_request_attention(node: &Value, details: &mut PullRequestDetails) 
         if let Some(parsed) = parse_reviewer_review(review) {
             details.reviewer_reviews.push(parsed);
         }
-        if let Some(feedback) = parse_review_summary(review) {
-            details.feedback.push(feedback);
-        }
     }
     details.reviews_complete =
         connection_complete(node.get("reviewRequests")) && connection_complete(node.get("reviews"));
@@ -1283,24 +1280,6 @@ fn parse_reviewer_review(node: &Value) -> Option<ReviewerReview> {
             .get("submittedAt")
             .and_then(Value::as_str)
             .map(str::to_owned),
-    })
-}
-
-fn parse_review_summary(node: &Value) -> Option<PullRequestFeedback> {
-    let body = node.get("body")?.as_str()?.trim();
-    if body.is_empty() {
-        return None;
-    }
-    Some(PullRequestFeedback {
-        id: node.get("id")?.as_str()?.to_owned(),
-        database_id: node.get("databaseId").and_then(Value::as_u64),
-        thread_id: None,
-        kind: FeedbackKind::ReviewSummary,
-        author: actor_name(node.get("author")),
-        body: body.to_owned(),
-        path: None,
-        permalink: node.get("url").and_then(Value::as_str).map(str::to_owned),
-        outdated: false,
     })
 }
 
@@ -2381,19 +2360,34 @@ mod tests {
                             "pageInfo": {"hasNextPage": false}
                         },
                         "reviewThreads": {
-                            "nodes": [{
-                                "id": "THREAD_1", "isResolved": false,
-                                "isOutdated": false, "path": "src/lib.rs",
-                                "comments": {
-                                    "nodes": [{
-                                        "id": "COMMENT_1", "databaseId": 101,
-                                        "author": {"login": "reviewer"},
-                                        "body": "This can deadlock",
-                                        "url": "https://example/comment/101"
-                                    }],
-                                    "pageInfo": {"hasPreviousPage": false}
+                            "nodes": [
+                                {
+                                    "id": "THREAD_1", "isResolved": false,
+                                    "isOutdated": false, "path": "src/lib.rs",
+                                    "comments": {
+                                        "nodes": [{
+                                            "id": "COMMENT_1", "databaseId": 101,
+                                            "author": {"login": "reviewer"},
+                                            "body": "This can deadlock",
+                                            "url": "https://example/comment/101"
+                                        }],
+                                        "pageInfo": {"hasPreviousPage": false}
+                                    }
+                                },
+                                {
+                                    "id": "THREAD_RESOLVED", "isResolved": true,
+                                    "isOutdated": false, "path": "src/old.rs",
+                                    "comments": {
+                                        "nodes": [{
+                                            "id": "COMMENT_RESOLVED", "databaseId": 102,
+                                            "author": {"login": "reviewer"},
+                                            "body": "Already fixed",
+                                            "url": "https://example/comment/102"
+                                        }],
+                                        "pageInfo": {"hasPreviousPage": false}
+                                    }
                                 }
-                            }],
+                            ],
                             "pageInfo": {"hasNextPage": false}
                         },
                         "commits": {"nodes": [{"commit": {"statusCheckRollup": {
@@ -2688,12 +2682,18 @@ mod tests {
         assert_eq!(details.attention_summary().optional_failures, 1);
         assert_eq!(details.review_requests[0].name, "maintainers");
         assert_eq!(details.reviewer_reviews[0].database_id, Some(91));
-        assert_eq!(details.feedback.len(), 2);
+        assert_eq!(details.feedback.len(), 1);
         assert!(
             details
                 .feedback
                 .iter()
                 .any(|feedback| feedback.database_id == Some(101))
+        );
+        assert!(
+            details
+                .feedback
+                .iter()
+                .all(|feedback| feedback.database_id != Some(102))
         );
     }
 

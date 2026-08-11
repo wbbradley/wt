@@ -281,6 +281,12 @@ impl PullRequestAttentionSummary {
 }
 
 impl PullRequestDetails {
+    pub fn unresolved_feedback(&self) -> impl Iterator<Item = &PullRequestFeedback> {
+        self.feedback
+            .iter()
+            .filter(|feedback| feedback.kind == FeedbackKind::InlineThread)
+    }
+
     pub fn normalize_checks(&mut self) {
         let mut checks = BTreeMap::<String, PullRequestCheck>::new();
         for check in std::mem::take(&mut self.checks) {
@@ -362,11 +368,7 @@ impl PullRequestDetails {
         PullRequestAttentionSummary {
             required_checks: self.required_check_readiness(),
             review: self.review_readiness(),
-            unresolved_feedback: self
-                .feedback
-                .iter()
-                .filter(|feedback| feedback.kind == FeedbackKind::InlineThread)
-                .count(),
+            unresolved_feedback: self.unresolved_feedback().count(),
             optional_failures: if self.check_contexts_complete {
                 self.checks
                     .iter()
@@ -630,17 +632,30 @@ mod tests {
                 review("new", SubmittedReviewState::ChangesRequested, "2026-01-02"),
             ],
             reviews_complete: true,
-            feedback: vec![PullRequestFeedback {
-                id: "comment".to_owned(),
-                database_id: Some(7),
-                thread_id: Some("thread".to_owned()),
-                kind: FeedbackKind::InlineThread,
-                author: "octocat".to_owned(),
-                body: "please fix".to_owned(),
-                path: Some("src/lib.rs".to_owned()),
-                permalink: None,
-                outdated: false,
-            }],
+            feedback: vec![
+                PullRequestFeedback {
+                    id: "comment".to_owned(),
+                    database_id: Some(7),
+                    thread_id: Some("thread".to_owned()),
+                    kind: FeedbackKind::InlineThread,
+                    author: "octocat".to_owned(),
+                    body: "please fix".to_owned(),
+                    path: Some("src/lib.rs".to_owned()),
+                    permalink: None,
+                    outdated: false,
+                },
+                PullRequestFeedback {
+                    id: "historical-summary".to_owned(),
+                    database_id: Some(8),
+                    thread_id: None,
+                    kind: FeedbackKind::ReviewSummary,
+                    author: "octocat".to_owned(),
+                    body: "earlier review summary".to_owned(),
+                    path: None,
+                    permalink: None,
+                    outdated: false,
+                },
+            ],
             feedback_complete: true,
             merge_conflict: MergeConflictState::Conflicting,
             ..PullRequestDetails::default()
@@ -650,6 +665,7 @@ mod tests {
 
         assert_eq!(details.reviewer_reviews.len(), 1);
         let summary = details.attention_summary();
+        assert_eq!(details.unresolved_feedback().count(), 1);
         assert_eq!(summary.review, ReviewReadiness::ChangesRequested);
         assert_eq!(summary.unresolved_feedback, 1);
         assert_eq!(summary.merge_conflict, MergeConflictState::Conflicting);
