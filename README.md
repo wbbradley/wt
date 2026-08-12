@@ -52,7 +52,7 @@ The initial selection is the worktree containing the current directory. The body
 
 ```text
 ▾ acme/web
-  ├─ ▾ ● feature/login · PR #42 · Fix login race · checks failing · review required · 2 unresolved comments · [~1]
+  ├─ ▾ ● feature/login · PR #42 · Fix login race · checks failing · review required · [~1]
   │     ├─ ▸ Worktree · clean · tracks origin/feature/login
   │     ├─ ▸ Overview · open · auto-merge off · conflicts clean
   │     ├─ ▸ Checks  ✗ 3/4 required
@@ -66,7 +66,7 @@ The initial selection is the worktree containing the current directory. The body
   └─ ▸ Backburner
 ```
 
-Tree connectors and disclosures are muted, the current worktree has a green `●`, PR numbers are orange, reviewer names have stable hash-derived colors, and content wraps by terminal display width. Branch rows show title and attention-only status: failed required checks, outstanding or changes-requested reviews, unresolved-comment count, actual conflicts, auto-merge, non-open state, virtual/Backburner state, and compact local status. `[+N ~N ?N]` means staged, unstaged, and untracked entries; `locked` and `prunable` remain explicit.
+Tree connectors and disclosures are muted, the current worktree has a green `●`, PR numbers are orange, reviewer names have stable hash-derived colors, and every tree item stays on one display-width-truncated line. Branch rows show title and compact attention status: failed required checks, outstanding or changes-requested reviews, actual conflicts, auto-merge, non-open state, virtual/Backburner state, and local status. Unresolved counts live on the Open comments header instead of being repeated on the branch. `[+N ~N ?N]` means staged, unstaged, and untracked entries; `locked` and `prunable` remain explicit.
 
 Disclosure defaults match Rollup while retaining `wt`'s local metadata:
 
@@ -77,6 +77,8 @@ Disclosure defaults match Rollup while retaining `wt`'s local metadata:
 - Overview expands to URL, base/head, full head SHA, state/update time, auto-merge, conflict, warning, and stale/loading detail state;
 - Checks keeps failure/error and unknown rows direct, Pending/Expected under Pending, and successful/neutral/skipped rows under Valid Results;
 - Reviewers combines requests and latest submitted states, with review-summary bodies nested under their reviewer; Open comments contains unresolved inline threads only.
+
+A worktree at a merged PR's merge commit can still carry that GitHub association and the compact `merged` branch label. Merged associations omit Overview, Checks, and Reviewers; Open comments remains only when unresolved threads still exist.
 
 Navigation:
 

@@ -89,8 +89,8 @@ The remaining differences are deliberate:
 - `wt` keeps its orange PR numbers and green current-worktree marker. Its branch row begins with the
   local/head branch identity, then PR number and title; Rollup uses a blue PR number as the primary
   identity and may show author/head-ref fields.
-- `wt` wraps branch status by terminal display width and retains attention-only PR state alongside
-  compact local dirtiness, lock, and prunable badges. Rollup's PR row is single-line and has no
+- `wt` truncates every tree item to one terminal-display-width line and retains attention-only PR
+  state alongside compact local dirtiness, lock, and prunable badges. Rollup's PR row has no
   corresponding local state.
 - Backburnered local worktrees remain in ordinary local ancestry, dimmed and marked, while virtual
   members move under Backburner. Rollup can move every represented PR because none owns a local

@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
@@ -201,7 +201,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         span.style = span.style.add_modifier(Modifier::DIM);
                     }
                 }
-                wrapped_tree_item(spans, line_width, prefix_width)
+                single_line_tree_item(spans, line_width)
             }
             VisibleRow::VirtualRepository {
                 virtual_repository_index,
@@ -269,7 +269,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         span.style = span.style.add_modifier(Modifier::DIM);
                     }
                 }
-                wrapped_tree_item(spans, line_width, prefix_width)
+                single_line_tree_item(spans, line_width)
             }
             VisibleRow::Backburner { expanded, .. } => ListItem::new(Line::from(vec![
                 Span::styled(tree_prefix, Style::default().fg(MUTED)),
@@ -286,11 +286,9 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ..
             } => {
                 let line_width = area.width.saturating_sub(4) as usize;
-                let prefix_width = display_width(&tree_prefix);
-                wrapped_tree_item(
+                single_line_tree_item(
                     inline_row_spans(*kind, *section, text, *expanded, tree_prefix, line_width),
                     line_width,
-                    prefix_width,
                 )
             }
         })
@@ -696,18 +694,6 @@ fn pull_request_tree_spans(
         ReviewReadiness::Waiting => spans.push(tree_label("review required", WARNING)),
         ReviewReadiness::Approved | ReviewReadiness::Unknown => {}
     }
-    if let Some(feedback) = summary
-        .map(|summary| summary.unresolved_feedback)
-        .filter(|feedback| *feedback > 0)
-    {
-        spans.push(tree_label(
-            &format!(
-                "{feedback} unresolved {}",
-                pluralize(feedback, "comment", "comments")
-            ),
-            Color::Red,
-        ));
-    }
     match summary.map(|summary| summary.merge_conflict) {
         Some(MergeConflictState::Conflicting) => {
             spans.push(tree_label("conflicts present", Color::Red));
@@ -783,102 +769,8 @@ fn tree_label(text: &str, color: Color) -> Span<'static> {
     Span::styled(format!(" · {text}"), Style::default().fg(color))
 }
 
-fn wrapped_tree_item(
-    spans: Vec<Span<'static>>,
-    line_width: usize,
-    continuation_indent: usize,
-) -> ListItem<'static> {
-    ListItem::new(wrapped_tree_text(spans, line_width, continuation_indent))
-}
-
-fn wrapped_tree_text(
-    spans: Vec<Span<'static>>,
-    line_width: usize,
-    continuation_indent: usize,
-) -> Text<'static> {
-    let line_width = line_width.max(1);
-    let mut lines = Vec::new();
-    let mut current = Vec::new();
-    let mut current_width = 0;
-    for span in spans {
-        let span_width = span.width();
-        if !current.is_empty() && current_width + span_width > line_width {
-            lines.push(Line::from(std::mem::take(&mut current)));
-            let indent = continuation_indent.min(line_width.saturating_sub(2));
-            current.push(Span::raw(" ".repeat(indent)));
-            current_width = indent;
-            let text = span.content.trim_start_matches(" · ").to_owned();
-            append_wrapped_span(
-                &text,
-                span.style,
-                line_width,
-                continuation_indent,
-                &mut lines,
-                &mut current,
-                &mut current_width,
-            );
-        } else {
-            append_wrapped_span(
-                &span.content,
-                span.style,
-                line_width,
-                continuation_indent,
-                &mut lines,
-                &mut current,
-                &mut current_width,
-            );
-        }
-    }
-    if !current.is_empty() {
-        lines.push(Line::from(current));
-    }
-    Text::from(lines)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_wrapped_span(
-    text: &str,
-    style: Style,
-    line_width: usize,
-    continuation_indent: usize,
-    lines: &mut Vec<Line<'static>>,
-    current: &mut Vec<Span<'static>>,
-    current_width: &mut usize,
-) {
-    let mut chunk = String::new();
-    let mut chunk_width = 0;
-    for character in text.chars() {
-        let mut rendered_character = character;
-        let mut character_width = display_width(&character.to_string());
-        if character_width > line_width {
-            rendered_character = '…';
-            character_width = 1;
-        }
-        if *current_width + chunk_width + character_width > line_width
-            && (!current.is_empty() || !chunk.is_empty())
-        {
-            if !chunk.is_empty() {
-                current.push(Span::styled(std::mem::take(&mut chunk), style));
-            }
-            lines.push(Line::from(std::mem::take(current)));
-            let indent = continuation_indent.min(line_width.saturating_sub(character_width.max(1)));
-            if indent > 0 {
-                current.push(Span::raw(" ".repeat(indent)));
-            }
-            *current_width = indent;
-            chunk_width = 0;
-        }
-        chunk.push(rendered_character);
-        chunk_width += character_width;
-    }
-    if !chunk.is_empty() {
-        current.push(Span::styled(chunk, style));
-        *current_width += chunk_width;
-    }
-}
-
-fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 { singular } else { plural }
+fn single_line_tree_item(spans: Vec<Span<'static>>, line_width: usize) -> ListItem<'static> {
+    ListItem::new(Line::from(truncate_spans(spans, line_width)))
 }
 
 fn truncate_label(label: &str, width: usize) -> String {
@@ -1655,7 +1547,7 @@ mod tests {
             crossterm::event::KeyCode::Char('l'),
             crossterm::event::KeyModifiers::NONE,
         ));
-        let mut terminal = Terminal::new(TestBackend::new(120, 70)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(200, 70)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
@@ -1665,7 +1557,6 @@ mod tests {
         assert!(content.contains("PR #42"));
         assert!(content.contains("virtual feature"));
         assert!(content.contains("changes requested"));
-        assert!(content.contains("1 unresolved comment"));
         assert!(content.contains("conflicts present"));
         assert!(content.contains("virtual-only"));
         assert!(
@@ -1675,7 +1566,6 @@ mod tests {
         assert!(colored_text(buffer, PR_NUMBER).contains("#42"));
         let red = colored_text(buffer, Color::Red);
         assert!(red.contains("changes requested"));
-        assert!(red.contains("1 unresolved comment"));
         assert!(red.contains("conflicts present"));
         assert!(content.contains("head: viewer/fork:"));
         assert!(content.contains("head SHA: head-sha"));
@@ -1686,6 +1576,7 @@ mod tests {
         assert!(content.contains("Checks  ✓ 1/1 required · 1 optional failure"));
         assert!(content.contains("Reviewers  [✗ changes]"));
         assert!(content.contains("Open comments  1 unresolved"));
+        assert!(!content.contains("unresolved comment"));
         assert!(content.contains("fix this"));
 
         let mut narrow_terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
@@ -1696,11 +1587,13 @@ mod tests {
         let narrow_content = buffer_text(narrow_buffer);
         assert!(narrow_content.contains("PR #42"));
         assert!(narrow_content.contains("draft"));
-        assert!(narrow_content.contains("[auto-merge]"));
-        assert!(narrow_content.contains("changes requested"));
-        assert!(narrow_content.contains("1 unresolved comment"));
-        assert!(narrow_content.contains("conflicts present"));
-        assert!(narrow_content.contains("virtual-only"));
+        let narrow_lines = buffer_lines(narrow_buffer);
+        let branch_line = narrow_lines
+            .iter()
+            .position(|line| line.contains("feature/compact-attention"))
+            .unwrap();
+        assert!(narrow_lines[branch_line].contains('…'));
+        assert!(narrow_lines[branch_line + 1].contains("Overview"));
 
         app.virtual_repositories[0].pull_requests[0]
             .pull_request
@@ -1914,43 +1807,42 @@ mod tests {
     }
 
     #[test]
-    fn wraps_unicode_tree_content_within_display_width_and_preserves_styles() {
+    fn truncates_unicode_tree_content_to_one_line_and_preserves_styles() {
         let connector_style = Style::default().fg(MUTED);
         let branch_style = Style::default().fg(BRANCH);
         let pr_style = Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD);
-        let text = wrapped_tree_text(
-            vec![
-                Span::styled("└─ ▾ ", connector_style),
-                Span::styled("界界-branch", branch_style),
-                Span::styled(" · PR #42", pr_style),
-                Span::styled(" · 長い Unicode title", Style::default()),
-            ],
-            12,
-            5,
-        );
+        let spans = vec![
+            Span::styled("└─ ▾ ", connector_style),
+            Span::styled("界界-branch", branch_style),
+            Span::styled(" · PR #42", pr_style),
+            Span::styled(" · 長い Unicode title", Style::default()),
+        ];
+        let visible = truncate_spans(spans.clone(), 26);
+        let line = Line::from(visible.clone());
+        let item = single_line_tree_item(spans, 26);
 
-        assert!(text.lines.iter().all(|line| line.width() <= 12));
+        assert_eq!(item.height(), 1);
+        assert!(item.width() <= 26);
+        assert!(line.width() <= 26);
         assert!(
-            text.lines.iter().flat_map(|line| &line.spans).any(|span| {
+            visible.iter().any(|span| {
                 span.content.contains("└─ ▾") && span.style == connector_style
             })
         );
         assert!(
-            text.lines
+            visible
                 .iter()
-                .flat_map(|line| &line.spans)
-                .any(|span| { span.content.contains("界界") && span.style == branch_style })
+                .any(|span| span.content.contains("界界") && span.style == branch_style)
         );
         assert!(
-            text.lines
+            visible
                 .iter()
-                .flat_map(|line| &line.spans)
-                .any(|span| { span.content.contains("#42") && span.style == pr_style })
+                .any(|span| span.content.contains("#42") && span.style == pr_style)
         );
 
-        let single_column = wrapped_tree_text(vec![Span::styled("界", branch_style)], 1, 8);
-        assert_eq!(single_column.lines[0].spans[0].content.as_ref(), "…");
-        assert!(single_column.lines.iter().all(|line| line.width() <= 1));
+        let single_column = truncate_spans(vec![Span::styled("界", branch_style)], 1);
+        assert_eq!(single_column[0].content.as_ref(), "…");
+        assert!(Line::from(single_column).width() <= 1);
     }
 
     #[test]
@@ -1972,14 +1864,10 @@ mod tests {
             24,
         );
         for spans in [reviewer, comment] {
-            let text = wrapped_tree_text(spans, 24, 6);
-            assert!(text.lines.iter().all(|line| line.width() <= 24));
-            assert!(
-                text.lines
-                    .iter()
-                    .flat_map(|line| &line.spans)
-                    .any(|span| span.content.contains("審査者"))
-            );
+            assert!(spans.iter().any(|span| span.content.contains("審査者")));
+            let item = single_line_tree_item(spans, 24);
+            assert_eq!(item.height(), 1);
+            assert!(item.width() <= 24);
         }
     }
 
