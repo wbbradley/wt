@@ -2044,7 +2044,7 @@ impl App {
             );
             if comments_expanded {
                 for feedback in open_comments {
-                    let body = single_line_text(&feedback.body);
+                    let body = single_line_text(&strip_html_comments(&feedback.body));
                     let mut text = format!("@{} {body}", feedback.author);
                     if let Some(path) = feedback.path {
                         text.push_str(&format!(" ({path})"));
@@ -4248,6 +4248,22 @@ fn single_line_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn strip_html_comments(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut remainder = text;
+
+    while let Some(comment_start) = remainder.find("<!--") {
+        stripped.push_str(&remainder[..comment_start]);
+        remainder = &remainder[comment_start + "<!--".len()..];
+        let Some(comment_end) = remainder.find("-->") else {
+            return stripped;
+        };
+        remainder = &remainder[comment_end + "-->".len()..];
+    }
+    stripped.push_str(remainder);
+    stripped
+}
+
 fn feedback_search_text(feedback: &crate::model::PullRequestFeedback) -> String {
     [
         feedback.id.clone(),
@@ -5412,7 +5428,11 @@ mod tests {
                     thread_id: Some("thread".to_owned()),
                     kind: crate::model::FeedbackKind::InlineThread,
                     author: "reviewer".to_owned(),
-                    body: " \n line one\n\tline two \n ".to_owned(),
+                    body: concat!(
+                        "<!-- devin-review-comment {\"id\": \"BUG_0001\"} -->\n",
+                        " \n line one\n\tline two \n "
+                    )
+                    .to_owned(),
                     path: Some("src/lib.rs".to_owned()),
                     permalink: Some("https://comments/7".to_owned()),
                     outdated: false,
