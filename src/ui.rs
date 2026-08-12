@@ -165,7 +165,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     spans.extend(
                         pull_request
                             .map(|pull_request| {
-                                pull_request_tree_spans(pull_request, details, false, backburnered)
+                                pull_request_tree_spans(
+                                    pull_request,
+                                    details,
+                                    false,
+                                    backburnered,
+                                    worktree_is_pull_request_base(worktree, pull_request),
+                                )
                             })
                             .unwrap_or_default(),
                     );
@@ -207,7 +213,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     .is_some_and(|identity| app.is_backburnered(&identity));
                 let mut suffix = pull_request
                     .map(|pull_request| {
-                        pull_request_tree_spans(pull_request, details, false, backburnered)
+                        pull_request_tree_spans(
+                            pull_request,
+                            details,
+                            false,
+                            backburnered,
+                            worktree_is_pull_request_base(worktree, pull_request),
+                        )
                     })
                     .unwrap_or_default();
                 suffix.extend(github_freshness_spans(
@@ -290,6 +302,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     details,
                     true,
                     backburnered,
+                    false,
                 );
                 let line_width = area.width.saturating_sub(3) as usize;
                 let prefix_width = 2 + display_width(&tree_prefix) + 2;
@@ -753,6 +766,7 @@ fn pull_request_tree_spans(
     details: Option<&PullRequestDetails>,
     virtual_row: bool,
     backburnered: bool,
+    suppress_merged: bool,
 ) -> Vec<Span<'static>> {
     let summary = details.map(PullRequestDetails::attention_summary);
     let mut spans = Vec::new();
@@ -765,7 +779,10 @@ fn pull_request_tree_spans(
     }
     match pull_request.state {
         PullRequestState::Draft => spans.push(tree_label("draft", Color::LightBlue)),
-        PullRequestState::Merged => spans.push(tree_label("merged", Color::Green)),
+        PullRequestState::Merged if !suppress_merged => {
+            spans.push(tree_label("merged", Color::Green));
+        }
+        PullRequestState::Merged => {}
         PullRequestState::Closed => spans.push(tree_label("closed", Color::DarkGray)),
         PullRequestState::Open => {}
     }
@@ -1396,6 +1413,17 @@ fn worktree_identity(worktree: &crate::model::Worktree) -> String {
                 .map(|head| format!("detached:{}", short(head)))
         })
         .unwrap_or_else(|| if worktree.bare { "bare" } else { "unknown" }.to_owned())
+}
+
+fn worktree_is_pull_request_base(
+    worktree: &crate::model::Worktree,
+    pull_request: &crate::model::PullRequest,
+) -> bool {
+    worktree
+        .branch
+        .as_deref()
+        .and_then(|branch| branch.strip_prefix("refs/heads/"))
+        == Some(pull_request.base.branch.as_str())
 }
 
 fn display_path(path: &std::path::Path) -> String {
@@ -2290,6 +2318,14 @@ mod tests {
             }),
         );
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let trunk = buffer_text(terminal.backend().buffer());
+        assert!(!trunk.contains("· merged"));
+        assert!(!trunk.contains("PR #42"));
+        assert!(!trunk.contains("merged change"));
+        assert!(!trunk.contains("auto-merge"));
+
+        app.repositories[0].worktrees[0].branch = Some("refs/heads/topic".to_owned());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let merged_buffer = terminal.backend().buffer();
         let merged = buffer_text(merged_buffer);
         assert!(merged.contains("· merged"));
@@ -2326,6 +2362,7 @@ mod tests {
         let merged_labels = pull_request_tree_spans(
             merged_pull_request,
             Some(&stale_active_details),
+            false,
             false,
             false,
         )
