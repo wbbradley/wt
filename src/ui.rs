@@ -986,6 +986,10 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("filter: ", Style::default().fg(MUTED)),
             Span::styled(app.filter.clone(), Style::default().fg(WARNING)),
+            Span::styled(
+                " · Esc clear · / replace · h/l fold",
+                Style::default().fg(MUTED),
+            ),
         ])
     } else {
         shortcut_line(&[
@@ -1000,6 +1004,10 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     let bottom = app.inline_error.as_ref().map_or_else(
         || {
+            if app.filter_active {
+                return shortcut_line(&[("Enter", "apply"), ("Esc", "cancel search")]);
+            }
+            let exit_key = if app.filter.is_empty() { "q/Esc" } else { "q" };
             shortcut_line(&[
                 ("w", "web"),
                 ("C", "prompt"),
@@ -1008,7 +1016,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 ("m", "move"),
                 ("L/U", "lock"),
                 ("d", "remove"),
-                ("q/Esc", "cancel"),
+                (exit_key, "cancel"),
             ])
         },
         |error| {
@@ -1862,6 +1870,32 @@ mod tests {
         let pull_request = field("PR", "#42 open".to_owned());
         assert_eq!(pull_request.spans[1].content.as_ref(), "#42");
         assert_eq!(pull_request.spans[1].style.fg, Some(PR_NUMBER));
+    }
+
+    #[test]
+    fn committed_filter_footer_explains_clear_replace_and_folding() {
+        let repository = RepositoryView {
+            config: RepositoryConfig {
+                path: PathBuf::from("/repo"),
+                label: Some("project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            },
+            session_only: false,
+            stale_error: None,
+            expanded: true,
+            worktrees: Vec::new(),
+        };
+        let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        app.filter = "project".to_owned();
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(
+            buffer_text(terminal.backend().buffer())
+                .contains("filter: project · Esc clear · / replace · h/l fold")
+        );
     }
 
     #[test]

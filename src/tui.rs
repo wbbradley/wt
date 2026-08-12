@@ -164,8 +164,7 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
     let current_directory = env::current_dir().map_err(TuiError::CurrentDirectory)?;
     let repositories = load_repository_views(&catalog, &current_directory);
     let mut app = App::new(repositories, current_directory);
-    app.filter = initial_filter.to_owned();
-    app.filter_active = !initial_filter.is_empty();
+    app.set_committed_filter(initial_filter);
     let mut controller = Controller::new(catalog_path, catalog, app);
     controller.refresh_branch_parents();
     controller.load_remote_cache();
