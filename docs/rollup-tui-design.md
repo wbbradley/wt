@@ -249,9 +249,10 @@ one selection and one subtree scope.
 - Attention navigation lands on the actionable branch node and expands only the ancestor path
   needed to reveal it; it does not overwrite inner user folds.
 
-Filtering adopts Rollup's temporary-expansion model. Matching is case-insensitive over rendered
-text plus the hidden Worktree/Overview fields already searched by `wt`. Only matching rows and
-their ancestors remain. Normally collapsed sections are temporarily expanded to reveal matches;
+Filtering adopts Rollup's temporary-expansion model. Matching uses a case-insensitive regular
+expression over rendered text plus the hidden Worktree/Overview fields already searched by `wt`.
+It updates incrementally, with invalid expressions matching no rows until valid. Only matching rows
+and their ancestors remain. Normally collapsed sections are temporarily expanded to reveal matches;
 temporary `h`/`l` changes live in filter-only state. Clearing the filter restores the exact saved
 unfiltered folds.
 

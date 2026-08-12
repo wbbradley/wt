@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use regex::{Regex, RegexBuilder};
 
 use crate::github::{GitHubError, PullRequestMapping};
 use crate::model::{
@@ -638,7 +639,12 @@ impl App {
         rows: Vec<VisibleRow>,
         apply_temporary_collapses: bool,
     ) -> Vec<VisibleRow> {
-        let query = self.filter.to_ascii_lowercase();
+        let Ok(query) = RegexBuilder::new(&self.filter)
+            .case_insensitive(true)
+            .build()
+        else {
+            return Vec::new();
+        };
         let mut ancestors = Vec::<usize>::new();
         let mut retained = BTreeSet::new();
         for (index, row) in rows.iter().enumerate() {
@@ -679,10 +685,7 @@ impl App {
         visible
     }
 
-    fn row_matches_filter(&self, row: &VisibleRow, query: &str) -> bool {
-        if query.is_empty() {
-            return true;
-        }
+    fn row_matches_filter(&self, row: &VisibleRow, query: &Regex) -> bool {
         let text = match row {
             VisibleRow::Repository {
                 repository_index, ..
@@ -829,7 +832,7 @@ impl App {
                 format!("{} {}", text, self.inline_identity_search_text(id))
             }
         };
-        text.to_ascii_lowercase().contains(query)
+        query.is_match(&text)
     }
 
     fn inline_identity_search_text(&self, id: &RowId) -> String {
@@ -6518,6 +6521,40 @@ mod tests {
     }
 
     #[test]
+    fn filter_uses_case_insensitive_regular_expressions() {
+        let mut first = repository("/first", true);
+        first.config.label = Some("Alpha-Service".to_owned());
+        let mut second = repository("/second", true);
+        second.config.label = Some("beta-worker".to_owned());
+        let mut app = App::new(vec![first, second], PathBuf::from("/elsewhere"));
+
+        for (filter, expected) in [
+            ("^alpha-[a-z]+", vec![PathBuf::from("/first")]),
+            (
+                "ALPHA|beta-worker",
+                vec![PathBuf::from("/first"), PathBuf::from("/second")],
+            ),
+            ("alpha-(service|api)", vec![PathBuf::from("/first")]),
+        ] {
+            app.set_committed_filter(filter);
+            assert_eq!(
+                app.visible_rows()
+                    .into_iter()
+                    .filter_map(|row| match row.id() {
+                        RowId::Repository(path) => Some(path.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                expected,
+                "unexpected matches for {filter}"
+            );
+        }
+
+        app.set_committed_filter("[");
+        assert!(app.visible_rows().is_empty());
+    }
+
+    #[test]
     fn filtered_tree_keeps_only_matches_and_complete_nested_ancestor_paths() {
         let (mut app, identity) = filter_test_app();
         let repository = RowId::VirtualRepository(identity.repository.clone());
@@ -6669,19 +6706,19 @@ mod tests {
         assert!(app.filter_active);
         assert!(app.filter.is_empty());
         assert!(app.filter_collapsed.is_empty());
-        for character in "pending-needle".chars() {
+        for character in "PENDING-(needle|other)".chars() {
             app.handle_key(key(KeyCode::Char(character)));
         }
         app.handle_key(key(KeyCode::Enter));
         assert!(!app.filter_active);
-        assert_eq!(app.filter, "pending-needle");
+        assert_eq!(app.filter, "PENDING-(needle|other)");
 
         let details = app.pull_request_details[&identity].clone();
         assert!(app.apply_pull_request_details(
             app.github_generation,
             BTreeMap::from([(identity.clone(), Ok(details))]),
         ));
-        assert_eq!(app.filter, "pending-needle");
+        assert_eq!(app.filter, "PENDING-(needle|other)");
         assert!(app.visible_rows().iter().any(|row| {
             row.id() == &RowId::Check(identity.clone(), "pending-needle".to_owned())
         }));

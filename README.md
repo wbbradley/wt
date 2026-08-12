@@ -90,7 +90,7 @@ Navigation:
 - `Enter` toggles a repository/disclosure, selects a local worktree, materializes a virtual PR, or opens an inline URL with PR fallback. `w` opens the selected item or owning PR in a browser.
 - `r` coalesces local and GitHub refreshes. `?` or Space opens the action palette. `q`/`Esc`/`Ctrl-c` cancels; during materialization, Ctrl-C stops the active process and returns to the TUI.
 
-Press `/` to edit a case-insensitive filter. It searches rendered repository, branch, section, reviewer, comment, and check text plus hidden paths, SHAs, URLs, warnings, IDs, and status/error values. Enter commits; Esc cancels editing. A committed filter retains only matches and their complete ancestor paths, temporarily expands saved folds, and has its own `h`/`l` folds. `/` replaces it and Esc clears it, restoring the exact saved tree choices.
+Press `/` to edit a case-insensitive regular expression. It searches rendered repository, branch, section, reviewer, comment, and check text plus hidden paths, SHAs, URLs, warnings, IDs, and status/error values. Matching updates incrementally; an incomplete or invalid expression shows no rows until it becomes valid. Enter commits; Esc cancels editing. A committed filter retains only matches and their complete ancestor paths, temporarily expands saved folds, and has its own `h`/`l` folds. `/` replaces it and Esc clears it, restoring the exact saved tree choices.
 
 Direct actions:
 
