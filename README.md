@@ -102,18 +102,17 @@ Direct actions:
 
 All actions remain in the palette, disabled entries explain why, and mutating forms show exact inputs before a separate confirmation. `n` pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk. A successful tracked-worktree creation exits so the shell wrapper can enter it.
 
-For `c`, a check/comment/review-summary row is exact; Checks, Reviewers, and Open comments select only that class on the owning PR; a branch includes itself and descendants; Stacked branches excludes the parent; a repository excludes Backburner; and Backburner selects its explicit members. Scope ignores current folds and filters, deduplicates canonical identities, and retains tree pre-order. Empty scopes report `c: nothing to address here` without changing the clipboard.
+For `c`, a check or comment row is exact, including an individually selected passing check. Checks selects failing checks only, Open comments selects unresolved inline comments only, Reviewers selects review summaries, and a reviewer selects that reviewer's summaries. A branch includes itself and descendants; Stacked branches excludes the parent; a repository excludes Backburner; and Backburner selects its explicit members. Scope ignores current folds and filters, deduplicates canonical identities, and retains tree pre-order. The copied prompt follows Rollup's grouped `In branch (#PR title)` format, lists stored comment/review IDs with reusable `gh api` commands, includes check URLs, and asks for a worktree when necessary. Empty scopes report `c: nothing to address here` without changing the clipboard.
 
 For `p`, a leaf or non-stacking section selects its owning PR and container scopes mirror `c`. Leading conventional-commit prefixes are removed and drafts end in ` - DRAFT`. A truly empty scope reports `p: no PR under selection` without changing the clipboard.
 
 ```text
-## feature/login — PR #42: Fix login race
-Repository: acme/web (github.com)
-PR: https://github.com/acme/web/pull/42
+In feature/login (#42 Fix login race):
 
-### Failing checks
-Inspect: gh pr checks 42 --repo acme/web
-- integration [Failure]
+Checks:
+  - integration (https://github.com/acme/web/actions/runs/123)
+
+Use a worktree if the relevant branches are not already active in the current worktree.
 ```
 
 Authored PRs are grouped under their canonical base `owner/repository`. `[no local repo]` means the base repository is not registered; `virtual-only` means no local worktree represents that PR. Enter materializes a virtual row after a live SHA recheck. Ordinary worktree actions and direct selectors never materialize implicitly.

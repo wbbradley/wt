@@ -5918,10 +5918,10 @@ mod tests {
             Intent::BeginAction(Action::CopyAgentPrompt)
         );
         let expanded = app.agent_prompt().unwrap();
-        assert!(expanded.contains("PR #1"));
-        assert!(expanded.contains("PR #2"));
-        assert!(!expanded.contains("PR #3"));
-        assert!(expanded.find("PR #1").unwrap() < expanded.find("PR #2").unwrap());
+        assert!(expanded.contains("(#1 "));
+        assert!(expanded.contains("(#2 "));
+        assert!(!expanded.contains("(#3 "));
+        assert!(expanded.find("(#1 ").unwrap() < expanded.find("(#2 ").unwrap());
 
         app.virtual_repositories[0].expanded = false;
         assert_eq!(app.agent_prompt().unwrap(), expanded);
@@ -5939,7 +5939,9 @@ mod tests {
         let feedback = app.agent_prompt().unwrap();
         assert!(feedback.contains("feedback-1"));
         assert!(!feedback.contains("check-1"));
-        assert!(!feedback.contains("PR #2"));
+        assert!(!feedback.contains("(#2 "));
+        assert!(!feedback.contains("Checks:"));
+        assert!(!feedback.contains("failing checks"));
 
         app.selected = Some(RowId::Reviewer(
             parent.identity.clone(),
@@ -5957,7 +5959,7 @@ mod tests {
 
         app.selected = Some(RowId::Check(parent.identity.clone(), "valid-1".to_owned()));
         let valid = app.agent_prompt().unwrap();
-        assert!(valid.contains("valid-1 [Success]"));
+        assert!(valid.contains("Checks:\n  - valid-1 ("));
         assert!(!valid.contains("check-1"));
 
         app.selected = Some(RowId::Section(
@@ -5971,9 +5973,9 @@ mod tests {
             InlineSection::StackedBranches,
         ));
         let child_prompt = app.agent_prompt().unwrap();
-        assert!(!child_prompt.contains("PR #1"));
-        assert!(child_prompt.contains("PR #2"));
-        assert!(!child_prompt.contains("PR #3"));
+        assert!(!child_prompt.contains("(#1 "));
+        assert!(child_prompt.contains("(#2 "));
+        assert!(!child_prompt.contains("(#3 "));
 
         app.selected = Some(RowId::VirtualPullRequest(parent.identity.clone()));
         let review_request = app.review_request().unwrap();
@@ -6084,9 +6086,9 @@ mod tests {
             1
         );
         let group_prompt = app.agent_prompt().unwrap();
-        assert!(group_prompt.contains("PR #1"));
-        assert!(group_prompt.contains("PR #2"));
-        assert!(!group_prompt.contains("PR #3"));
+        assert!(group_prompt.contains("(#1 "));
+        assert!(group_prompt.contains("(#2 "));
+        assert!(!group_prompt.contains("(#3 "));
         let group_review_request = app.review_request().unwrap();
         assert!(group_review_request.contains(&parent.pull_request.url));
         assert!(group_review_request.contains(&child.pull_request.url));
@@ -6107,13 +6109,13 @@ mod tests {
 
         app.selected = Some(RowId::VirtualRepository(parent.identity.repository.clone()));
         let repository_prompt = app.agent_prompt().unwrap();
-        assert!(!repository_prompt.contains("PR #1"));
-        assert!(!repository_prompt.contains("PR #2"));
+        assert!(!repository_prompt.contains("(#1 "));
+        assert!(!repository_prompt.contains("(#2 "));
         let repository_review_request = app.review_request().unwrap();
         assert!(!repository_review_request.contains(&parent.pull_request.url));
         assert!(!repository_review_request.contains(&child.pull_request.url));
         assert!(repository_review_request.contains(&unrelated.pull_request.url));
-        assert!(repository_prompt.contains("PR #3"));
+        assert!(repository_prompt.contains("(#3 "));
 
         app.selected = Some(RowId::Backburner(parent.identity.repository.clone()));
         app.handle_key(key(KeyCode::Enter));

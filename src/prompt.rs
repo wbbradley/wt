@@ -11,94 +11,102 @@ pub struct PromptPullRequest {
 }
 
 pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String> {
-    if pull_requests
+    let actionable = pull_requests
         .iter()
-        .all(|pull_request| pull_request.checks.is_empty() && pull_request.feedback.is_empty())
-    {
+        .filter(|pull_request| !pull_request.checks.is_empty() || !pull_request.feedback.is_empty())
+        .collect::<Vec<_>>();
+    if actionable.is_empty() {
         return None;
     }
 
-    let mut output = String::from(
-        "Address the following pull request feedback and failing checks. Preserve unrelated changes, use the stored GitHub IDs when investigating, and verify each fix.\n",
-    );
-    for pull_request in pull_requests {
-        if pull_request.checks.is_empty() && pull_request.feedback.is_empty() {
-            continue;
-        }
+    let mut output = String::new();
+    for pull_request in actionable {
         let repository = &pull_request.identity.repository;
-        output.push_str(&format!(
-            "\n## {} — PR #{}: {}\nRepository: {}/{} ({})\nPR: {}\n",
-            pull_request.pull_request.head.branch,
-            pull_request.identity.number,
-            pull_request.pull_request.title,
-            repository.owner,
-            repository.repository,
-            repository.host,
-            pull_request.pull_request.url,
-        ));
-        if !pull_request.checks.is_empty() {
-            output.push_str("\n### Failing checks\n");
+        if pull_request.pull_request.head.branch.is_empty() {
             output.push_str(&format!(
-                "Inspect: gh pr checks {} --repo {}\n",
-                pull_request.identity.number,
-                repository_selector(repository),
+                "#{} {}:\n",
+                pull_request.identity.number, pull_request.pull_request.title,
             ));
+        } else {
+            output.push_str(&format!(
+                "In {} (#{} {}):\n",
+                pull_request.pull_request.head.branch,
+                pull_request.identity.number,
+                pull_request.pull_request.title,
+            ));
+        }
+
+        let thread_comments = pull_request
+            .feedback
+            .iter()
+            .filter(|feedback| feedback.kind == FeedbackKind::InlineThread)
+            .filter_map(|feedback| feedback.database_id.map(|id| (feedback, id)))
+            .collect::<Vec<_>>();
+        if !thread_comments.is_empty() {
+            output.push_str("\nComment IDs:\n");
+            for (feedback, id) in thread_comments {
+                output.push_str(&format!("  - {id} - {}\n", excerpt(&feedback.body)));
+            }
+            output.push_str(
+                "\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\n",
+            );
+            output.push_str(&format!(
+                "gh api --hostname {} repos/{}/{}/pulls/comments/$comment_id --jq '{{id,path,line,body,created_at,updated_at}}'\n```\n",
+                repository.host, repository.owner, repository.repository,
+            ));
+        }
+
+        let review_summaries = pull_request
+            .feedback
+            .iter()
+            .filter(|feedback| feedback.kind == FeedbackKind::ReviewSummary)
+            .filter_map(|feedback| feedback.database_id.map(|id| (feedback, id)))
+            .collect::<Vec<_>>();
+        if !review_summaries.is_empty() {
+            output.push_str("\nReview IDs:\n");
+            for (feedback, id) in review_summaries {
+                output.push_str(&format!("  - {id} - {}\n", excerpt(&feedback.body)));
+            }
+            output.push_str(
+                "\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\n",
+            );
+            output.push_str(&format!(
+                "gh api --hostname {} repos/{}/{}/pulls/{}/reviews/$review_id --jq '{{id,body,state,submitted_at}}'\n```\n",
+                repository.host,
+                repository.owner,
+                repository.repository,
+                pull_request.identity.number,
+            ));
+        }
+
+        let unidentified = pull_request
+            .feedback
+            .iter()
+            .filter(|feedback| feedback.database_id.is_none())
+            .collect::<Vec<_>>();
+        if !unidentified.is_empty() {
+            output.push_str("\nComments:\n");
+            for feedback in unidentified {
+                let reference = feedback.permalink.as_deref().unwrap_or(&feedback.id);
+                output.push_str(&format!("  - {reference} - {}\n", excerpt(&feedback.body)));
+            }
+        }
+
+        if !pull_request.checks.is_empty() {
+            output.push_str("\nChecks:\n");
             for check in &pull_request.checks {
-                output.push_str(&format!("- {} [{:?}]\n", check.name, check.state));
+                let url = check
+                    .target_url
+                    .as_deref()
+                    .unwrap_or(&pull_request.pull_request.url);
+                output.push_str(&format!("  - {} ({url})\n", check.name));
             }
         }
-        if !pull_request.feedback.is_empty() {
-            output.push_str("\n### Feedback\n");
-            for feedback in &pull_request.feedback {
-                let kind = match feedback.kind {
-                    FeedbackKind::InlineThread => "inline comment",
-                    FeedbackKind::ReviewSummary => "review summary",
-                };
-                let path = feedback.path.as_deref().unwrap_or("no path");
-                let database_id = feedback
-                    .database_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "unavailable".to_owned());
-                let thread_id = feedback.thread_id.as_deref().unwrap_or("unavailable");
-                output.push_str(&format!(
-                    "- {kind} by {} at {path} [node ID: {}; database ID: {database_id}; thread ID: {thread_id}]{}\n  Body: {}\n",
-                    feedback.author,
-                    feedback.id,
-                    if feedback.outdated { " [outdated]" } else { "" },
-                    excerpt(&feedback.body),
-                ));
-                if let Some(database_id) = feedback.database_id {
-                    let (endpoint, jq) = match feedback.kind {
-                        FeedbackKind::InlineThread => (
-                            format!(
-                                "repos/{}/{}/pulls/comments/{database_id}",
-                                repository.owner, repository.repository
-                            ),
-                            "{author: .user.login, path, line, body, diff_hunk, created_at}",
-                        ),
-                        FeedbackKind::ReviewSummary => (
-                            format!(
-                                "repos/{}/{}/pulls/{}/reviews/{database_id}",
-                                repository.owner,
-                                repository.repository,
-                                pull_request.identity.number
-                            ),
-                            "{author: .user.login, state, body, submitted_at}",
-                        ),
-                    };
-                    output.push_str(&format!(
-                        "  Inspect: gh api --hostname {} {endpoint} --jq '{}'\n",
-                        repository.host, jq
-                    ));
-                } else {
-                    output.push_str(&format!(
-                        "  Inspect: gh api graphql --hostname {} -f query='query($id: ID!) {{ node(id: $id) {{ __typename ... on PullRequestReview {{ author {{ login }} body state submittedAt }} ... on PullRequestReviewComment {{ author {{ login }} body path diffHunk createdAt }} }} }}' -F id={}\n",
-                        repository.host, feedback.id
-                    ));
-                }
-            }
-        }
+        output.push('\n');
     }
+    output.push_str(
+        "Use a worktree if the relevant branches are not already active in the current worktree.",
+    );
     Some(output)
 }
 
@@ -146,26 +154,9 @@ fn strip_conventional_commit_prefix(title: &str) -> &str {
     if stripped.is_empty() { title } else { stripped }
 }
 
-fn repository_selector(repository: &crate::model::GitHubRepositoryIdentity) -> String {
-    if repository.host == "github.com" {
-        format!("{}/{}", repository.owner, repository.repository)
-    } else {
-        format!(
-            "{}/{}/{}",
-            repository.host, repository.owner, repository.repository
-        )
-    }
-}
-
 fn excerpt(body: &str) -> String {
     let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    const LIMIT: usize = 180;
-    if normalized.chars().count() <= LIMIT {
-        return normalized;
-    }
-    let mut excerpt = normalized.chars().take(LIMIT - 1).collect::<String>();
-    excerpt.push('…');
-    excerpt
+    normalized.chars().take(100).collect()
 }
 
 #[cfg(test)]
@@ -237,7 +228,7 @@ mod tests {
                 },
                 PullRequestFeedback {
                     id: "PRR_node".to_owned(),
-                    database_id: None,
+                    database_id: Some(92),
                     thread_id: None,
                     kind: FeedbackKind::ReviewSummary,
                     author: "lead".to_owned(),
@@ -255,9 +246,8 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "Address the following pull request feedback and failing checks. Preserve unrelated changes, use the stored GitHub IDs when investigating, and verify each fix.\n\n## feature — PR #42: Fix feedback\nRepository: base/project (git.example.com)\nPR: https://git.example.com/base/project/pull/42\n\n### Failing checks\nInspect: gh pr checks 42 --repo git.example.com/base/project\n- build [Error]\n- lint [Failure]\n\n### Feedback\n- inline comment by reviewer at src/lib.rs [node ID: IC_node; database ID: 91; thread ID: PRRT_thread]\n  Body: split this line\n  Inspect: gh api --hostname git.example.com repos/base/project/pulls/comments/91 --jq '{author: .user.login, path, line, body, diff_hunk, created_at}'\n- review summary by lead at no path [node ID: PRR_node; database ID: unavailable; thread ID: unavailable] [outdated]\n  Body: Please add coverage\n  Inspect: gh api graphql --hostname git.example.com -f query='query($id: ID!) { node(id: $id) { __typename ... on PullRequestReview { author { login } body state submittedAt } ... on PullRequestReviewComment { author { login } body path diffHunk createdAt } } }' -F id=PRR_node\n"
+            "In feature (#42 Fix feedback):\n\nComment IDs:\n  - 91 - split this line\n\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/comments/$comment_id --jq '{id,path,line,body,created_at,updated_at}'\n```\n\nReview IDs:\n  - 92 - Please add coverage\n\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/42/reviews/$review_id --jq '{id,body,state,submitted_at}'\n```\n\nChecks:\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nUse a worktree if the relevant branches are not already active in the current worktree."
         );
-        assert!(!actual.contains("https://checks/build"));
         assert!(!actual.contains("https://git.example.com/comment/91"));
         assert!(!actual.contains("not merge-required"));
     }
@@ -272,9 +262,42 @@ mod tests {
     }
 
     #[test]
-    fn github_dot_com_check_command_uses_the_native_repo_selector() {
-        let repository = GitHubRepositoryIdentity::canonical("github.com", "Acme", "Web");
-        assert_eq!(repository_selector(&repository), "acme/web");
+    fn unidentified_comments_use_their_best_reference_and_rollup_excerpt() {
+        let mut pull_request = pull_request();
+        pull_request.checks.clear();
+        pull_request.feedback = vec![
+            PullRequestFeedback {
+                id: "node-with-link".to_owned(),
+                database_id: None,
+                thread_id: None,
+                kind: FeedbackKind::InlineThread,
+                author: "reviewer".to_owned(),
+                body: format!("\n  {} trailing", "x".repeat(101)),
+                path: None,
+                permalink: Some("https://git.example.com/comment/fallback".to_owned()),
+                outdated: false,
+            },
+            PullRequestFeedback {
+                id: "node-only".to_owned(),
+                database_id: None,
+                thread_id: None,
+                kind: FeedbackKind::ReviewSummary,
+                author: "lead".to_owned(),
+                body: "  review\n summary  ".to_owned(),
+                path: None,
+                permalink: None,
+                outdated: false,
+            },
+        ];
+
+        let actual = format_agent_prompt(&[pull_request]).unwrap();
+        assert!(actual.contains(&format!(
+            "Comments:\n  - https://git.example.com/comment/fallback - {}\n",
+            "x".repeat(100)
+        )));
+        assert!(actual.contains("  - node-only - review summary\n"));
+        assert!(!actual.contains("Comment IDs:"));
+        assert!(!actual.contains("Review IDs:"));
     }
 
     #[test]
