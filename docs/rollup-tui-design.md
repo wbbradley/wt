@@ -262,9 +262,10 @@ Rollup's lower-case copy keys are part of the desired UI:
 
 - `c` copies Rollup's grouped actionable prompt. Exact check/comment rows remain exact; Checks
   selects failing checks, Reviewers selects review summaries, Open comments selects unresolved
-  inline comments, and reviewer rows select that reviewer's summaries. Branch nodes include
-  themselves and all stacked descendants; Stacked branches excludes the parent; a repository covers
-  all represented PRs; Backburner covers its explicit members. The formatter groups by
+  inline comments, and reviewer rows select that reviewer's summaries. Container scopes include
+  failing checks and unresolved inline comments, not historical review summaries. Branch nodes
+  include themselves and all stacked descendants; Stacked branches excludes the parent; a repository
+  covers all represented PRs; Backburner covers its explicit members. The formatter groups by
   `In branch (#PR title)`, emits stored IDs plus reusable `gh api` commands, includes check URLs,
   and closes with Rollup's worktree instruction. Scope is independent of visibility and fold state.
 - `p` copies one terse line per PR in the same structural scope:

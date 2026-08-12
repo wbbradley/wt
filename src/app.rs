@@ -2930,14 +2930,10 @@ impl App {
                     identity: identity.clone(),
                     pull_request: pull_request.pull_request.clone(),
                     checks: Vec::new(),
-                    feedback: pull_request
-                        .feedback
-                        .iter()
-                        .filter(|feedback| {
-                            feedback.id == *id
-                                && feedback.kind == crate::model::FeedbackKind::InlineThread
-                        })
-                        .cloned()
+                    feedback: self
+                        .unresolved_prompt_feedback(identity)
+                        .into_iter()
+                        .filter(|feedback| feedback.id == *id)
                         .collect(),
                 })
                 .into_iter()
@@ -2972,7 +2968,7 @@ impl App {
                         .map(|pull_request| (identity, pull_request))
                 })
                 .map(|(identity, pull_request)| PromptPullRequest {
-                    identity,
+                    identity: identity.clone(),
                     pull_request: pull_request.pull_request.clone(),
                     checks: if *section == InlineSection::Checks {
                         pull_request.checks.clone()
@@ -2983,18 +2979,18 @@ impl App {
                         section,
                         InlineSection::Reviewers | InlineSection::OpenComments
                     ) {
-                        pull_request
-                            .feedback
-                            .iter()
-                            .filter(|feedback| {
-                                (*section == InlineSection::Reviewers
-                                    && feedback.kind == crate::model::FeedbackKind::ReviewSummary)
-                                    || (*section == InlineSection::OpenComments
-                                        && feedback.kind
-                                            == crate::model::FeedbackKind::InlineThread)
-                            })
-                            .cloned()
-                            .collect()
+                        if *section == InlineSection::OpenComments {
+                            self.unresolved_prompt_feedback(&identity)
+                        } else {
+                            pull_request
+                                .feedback
+                                .iter()
+                                .filter(|feedback| {
+                                    feedback.kind == crate::model::FeedbackKind::ReviewSummary
+                                })
+                                .cloned()
+                                .collect()
+                        }
                     } else {
                         Vec::new()
                     },
@@ -3004,7 +3000,11 @@ impl App {
             Some(selected) => self
                 .structural_scope_identities(selected, false)
                 .into_iter()
-                .filter_map(|identity| all.get(&identity).cloned())
+                .filter_map(|identity| {
+                    let mut pull_request = all.get(&identity).cloned()?;
+                    pull_request.feedback = self.unresolved_prompt_feedback(&identity);
+                    Some(pull_request)
+                })
                 .collect(),
             None => Vec::new(),
         };
@@ -3296,6 +3296,18 @@ impl App {
             }
         }
         pull_requests
+    }
+
+    fn unresolved_prompt_feedback(
+        &self,
+        identity: &CanonicalPullRequestId,
+    ) -> Vec<crate::model::PullRequestFeedback> {
+        self.pull_request_details
+            .get(identity)
+            .into_iter()
+            .flat_map(PullRequestDetails::unresolved_feedback)
+            .cloned()
+            .collect()
     }
 
     fn prompt_pull_request(
@@ -5922,6 +5934,10 @@ mod tests {
         assert!(expanded.contains("(#2 "));
         assert!(!expanded.contains("(#3 "));
         assert!(expanded.find("(#1 ").unwrap() < expanded.find("(#2 ").unwrap());
+        assert!(expanded.contains("feedback-1"));
+        assert!(expanded.contains("feedback-2"));
+        assert!(!expanded.contains("review-1"));
+        assert!(!expanded.contains("review-2"));
 
         app.virtual_repositories[0].expanded = false;
         assert_eq!(app.agent_prompt().unwrap(), expanded);
