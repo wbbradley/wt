@@ -4,13 +4,52 @@
 
 Local repository and worktree data renders first. The most recent GitHub snapshot is loaded from a machine-local cache for the first frame, then status and GitHub requests run in the background. Unavailable repositories, missing credentials, network failures, and rate limits do not block navigation or local operations.
 
-## Install
+## Installation
 
-Build and install with a current Rust toolchain:
+`wt` requires Git and a current Rust toolchain. Install the latest version directly from GitHub:
+
+```bash
+cargo install --git https://github.com/wbbradley/wt.git
+```
+
+To install from an existing checkout instead:
 
 ```bash
 cargo install --path .
 ```
+
+Confirm that Cargo's binary directory is on `PATH` and the installation is available:
+
+```bash
+command -v wt
+wt --version
+```
+
+Rustup normally configures `~/.cargo/bin` automatically. If `command -v wt` prints nothing, add this before the shell-initialization line in the same startup file:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+### Shell initialization
+
+Shell initialization is currently available for Bash. It installs the navigation wrapper and local tab completion; the wrapper is what lets a TUI selection change the directory of the current shell.
+
+Add this line to the startup file used by your interactive Bash sessions:
+
+```bash
+eval "$(wt shell-init bash)"
+```
+
+For most Linux terminals that file is `~/.bashrc`. Bash login shells, including Bash used from the macOS Terminal, normally read `~/.bash_profile` instead; either add the line there or have `~/.bash_profile` source `~/.bashrc`. Then open a new shell, or initialize the current one immediately:
+
+```bash
+eval "$(wt shell-init bash)"
+```
+
+When developing from a checkout, `source shell/wt.bash` loads the same integration directly. Re-running either initialization form is safe.
+
+### First run
 
 Register repositories, including normal checkouts, linked worktrees, and bare repositories:
 
@@ -26,15 +65,7 @@ Run `wt -x` from a linked worktree when you are finished with it. `wt` safely re
 
 ## Bash navigation and completion
 
-Add the self-contained Bash 3.2-compatible integration to `.bashrc`:
-
-```bash
-eval "$(wt shell-init bash)"
-```
-
-When developing from a checkout, sourcing `shell/wt.bash` directly is also supported.
-
-With the function loaded, `wt` changes the current shell to the worktree selected in the TUI. Cancellation, an empty selection, and failures leave `$PWD` unchanged. Scriptable `repo` and `worktree` commands plus help and version requests pass directly to the binary.
+The integration is self-contained and compatible with Bash 3.2. With the function loaded, `wt` changes the current shell to the worktree selected in the TUI. Cancellation, an empty selection, and failures leave `$PWD` unchanged. Scriptable `config`, `repo`, and `worktree` commands plus shell initialization, help, and version requests pass directly to the binary.
 
 Navigate without opening the TUI when a branch, worktree basename, or path is unique:
 
