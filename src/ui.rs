@@ -110,7 +110,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .collect::<Vec<_>>();
                 let state_width = states
                     .iter()
-                    .map(|(state, _)| state.chars().count() + 3)
+                    .map(|(state, _)| display_width(state) + 3)
                     .sum::<usize>();
                 let available = area.width.saturating_sub(7) as usize;
                 let label = truncate_label(
@@ -177,7 +177,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.statuses.get(&worktree.path),
                     worktree,
                 ));
-                let prefix_width = tree_prefix.chars().count() + 4;
+                let prefix_width = display_width(&tree_prefix) + 4;
                 let line_width = area.width.saturating_sub(4) as usize;
                 let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
@@ -221,7 +221,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let label = truncate_label(
                     &repository.identity.full_name(),
                     (area.width.saturating_sub(7) as usize)
-                        .saturating_sub(tree_prefix.chars().count() + marker.chars().count()),
+                        .saturating_sub(display_width(&tree_prefix) + display_width(marker)),
                 );
                 ListItem::new(Line::from(vec![
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
@@ -249,7 +249,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     backburnered,
                 );
                 let line_width = area.width.saturating_sub(4) as usize;
-                let prefix_width = tree_prefix.chars().count() + 4;
+                let prefix_width = display_width(&tree_prefix) + 4;
                 let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
@@ -286,7 +286,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ..
             } => {
                 let line_width = area.width.saturating_sub(4) as usize;
-                let prefix_width = tree_prefix.chars().count();
+                let prefix_width = display_width(&tree_prefix);
                 wrapped_tree_item(
                     inline_row_spans(*kind, *section, text, *expanded, tree_prefix, line_width),
                     line_width,
@@ -670,6 +670,7 @@ fn pull_request_tree_spans(
         format!(" · PR #{}", pull_request.number),
         Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD),
     )];
+    spans.push(tree_label(&pull_request.title, Color::White));
     match pull_request.state {
         PullRequestState::Draft => spans.push(tree_label("draft", Color::LightBlue)),
         PullRequestState::Merged => spans.push(tree_label("merged", Color::Green)),
@@ -787,6 +788,14 @@ fn wrapped_tree_item(
     line_width: usize,
     continuation_indent: usize,
 ) -> ListItem<'static> {
+    ListItem::new(wrapped_tree_text(spans, line_width, continuation_indent))
+}
+
+fn wrapped_tree_text(
+    spans: Vec<Span<'static>>,
+    line_width: usize,
+    continuation_indent: usize,
+) -> Text<'static> {
     let line_width = line_width.max(1);
     let mut lines = Vec::new();
     let mut current = Vec::new();
@@ -795,21 +804,77 @@ fn wrapped_tree_item(
         let span_width = span.width();
         if !current.is_empty() && current_width + span_width > line_width {
             lines.push(Line::from(std::mem::take(&mut current)));
-            let indent = continuation_indent.min(line_width.saturating_sub(1));
+            let indent = continuation_indent.min(line_width.saturating_sub(2));
             current.push(Span::raw(" ".repeat(indent)));
             current_width = indent;
             let text = span.content.trim_start_matches(" · ").to_owned();
-            current_width += text.chars().count();
-            current.push(Span::styled(text, span.style));
+            append_wrapped_span(
+                &text,
+                span.style,
+                line_width,
+                continuation_indent,
+                &mut lines,
+                &mut current,
+                &mut current_width,
+            );
         } else {
-            current_width += span_width;
-            current.push(span);
+            append_wrapped_span(
+                &span.content,
+                span.style,
+                line_width,
+                continuation_indent,
+                &mut lines,
+                &mut current,
+                &mut current_width,
+            );
         }
     }
     if !current.is_empty() {
         lines.push(Line::from(current));
     }
-    ListItem::new(Text::from(lines))
+    Text::from(lines)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_wrapped_span(
+    text: &str,
+    style: Style,
+    line_width: usize,
+    continuation_indent: usize,
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
+    current_width: &mut usize,
+) {
+    let mut chunk = String::new();
+    let mut chunk_width = 0;
+    for character in text.chars() {
+        let mut rendered_character = character;
+        let mut character_width = display_width(&character.to_string());
+        if character_width > line_width {
+            rendered_character = '…';
+            character_width = 1;
+        }
+        if *current_width + chunk_width + character_width > line_width
+            && (!current.is_empty() || !chunk.is_empty())
+        {
+            if !chunk.is_empty() {
+                current.push(Span::styled(std::mem::take(&mut chunk), style));
+            }
+            lines.push(Line::from(std::mem::take(current)));
+            let indent = continuation_indent.min(line_width.saturating_sub(character_width.max(1)));
+            if indent > 0 {
+                current.push(Span::raw(" ".repeat(indent)));
+            }
+            *current_width = indent;
+            chunk_width = 0;
+        }
+        chunk.push(rendered_character);
+        chunk_width += character_width;
+    }
+    if !chunk.is_empty() {
+        current.push(Span::styled(chunk, style));
+        *current_width += chunk_width;
+    }
 }
 
 fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
@@ -817,16 +882,29 @@ fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
 }
 
 fn truncate_label(label: &str, width: usize) -> String {
-    let length = label.chars().count();
-    if length <= width {
+    if display_width(label) <= width {
         return label.to_owned();
     }
-    if width <= 1 {
-        return "…".chars().take(width).collect();
+    if width == 0 {
+        return String::new();
     }
-    let mut truncated: String = label.chars().take(width - 1).collect();
+    let budget = width - 1;
+    let mut used = 0;
+    let mut truncated = String::new();
+    for character in label.chars() {
+        let character_width = display_width(&character.to_string());
+        if used + character_width > budget {
+            break;
+        }
+        truncated.push(character);
+        used += character_width;
+    }
     truncated.push('…');
     truncated
+}
+
+fn display_width(text: &str) -> usize {
+    Span::raw(text.to_owned()).width()
 }
 
 #[cfg(test)]
@@ -1584,7 +1662,8 @@ mod tests {
         assert!(content.contains("base/project [no local repo]"));
         assert!(content.contains("└─ ▾   feature/compact-attention"));
         assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
-        assert!(content.contains("PR #42 · draft · [auto-merge]"));
+        assert!(content.contains("PR #42"));
+        assert!(content.contains("virtual feature"));
         assert!(content.contains("changes requested"));
         assert!(content.contains("1 unresolved comment"));
         assert!(content.contains("conflicts present"));
@@ -1650,7 +1729,8 @@ mod tests {
         ));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let expanded = buffer_text(terminal.backend().buffer());
-        assert!(expanded.contains("PR #42 · draft · [auto-merge]"));
+        assert!(expanded.contains("PR #42"));
+        assert!(expanded.contains("virtual feature"));
         assert!(expanded.contains("backburner"));
     }
 
@@ -1825,6 +1905,85 @@ mod tests {
     }
 
     #[test]
+    fn truncates_labels_by_terminal_columns() {
+        assert_eq!(truncate_label("界界界", 5), "界界…");
+        assert_eq!(display_width(&truncate_label("界界界", 5)), 5);
+        assert_eq!(truncate_label("界界界", 4), "界…");
+        assert_eq!(truncate_label("界", 1), "…");
+        assert_eq!(truncate_label("界", 0), "");
+    }
+
+    #[test]
+    fn wraps_unicode_tree_content_within_display_width_and_preserves_styles() {
+        let connector_style = Style::default().fg(MUTED);
+        let branch_style = Style::default().fg(BRANCH);
+        let pr_style = Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD);
+        let text = wrapped_tree_text(
+            vec![
+                Span::styled("└─ ▾ ", connector_style),
+                Span::styled("界界-branch", branch_style),
+                Span::styled(" · PR #42", pr_style),
+                Span::styled(" · 長い Unicode title", Style::default()),
+            ],
+            12,
+            5,
+        );
+
+        assert!(text.lines.iter().all(|line| line.width() <= 12));
+        assert!(
+            text.lines.iter().flat_map(|line| &line.spans).any(|span| {
+                span.content.contains("└─ ▾") && span.style == connector_style
+            })
+        );
+        assert!(
+            text.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| { span.content.contains("界界") && span.style == branch_style })
+        );
+        assert!(
+            text.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| { span.content.contains("#42") && span.style == pr_style })
+        );
+
+        let single_column = wrapped_tree_text(vec![Span::styled("界", branch_style)], 1, 8);
+        assert_eq!(single_column.lines[0].spans[0].content.as_ref(), "…");
+        assert!(single_column.lines.iter().all(|line| line.width() <= 1));
+    }
+
+    #[test]
+    fn bounds_long_unicode_reviewer_and_comment_rows_by_display_width() {
+        let reviewer = inline_row_spans(
+            InlineRowKind::Reviewer,
+            InlineSection::Reviewers,
+            "審査者審査者審査者 · changes requested · reviewed",
+            None,
+            "│  └─ ".to_owned(),
+            24,
+        );
+        let comment = inline_row_spans(
+            InlineRowKind::OpenComment,
+            InlineSection::OpenComments,
+            "@審査者審査者 長いコメント本文 🧪 (src/界.rs) [outdated]",
+            None,
+            "│  └─ ".to_owned(),
+            24,
+        );
+        for spans in [reviewer, comment] {
+            let text = wrapped_tree_text(spans, 24, 6);
+            assert!(text.lines.iter().all(|line| line.width() <= 24));
+            assert!(
+                text.lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content.contains("審査者"))
+            );
+        }
+    }
+
+    #[test]
     fn tree_prefixes_render_siblings_ancestry_and_roots() {
         assert_eq!(
             tree_prefixes_from_depths(&[0, 1, 2, 1, 0, 1]),
@@ -1916,14 +2075,11 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut empty)).unwrap();
         let palette = buffer_text(terminal.backend().buffer());
         assert!(palette.contains("Actions"));
-        for expected in [
-            "[c] copy agent prompt",
-            "[p] copy review request",
-            "[C] create worktree",
-            "[P] prune stale records",
-        ] {
-            assert!(palette.contains(expected), "missing {expected}");
+        for action in crate::app::Action::ALL {
+            let expected = format!("[{}] {}", action.shortcut(), action.label());
+            assert!(palette.contains(&expected), "missing {expected}");
         }
+        assert!(palette.contains("select a repository or worktree"));
 
         let stale = RepositoryView {
             config: RepositoryConfig {
@@ -2084,6 +2240,29 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("error: destination parent does not exist: /trees"));
+    }
+
+    #[test]
+    fn renders_header_progress_footer_error_and_confirmation() {
+        let mut app = App::new(Vec::new(), PathBuf::from("/outside"));
+        app.progress = Some("performing operation…".to_owned());
+        app.inline_error = Some("clipboard unavailable".to_owned());
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let status = buffer_text(terminal.backend().buffer());
+        assert!(status.contains("·  performing operation…"));
+        assert!(status.contains("error: clipboard unavailable"));
+
+        app.inline_error = None;
+        app.modal = Some(Modal::Confirm {
+            action: crate::app::Action::Prune,
+            summary: vec!["remove 2 stale worktree records".to_owned()],
+        });
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let confirmation = buffer_text(terminal.backend().buffer());
+        assert!(confirmation.contains("Confirm prune stale records"));
+        assert!(confirmation.contains("remove 2 stale worktree records"));
+        assert!(confirmation.contains("Enter/y confirms · n/Esc cancels"));
     }
 
     #[test]

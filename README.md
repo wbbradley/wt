@@ -48,48 +48,60 @@ An ambiguous qualified selector opens the TUI prefiltered instead of guessing. T
 
 ## TUI
 
-The initial selection is the worktree containing the current directory. The TUI is one full-width selectable tree: every local worktree has a collapsed Worktree section, and PR-backed local or virtual branches add inline Overview, Checks, Reviews, and Feedback sections. Overview, Checks, and Reviews start collapsed with their rollup state and counts visible on the header; unresolved Feedback starts expanded. Resolved review threads and historical review-summary bodies are omitted from Feedback. Expanded checks are ordered with failures first, and every metadata, check, reviewer/request, review, and feedback row is keyboard-selectable. Loading or stale snapshots remain visible and labeled.
+The initial selection is the worktree containing the current directory. The body is one full-width, selectable tree: repositories own local worktree and virtual pull-request branches, and every branch's metadata and attention details are inline. A local PR appears only on its worktree row. Local commit ancestry wins when it disagrees with GitHub stack ancestry; each remaining virtual PR is attached once by an unambiguous base/head relationship.
 
-Navigation keys:
+```text
+▾ acme/web
+  ├─ ▾ ● feature/login · PR #42 · Fix login race · checks failing · review required · 2 unresolved comments · [~1]
+  │     ├─ ▸ Worktree · clean · tracks origin/feature/login
+  │     ├─ ▸ Overview · open · auto-merge off · conflicts clean
+  │     ├─ ▸ Checks  ✗ 3/4 required
+  │     ├─ ▸ Reviewers  [req, ✗ changes]
+  │     ├─ ▾ Open comments  2 unresolved
+  │     │  └─ @reviewer Handle cancellation (src/login.rs) [outdated]
+  │     └─ ▾ Stacked branches
+  │        └─ ▾ feature/login-ui · PR #43 · Polish login UI · virtual-only
+  ├─ ▾   chores
+  │     └─ ▸ Worktree · clean
+  └─ ▸ Backburner
+```
 
-- `j`/`k` or arrows: move through all branch, section, and inline rows; `g`/`G`: first/last; `Ctrl-d`/`Ctrl-u`: half-page
-- `]`/`[`: next/previous actionable PR, wrapping and skipping Backburner
-- `h`/`l` or left/right: collapse/expand repository and inline section rows; collapsing an inline child returns selection to its section header
-- `/`: filter across repository, path, branch, status, PR, checks, review, warning, and error text
-- `r`: coalesced local and GitHub refresh
-- `Enter`: select a worktree, toggle a repository, materialize a virtual authored-PR row, or open an inline item's URL with PR fallback
-- `w`: on a local or virtual PR branch, open the PR page; on an inline row, open that item's URL with PR fallback
-- `q`/`Esc`/`Ctrl-c`: cancel; during PR materialization, Ctrl-C cancels the operation and returns to the TUI
-- `?` or Space: action palette
+Tree connectors and disclosures are muted, the current worktree has a green `●`, PR numbers are orange, reviewer names have stable hash-derived colors, and content wraps by terminal display width. Branch rows show title and attention-only status: failed required checks, outstanding or changes-requested reviews, unresolved-comment count, actual conflicts, auto-merge, non-open state, virtual/Backburner state, and compact local status. `[+N ~N ?N]` means staged, unstaged, and untracked entries; `locked` and `prunable` remain explicit.
 
-Direct action shortcuts:
+Disclosure defaults match Rollup while retaining `wt`'s local metadata:
 
-- `c`: copy an agent-ready prompt for the selected actionable item, section, branch subtree, or repository
-- `p`: copy one terse `{url} - {title}` review-request line per PR in the same structural scope
-- `w`: open the selected branch's pull request in a browser
-- `b`: move the selected PR and its stacked descendants into or out of Backburner
-- `C`: advanced create; `n`: new tracked worktree; `m`: move; `L`/`U`: lock/unlock; `d`: remove
-- `R`: repair; `P`: prune; `a`: register; `e`: edit/relink; `x`: unregister
+- repositories, complete branch subtrees, Open comments, and Stacked worktrees/PRs/branches start expanded;
+- Worktree, Overview, Checks, Pending, Valid Results, Reviewers, and Backburner start collapsed;
+- Reviewers starts expanded when a retained human review-summary body exists;
+- Worktree expands to repository anchor, path, branch, full HEAD, upstream, lock, prunable, local status, and GitHub warnings;
+- Overview expands to URL, base/head, full head SHA, state/update time, auto-merge, conflict, warning, and stale/loading detail state;
+- Checks keeps failure/error and unknown rows direct, Pending/Expected under Pending, and successful/neutral/skipped rows under Valid Results;
+- Reviewers combines requests and latest submitted states, with review-summary bodies nested under their reviewer; Open comments contains unresolved inline threads only.
 
-Forms show the exact operation inputs before a separate confirmation. Disabled palette actions explain why they are unavailable.
+Navigation:
 
-Authored pull requests appear once under their canonical base `owner/repository`. A yellow `[no local repo]` marker means the base repository is not yet registered, and `virtual-only` means no ordinary local worktree represents that PR. Enter materializes a virtual row; ordinary worktree actions and direct selectors never create PR worktrees.
+- `j`/`k` or arrows move across every visible row; `g`/`G` select first/last; `Ctrl-d`/`Ctrl-u` move half a full-tree viewport.
+- `h`/Left collapses a selected disclosure. On a metadata, check, reviewer, review-summary, or comment leaf it collapses the nearest enclosing section and lands on its header. A branch targets its complete subtree.
+- `l`/Right expands a disclosure and is a no-op on leaves. Inner fold choices survive outer folds and refreshes.
+- `]`/`[` moves to the next/previous actionable non-Backburner PR, wraps, and reveals only its required ancestor path.
+- `Enter` toggles a repository/disclosure, selects a local worktree, materializes a virtual PR, or opens an inline URL with PR fallback. `w` opens the selected item or owning PR in a browser.
+- `r` coalesces local and GitHub refreshes. `?` or Space opens the action palette. `q`/`Esc`/`Ctrl-c` cancels; during materialization, Ctrl-C stops the active process and returns to the TUI.
 
-Tree rows use classic `├─`, `└─`, and `│` connectors to show repository, stack, virtual-repository, Backburner, and inline-section ancestry. They reserve their compact, color-coded status labels for states that need attention. A typical local row might read `├─ ● feature/login · PR #42 · checks failing · review required · 2 unresolved comments · [~1]`; a virtual draft might read `└─   feature/api · PR #51 · draft · [auto-merge] · virtual-only`. The green circle marks the worktree containing the current directory, and PR numbers are orange throughout the UI. Titles, full paths, and commit SHAs are available in the inline Worktree and Overview sections; `/` filtering also searches them, check names, reviewers, and feedback text.
+Press `/` to edit a case-insensitive filter. It searches rendered repository, branch, section, reviewer, comment, and check text plus hidden paths, SHAs, URLs, warnings, IDs, and status/error values. Enter commits; Esc cancels editing. A committed filter retains only matches and their complete ancestor paths, temporarily expands saved folds, and has its own `h`/`l` folds. `/` replaces it and Esc clears it, restoring the exact saved tree choices.
 
-Tree status language:
+Direct actions:
 
-- Failed required checks read `checks failing`; successful, pending, and unknown checks stay out of the branch line. Optional failures remain available in the inline Checks section.
-- Outstanding reviews read `review required`, changes requests remain explicit, and unresolved feedback is shown as a comment count. Approved and unknown review states stay out of the main tree line.
-- Only actual merge conflicts appear in the tree. `[auto-merge]` appears only when auto-merge is enabled.
-- `draft`, `merged`, and `closed` show non-open PR state. Local Git status uses git-stack-style `[+N ~N ?N]`: staged, unstaged, and untracked counts respectively. A path present in both staged and unstaged categories appears in both counts. `locked` and `prunable` remain explicit; `●` marks the current worktree.
-- An animated yellow spinner means remote data is loading. A previously loaded snapshot remains visible without an extra stale badge if a later refresh fails. PR numbers are always orange.
+- `c`: copy an agent-ready prompt for the selected exact item, class section, branch subtree, repository, or Backburner scope.
+- `p`: copy one `{url} - {title}` review-request line per PR in the same structural scope.
+- `b`: toggle the selected PR and GitHub-stacked descendants in Backburner.
+- `C`: advanced create; `n`: common tracked-worktree creation; `m`: move; `L`/`U`: lock/unlock; `d`: remove; `R`: repair; `P`: prune.
+- `a`: register a session repository; `e`: edit/relink; `x`: unregister; `w`: open the associated PR/item URL.
 
-Press `n` on a repository or one of its worktrees for the common new-worktree flow. The form pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk branch. The new local branch tracks that remote branch; after creation `wt` caches the worktree, exits, and changes the invoking shell into it.
+All actions remain in the palette, disabled entries explain why, and mutating forms show exact inputs before a separate confirmation. `n` pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk. A successful tracked-worktree creation exits so the shell wrapper can enter it.
 
-Press `c` to copy a focused repair prompt. A check or feedback row includes only that item; Checks, Reviewers, and Open comments include only their class on the owning PR. A branch includes itself and all stacked descendants, Stacked branches includes descendants only, a repository includes its represented non-Backburner PRs, and Backburner includes its explicit members. These scopes use the semantic tree regardless of current folds or filters, deduplicate canonical PR identities, and retain tree pre-order. Prompts group work by branch and PR, preserve check states plus comment/review IDs and paths, and provide `gh` commands that return readable context instead of copying per-item URLs. Empty scopes report `c: nothing to address here` without changing the clipboard.
+For `c`, a check/comment/review-summary row is exact; Checks, Reviewers, and Open comments select only that class on the owning PR; a branch includes itself and descendants; Stacked branches excludes the parent; a repository excludes Backburner; and Backburner selects its explicit members. Scope ignores current folds and filters, deduplicates canonical identities, and retains tree pre-order. Empty scopes report `c: nothing to address here` without changing the clipboard.
 
-Press `p` for the same structural PR scope formatted as one `{url} - {title}` line per PR. Leading conventional-commit prefixes are removed and draft lines end in ` - DRAFT`; a leaf or non-stacking section resolves to its owning PR. A truly empty scope reports `p: no PR under selection` without changing the clipboard.
+For `p`, a leaf or non-stacking section selects its owning PR and container scopes mirror `c`. Leading conventional-commit prefixes are removed and drafts end in ` - DRAFT`. A truly empty scope reports `p: no PR under selection` without changing the clipboard.
 
 ```text
 ## feature/login — PR #42: Fix login race
@@ -101,7 +113,9 @@ Inspect: gh pr checks 42 --repo acme/web
 - integration [Failure]
 ```
 
-Press `b` on a PR to toggle its entire GitHub stack in Backburner. Local worktrees stay in their ordinary ancestry position, dimmed and marked `backburner`; virtual-only PRs move under a collapsed Backburner group in their canonical repository. Their inline details and explicit `c`/`p` scopes remain available, but repository prompts and `[`/`]` attention navigation skip them. Membership survives refreshes and virtual-to-local materialization because it is stored by host-aware canonical PR ID in `$XDG_STATE_HOME/wt/state.json` (normally `~/.local/state/wt/state.json`). Set `WT_STATE_PATH` to override that location.
+Authored PRs are grouped under their canonical base `owner/repository`. `[no local repo]` means the base repository is not registered; `virtual-only` means no local worktree represents that PR. Enter materializes a virtual row after a live SHA recheck. Ordinary worktree actions and direct selectors never materialize implicitly.
+
+Backburner membership is host-aware and persisted in `$XDG_STATE_HOME/wt/state.json` (normally `~/.local/state/wt/state.json`; override with `WT_STATE_PATH`). Local worktrees stay in ordinary ancestry, dimmed and marked; virtual-only members move under the final collapsed Backburner group. Explicit navigation and `c`/`p` remain available, while repository prompts and attention traversal skip them.
 
 Local worktrees are nested by nearest commit ancestry. Local ancestry takes precedence over pull-request stack metadata, and each branch is rendered only once. Worktrees are always enumerated from each tracked repository's centralized `git worktree list --porcelain` data, including linked worktrees outside configured roots.
 

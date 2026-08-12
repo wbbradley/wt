@@ -7,15 +7,15 @@ and pull-request detail inline. The result should closely follow Rollup's Author
 behavior while retaining `wt`'s repository and worktree ownership model, local-first loading,
 virtual-PR materialization, Backburner rules, and worktree operations.
 
-This document compares the current implementations and defines the intended end state. The
-implementation is divided into independently reviewable tasks in `PLAN.md`.
+This document records the historical baseline, the migration design, and the final parity audit.
+The independently reviewable migration tasks were tracked in `PLAN.md`.
 
-## Current implementations
+## Historical baseline and reference
 
-### `wt`
+### `wt` before the migration
 
-`src/ui.rs::render` assigns 63% of the body to `render_list` and 37% to `render_detail`.
-`src/app.rs` consequently maintains two navigation systems:
+Before this migration, `src/ui.rs::render` assigned 63% of the body to `render_list` and 37% to
+`render_detail`. `src/app.rs` consequently maintained two navigation systems:
 
 - `VisibleRow` and `RowId` describe repository, worktree, virtual repository, virtual PR, and
   Backburner rows.
@@ -24,18 +24,19 @@ implementation is divided into independently reviewable tasks in `PLAN.md`.
 - `Pane`, `detail_selected`, `detail_scroll`, `detail_viewport_height`, and `detail_expanded` switch
   focus and retain detail-pane state.
 
-The main tree is already strong at repository/worktree concerns: local commit ancestry takes
-precedence, active PRs are represented by their worktree instead of duplicated virtual rows,
-virtual-only PRs use merge-target ancestry, and stable `RowId`s preserve selection through refresh.
-Filtering already searches undisplayed PR details as well as local fields. The PR detail builder
-already has most of the data and summaries needed by an inline tree, including required-check
+The old main tree was already strong at repository/worktree concerns: local commit ancestry took
+precedence, active PRs were represented by their worktree instead of duplicated virtual rows,
+virtual-only PRs used merge-target ancestry, and stable `RowId`s preserved selection through
+refresh.
+Filtering already searched undisplayed PR details as well as local fields. The PR detail builder
+already had most of the data and summaries needed by an inline tree, including required-check
 counts, folded reviewer state, unresolved feedback, URLs, and stable GitHub IDs.
 
 The split is the limiting factor. Attention details are visible for only one branch, `Tab` and
 `Pane` create a second navigation mode, `l` on a leaf transfers focus instead of expanding a tree
 node, and subtree actions need special logic to reconcile tree selection with detail selection.
 
-### Rollup
+### Rollup reference
 
 Rollup's Authored pane has one flattened semantic tree:
 
@@ -66,6 +67,38 @@ Collapsed state therefore never changes their scope. A PR covers its full stack,
 descendants only, a repository covers all of its PRs, and a leaf covers its owning PR or exact
 actionable item as appropriate.
 
+## Final parity audit (2026-08-11)
+
+The migrated `wt` TUI now intentionally matches Rollup's Authored tree for the shared interaction
+surface: one full-width semantic tree, classic connectors, stable disclosure identity and defaults,
+ancestor-preserving filters with temporary folds, child-to-section `h`, disclosure-only `l`,
+attention navigation, reviewer/check/comment presentation, stable reviewer colors, `c`/`p`
+semantic scopes, and a final collapsed Backburner group. Refreshes preserve selection and explicit
+folds, including when check categories or local/virtual representation change.
+
+The remaining differences are deliberate:
+
+- `wt` owns repositories and worktrees, not only authored PRs. It therefore retains selectable
+  bare, stale, invalid, and non-PR worktrees plus collapsed Worktree and Overview sections. Rollup's
+  other Reviewing, Merged, Releases, and Radar panes are outside this migration's scope.
+- Local commit ancestry wins in `wt`; GitHub base/head ancestry attaches only otherwise-unrepresented
+  virtual PRs. This permits one mixed local/virtual tree without duplicating a PR. Rollup's Authored
+  tree is PR-only and uses merge-target ancestry.
+- Enter can select a local worktree or materialize a virtual PR after a live head-SHA check. Rollup
+  opens the selected GitHub item and has no worktree-materialization lifecycle.
+- `wt` keeps its orange PR numbers and green current-worktree marker. Its branch row begins with the
+  local/head branch identity, then PR number and title; Rollup uses a blue PR number as the primary
+  identity and may show author/head-ref fields.
+- `wt` wraps branch status by terminal display width and retains attention-only PR state alongside
+  compact local dirtiness, lock, and prunable badges. Rollup's PR row is single-line and has no
+  corresponding local state.
+- Backburnered local worktrees remain in ordinary local ancestry, dimmed and marked, while virtual
+  members move under Backburner. Rollup can move every represented PR because none owns a local
+  worktree. Both implementations exclude Backburner from repository copy scopes and normal
+  attention traversal unless it is explicitly selected.
+- `wt` retains its action palette and confirmed worktree/repository mutations. Those operations do
+  not exist in Rollup and are intentionally layered around the shared tree behavior.
+
 ## Target tree
 
 The tree remains repository-owned and worktree-first. A local branch with a PR is one worktree node,
@@ -74,7 +107,7 @@ not a separate PR node. A virtual-only authored PR uses the same branch-node pre
 
 ```text
 ▾ acme/web
-  ├─ ▾ ● feature/login · PR #42 · Fix login race [feature/login] · [~1]
+  ├─ ▾ ● feature/login · PR #42 · Fix login race · [~1]
   │     ├─ ▸ Worktree · clean · tracks origin/feature/login
   │     ├─ ▸ Overview · open · auto-merge off · conflicts clean
   │     ├─ ▸ Checks ✗ 3/4 required
@@ -82,7 +115,7 @@ not a separate PR node. A virtual-only authored PR uses the same branch-node pre
   │     ├─ ▾ Open comments
   │     │  └─ @reviewer Handle cancellation (src/login.rs) [outdated]
   │     └─ ▾ Stacked branches
-  │        └─ ▾ feature/login-ui · PR #43 · Polish login UI [feature/login-ui]
+  │        └─ ▾ feature/login-ui · PR #43 · Polish login UI
   ├─   chores · clean
   └─ ▸ Backburner
 ```
@@ -91,7 +124,7 @@ The exact line is width-aware, but its information order is intentional:
 
 1. connector and outer disclosure;
 2. current-worktree marker and branch/worktree identity;
-3. orange PR number, PR title, and muted head branch when a PR exists;
+3. orange PR number and PR title when a PR exists;
 4. compact attention-only badges and local status.
 
 Repository, worktree/virtual-PR, Backburner, section, and leaf rows are all selectable. A branch node
