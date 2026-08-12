@@ -269,14 +269,14 @@ Rollup's lower-case copy keys are part of the desired UI:
   non-stacking section resolves to its owning PR. Ordering is deterministic tree pre-order and
   duplicate PR identities are removed.
 
-These keys conflict with `wt`'s advanced create and prune shortcuts. The migration is:
+These keys originally conflicted with `wt`'s create and prune shortcuts. The final mapping is:
 
 - `c`: copy agent prompt (currently `C`);
 - `p`: copy review request;
-- `C`: advanced create (currently `c`);
+- advanced create: action palette only;
 - `P`: prune (currently `p`).
 
-`n` remains the common new tracked-worktree flow. All four actions remain in the palette, and footer,
+`n` remains the common new tracked-worktree flow. All actions remain in the palette, and footer,
 palette, README, and reducer tests change together. Copy failures and empty scopes continue to use
 the existing progress/error line rather than a modal.
 

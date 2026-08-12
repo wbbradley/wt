@@ -1019,7 +1019,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 ("c", "prompt"),
                 ("p", "review"),
                 ("b", "Backburner"),
-                ("C/n", "create"),
+                ("n", "create"),
                 ("P", "prune"),
                 ("m", "move"),
                 (exit_key, "cancel"),
@@ -1058,8 +1058,12 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
                     } else {
                         style
                     };
+                    let shortcut = action
+                        .shortcut()
+                        .map(|shortcut| format!("[{shortcut}]"))
+                        .unwrap_or_else(|| "   ".to_owned());
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!("[{}]", action.shortcut()), shortcut_style),
+                        Span::styled(shortcut, shortcut_style),
                         Span::styled(format!(" {}{suffix}", action.label()), style),
                     ]))
                 })
@@ -2014,7 +2018,7 @@ mod tests {
         let mut shortcuts = Terminal::new(TestBackend::new(160, 12)).unwrap();
         shortcuts.draw(|frame| render(frame, &mut app)).unwrap();
         let shortcut_content = buffer_text(shortcuts.backend().buffer());
-        for expected in ["c prompt", "p review", "C/n create", "P prune"] {
+        for expected in ["c prompt", "p review", "n create", "P prune"] {
             assert!(shortcut_content.contains(expected), "missing {expected}");
         }
 
@@ -2039,7 +2043,10 @@ mod tests {
         let palette = buffer_text(terminal.backend().buffer());
         assert!(palette.contains("Actions"));
         for action in crate::app::Action::ALL {
-            let expected = format!("[{}] {}", action.shortcut(), action.label());
+            let expected = action.shortcut().map_or_else(
+                || format!("    {}", action.label()),
+                |shortcut| format!("[{shortcut}] {}", action.label()),
+            );
             assert!(palette.contains(&expected), "missing {expected}");
         }
         assert!(palette.contains("select a repository or worktree"));

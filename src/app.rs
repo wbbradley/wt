@@ -358,22 +358,22 @@ impl Action {
         }
     }
 
-    pub fn shortcut(self) -> &'static str {
+    pub fn shortcut(self) -> Option<&'static str> {
         match self {
-            Self::CopyAgentPrompt => "c",
-            Self::CopyReviewRequest => "p",
-            Self::OpenPullRequestWeb => "w",
-            Self::Create => "C",
-            Self::NewWorktree => "n",
-            Self::Move => "m",
-            Self::Lock => "L",
-            Self::Unlock => "U",
-            Self::Remove => "d",
-            Self::Repair => "R",
-            Self::Prune => "P",
-            Self::RegisterRepository => "a",
-            Self::EditRepository => "e",
-            Self::RemoveRepository => "x",
+            Self::CopyAgentPrompt => Some("c"),
+            Self::CopyReviewRequest => Some("p"),
+            Self::OpenPullRequestWeb => Some("w"),
+            Self::Create => None,
+            Self::NewWorktree => Some("n"),
+            Self::Move => Some("m"),
+            Self::Lock => Some("L"),
+            Self::Unlock => Some("U"),
+            Self::Remove => Some("d"),
+            Self::Repair => Some("R"),
+            Self::Prune => Some("P"),
+            Self::RegisterRepository => Some("a"),
+            Self::EditRepository => Some("e"),
+            Self::RemoveRepository => Some("x"),
         }
     }
 }
@@ -3531,7 +3531,6 @@ impl App {
             'c' => Action::CopyAgentPrompt,
             'p' => Action::CopyReviewRequest,
             'w' => Action::OpenPullRequestWeb,
-            'C' => Action::Create,
             'n' => Action::NewWorktree,
             'm' => Action::Move,
             'L' => Action::Lock,
@@ -6851,17 +6850,16 @@ mod tests {
     }
 
     #[test]
-    fn copy_create_and_prune_shortcuts_migrate_atomically() {
-        assert_eq!(Action::CopyAgentPrompt.shortcut(), "c");
-        assert_eq!(Action::CopyReviewRequest.shortcut(), "p");
-        assert_eq!(Action::Create.shortcut(), "C");
-        assert_eq!(Action::Prune.shortcut(), "P");
+    fn copy_and_prune_shortcuts_do_not_bind_advanced_create() {
+        assert_eq!(Action::CopyAgentPrompt.shortcut(), Some("c"));
+        assert_eq!(Action::CopyReviewRequest.shortcut(), Some("p"));
+        assert_eq!(Action::Create.shortcut(), None);
+        assert_eq!(Action::Prune.shortcut(), Some("P"));
 
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         for (key_code, expected) in [
             ('c', Action::CopyAgentPrompt),
             ('p', Action::CopyReviewRequest),
-            ('C', Action::Create),
             ('P', Action::Prune),
         ] {
             assert_eq!(
@@ -6869,6 +6867,7 @@ mod tests {
                 Intent::BeginAction(expected)
             );
         }
+        assert_eq!(app.handle_key(key(KeyCode::Char('C'))), Intent::None);
     }
 
     #[test]

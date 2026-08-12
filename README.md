@@ -97,7 +97,7 @@ Direct actions:
 - `c`: copy an agent-ready prompt for the selected exact item, class section, branch subtree, repository, or Backburner scope.
 - `p`: copy one `{url} - {title}` review-request line per PR in the same structural scope.
 - `b`: toggle the selected PR and GitHub-stacked descendants in Backburner.
-- `C`: advanced create; `n`: common tracked-worktree creation; `m`: move; `L`/`U`: lock/unlock; `d`: remove; `R`: repair; `P`: prune.
+- `n`: common tracked-worktree creation; `m`: move; `L`/`U`: lock/unlock; `d`: remove; `R`: repair; `P`: prune. Advanced create remains available in the action palette.
 - `a`: register a session repository; `e`: edit/relink; `x`: unregister; `w`: open the associated PR/item URL.
 
 All actions remain in the palette, disabled entries explain why, and mutating forms show exact inputs before a separate confirmation. `n` pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk. A successful tracked-worktree creation exits so the shell wrapper can enter it.
