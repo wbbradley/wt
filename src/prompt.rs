@@ -155,8 +155,65 @@ fn strip_conventional_commit_prefix(title: &str) -> &str {
 }
 
 fn excerpt(body: &str) -> String {
-    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
-    normalized.chars().take(100).collect()
+    concise_comment_text(body).chars().take(100).collect()
+}
+
+pub fn concise_comment_text(text: &str) -> String {
+    let stripped = strip_html_comments(text);
+    let mut concise = String::with_capacity(stripped.len());
+
+    for line in stripped.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let line = strip_markdown_line_prefix(line);
+        let line = line
+            .replace("**", "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if line.is_empty() {
+            continue;
+        }
+
+        if !concise.is_empty() {
+            concise.push_str(" • ");
+        }
+        concise.push_str(&line);
+    }
+
+    concise
+}
+
+fn strip_markdown_line_prefix(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix("- ") {
+        return rest.trim_start();
+    }
+
+    let heading_marks = line.bytes().take_while(|byte| *byte == b'#').count();
+    if heading_marks > 0 && line.as_bytes().get(heading_marks) == Some(&b' ') {
+        return line[heading_marks + 1..].trim_start();
+    }
+
+    line
+}
+
+fn strip_html_comments(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut remainder = text;
+
+    while let Some(comment_start) = remainder.find("<!--") {
+        stripped.push_str(&remainder[..comment_start]);
+        remainder = &remainder[comment_start + "<!--".len()..];
+        let Some(comment_end) = remainder.find("-->") else {
+            return stripped;
+        };
+        remainder = &remainder[comment_end + "-->".len()..];
+    }
+    stripped.push_str(remainder);
+    stripped
 }
 
 #[cfg(test)]
@@ -221,7 +278,13 @@ mod tests {
                     thread_id: Some("PRRT_thread".to_owned()),
                     kind: FeedbackKind::InlineThread,
                     author: "reviewer".to_owned(),
-                    body: "  split   this line  ".to_owned(),
+                    body: concat!(
+                        "<!-- review metadata -->\n",
+                        "## Summary\n",
+                        "**split** this line\n",
+                        "- follow up"
+                    )
+                    .to_owned(),
                     path: Some("src/lib.rs".to_owned()),
                     permalink: Some("https://git.example.com/comment/91".to_owned()),
                     outdated: false,
@@ -246,7 +309,7 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "In feature (#42 Fix feedback):\n\nComment IDs:\n  - 91 - split this line\n\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/comments/$comment_id --jq '{id,path,line,body,created_at,updated_at}'\n```\n\nReview IDs:\n  - 92 - Please add coverage\n\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/42/reviews/$review_id --jq '{id,body,state,submitted_at}'\n```\n\nChecks:\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nUse a worktree if the relevant branches are not already active in the current worktree."
+            "In feature (#42 Fix feedback):\n\nComment IDs:\n  - 91 - Summary • split this line • follow up\n\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/comments/$comment_id --jq '{id,path,line,body,created_at,updated_at}'\n```\n\nReview IDs:\n  - 92 - Please add coverage\n\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/42/reviews/$review_id --jq '{id,body,state,submitted_at}'\n```\n\nChecks:\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nUse a worktree if the relevant branches are not already active in the current worktree."
         );
         assert!(!actual.contains("https://git.example.com/comment/91"));
         assert!(!actual.contains("not merge-required"));
@@ -295,7 +358,7 @@ mod tests {
             "Comments:\n  - https://git.example.com/comment/fallback - {}\n",
             "x".repeat(100)
         )));
-        assert!(actual.contains("  - node-only - review summary\n"));
+        assert!(actual.contains("  - node-only - review • summary\n"));
         assert!(!actual.contains("Comment IDs:"));
         assert!(!actual.contains("Review IDs:"));
     }

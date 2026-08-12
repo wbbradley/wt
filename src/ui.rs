@@ -81,8 +81,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
     let tree_prefixes = tree_prefixes(app, &rows);
-    let search_query = app
-        .filter_active
+    let search_query = (app.filter_active || !app.filter.is_empty())
         .then(|| {
             RegexBuilder::new(&app.filter)
                 .case_insensitive(true)
@@ -362,7 +361,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut state = ListState::default()
         .with_selected(selected)
         .with_offset(app.scroll);
-    let selection_style = if app.filter_active {
+    let selection_style = if app.filter_active || !app.filter.is_empty() {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default().bg(SELECTION).add_modifier(Modifier::BOLD)
@@ -2150,6 +2149,10 @@ mod tests {
         assert!(
             buffer_text(terminal.backend().buffer())
                 .contains("search: project · Esc clear · / replace · h/l fold")
+        );
+        assert_eq!(
+            styled_text(terminal.backend().buffer(), Color::Black, Color::Yellow),
+            "project"
         );
 
         app.filter_active = true;

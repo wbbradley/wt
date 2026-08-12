@@ -11,7 +11,9 @@ use crate::model::{
     GitHubRepositoryIdentity, PullRequest, PullRequestDetails, RepositoryConfig,
     RequiredCheckReadiness, SubmittedReviewState, Worktree, WorktreeStatus,
 };
-use crate::prompt::{PromptPullRequest, format_agent_prompt, format_review_request};
+use crate::prompt::{
+    PromptPullRequest, concise_comment_text, format_agent_prompt, format_review_request,
+};
 
 const LIST_SCROLL_MARGIN: usize = 5;
 
@@ -4408,64 +4410,6 @@ fn pull_request_identity_matches(
             .as_deref()
             .zip(base.repository.as_deref())
             .is_some_and(|(head, base)| head.eq_ignore_ascii_case(base))
-}
-
-fn single_line_text(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn concise_comment_text(text: &str) -> String {
-    let stripped = strip_html_comments(text);
-    let mut concise = String::with_capacity(stripped.len());
-
-    for line in stripped.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let line = strip_markdown_line_prefix(line);
-        let line = single_line_text(&line.replace("**", ""));
-        if line.is_empty() {
-            continue;
-        }
-
-        if !concise.is_empty() {
-            concise.push_str(" • ");
-        }
-        concise.push_str(&line);
-    }
-
-    concise
-}
-
-fn strip_markdown_line_prefix(line: &str) -> &str {
-    if let Some(rest) = line.strip_prefix("- ") {
-        return rest.trim_start();
-    }
-
-    let heading_marks = line.bytes().take_while(|byte| *byte == b'#').count();
-    if heading_marks > 0 && line.as_bytes().get(heading_marks) == Some(&b' ') {
-        return line[heading_marks + 1..].trim_start();
-    }
-
-    line
-}
-
-fn strip_html_comments(text: &str) -> String {
-    let mut stripped = String::with_capacity(text.len());
-    let mut remainder = text;
-
-    while let Some(comment_start) = remainder.find("<!--") {
-        stripped.push_str(&remainder[..comment_start]);
-        remainder = &remainder[comment_start + "<!--".len()..];
-        let Some(comment_end) = remainder.find("-->") else {
-            return stripped;
-        };
-        remainder = &remainder[comment_end + "-->".len()..];
-    }
-    stripped.push_str(remainder);
-    stripped
 }
 
 fn feedback_search_text(feedback: &crate::model::PullRequestFeedback) -> String {
