@@ -735,30 +735,32 @@ fn pull_request_tree_spans(
         PullRequestState::Closed => spans.push(tree_label("closed", Color::DarkGray)),
         PullRequestState::Open => {}
     }
-    if pull_request.auto_merge {
-        spans.push(tree_label("[auto-merge]", SUCCESS));
-    }
-    let required_checks = summary
-        .map(|summary| summary.required_checks)
-        .unwrap_or(RequiredCheckReadiness::Unknown);
-    if required_checks == RequiredCheckReadiness::Failure {
-        spans.push(tree_label("checks failing", DANGER));
-    }
-    let review = summary
-        .map(|summary| summary.review)
-        .unwrap_or(ReviewReadiness::Unknown);
-    match review {
-        ReviewReadiness::ChangesRequested => {
-            spans.push(tree_label("changes requested", DANGER));
+    if pull_request.state != PullRequestState::Merged {
+        if pull_request.auto_merge {
+            spans.push(tree_label("[auto-merge]", SUCCESS));
         }
-        ReviewReadiness::Waiting => spans.push(tree_label("review required", WARNING)),
-        ReviewReadiness::Approved | ReviewReadiness::Unknown => {}
-    }
-    match summary.map(|summary| summary.merge_conflict) {
-        Some(MergeConflictState::Conflicting) => {
-            spans.push(tree_label("conflicts present", Color::Red));
+        let required_checks = summary
+            .map(|summary| summary.required_checks)
+            .unwrap_or(RequiredCheckReadiness::Unknown);
+        if required_checks == RequiredCheckReadiness::Failure {
+            spans.push(tree_label("checks failing", DANGER));
         }
-        Some(MergeConflictState::Unknown | MergeConflictState::Clean) | None => {}
+        let review = summary
+            .map(|summary| summary.review)
+            .unwrap_or(ReviewReadiness::Unknown);
+        match review {
+            ReviewReadiness::ChangesRequested => {
+                spans.push(tree_label("changes requested", DANGER));
+            }
+            ReviewReadiness::Waiting => spans.push(tree_label("review required", WARNING)),
+            ReviewReadiness::Approved | ReviewReadiness::Unknown => {}
+        }
+        match summary.map(|summary| summary.merge_conflict) {
+            Some(MergeConflictState::Conflicting) => {
+                spans.push(tree_label("conflicts present", Color::Red));
+            }
+            Some(MergeConflictState::Unknown | MergeConflictState::Clean) | None => {}
+        }
     }
     if virtual_row {
         spans.push(tree_label("virtual-only", Color::Magenta));
@@ -1344,8 +1346,8 @@ mod tests {
         AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, CheckState, FeedbackKind,
         GitHubBranchData, GitHubRepositoryIdentity, MergeConflictState, PullRequest,
         PullRequestCheck, PullRequestDetails, PullRequestFeedback, PullRequestIdentity,
-        PullRequestState, RateLimit, RepositoryConfig, ReviewerReview, SubmittedReviewState,
-        Worktree, WorktreeStatus,
+        PullRequestState, RateLimit, RepositoryConfig, ReviewRequest, ReviewerKind, ReviewerReview,
+        SubmittedReviewState, Worktree, WorktreeStatus,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2154,7 +2156,7 @@ mod tests {
                     state: PullRequestState::Merged,
                     updated_at: "2026-01-01T00:00:00Z".to_owned(),
                     review_decision: Some("APPROVED".to_owned()),
-                    auto_merge: false,
+                    auto_merge: true,
                     base: PullRequestIdentity {
                         repository: Some("base/project".to_owned()),
                         branch: "main".to_owned(),
@@ -2177,7 +2179,44 @@ mod tests {
         assert!(merged.contains("· merged"));
         assert!(!merged.contains("PR #42"));
         assert!(!merged.contains("merged change"));
+        assert!(!merged.contains("auto-merge"));
         assert!(colored_text(merged_buffer, Color::Green).contains("merged"));
+
+        let merged_pull_request = app
+            .github
+            .get(&path)
+            .and_then(GitHubState::data)
+            .and_then(|data| data.pull_request.as_ref())
+            .unwrap();
+        let stale_active_details = PullRequestDetails {
+            checks: vec![PullRequestCheck {
+                name: "build".to_owned(),
+                state: CheckState::Failure,
+                target_url: None,
+                required: true,
+                source_order: 0,
+                completed_at: None,
+            }],
+            check_contexts_complete: true,
+            review_requests: vec![ReviewRequest {
+                id: "review-request".to_owned(),
+                name: "reviewer".to_owned(),
+                kind: ReviewerKind::User,
+            }],
+            reviews_complete: true,
+            merge_conflict: MergeConflictState::Conflicting,
+            ..PullRequestDetails::default()
+        };
+        let merged_labels = pull_request_tree_spans(
+            merged_pull_request,
+            Some(&stale_active_details),
+            false,
+            false,
+        )
+        .into_iter()
+        .map(|span| span.content.into_owned())
+        .collect::<String>();
+        assert_eq!(merged_labels, " · merged");
 
         let previous = GitHubBranchData {
             pull_request: None,
