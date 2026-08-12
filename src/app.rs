@@ -824,231 +824,7 @@ impl App {
     }
 
     fn row_matches_filter(&self, row: &VisibleRow, query: &Regex) -> bool {
-        let text = match row {
-            VisibleRow::Repository {
-                repository_index, ..
-            } => {
-                let repository = &self.repositories[*repository_index];
-                let catalog_state = repository.stale_error.as_ref().map_or("", |_| {
-                    if repository.config.path.exists() {
-                        "invalid"
-                    } else {
-                        "stale"
-                    }
-                });
-                let mut text = format!(
-                    "{} {} {} {} {} {}",
-                    repository.config.display_label(),
-                    repository.config.path.display(),
-                    if repository.is_bare() { "bare" } else { "" },
-                    if repository.session_only {
-                        "session-only"
-                    } else {
-                        ""
-                    },
-                    catalog_state,
-                    repository.stale_error.as_deref().unwrap_or_default(),
-                );
-                if let Some((_, worktree)) = repository.singleton_worktree() {
-                    text.push(' ');
-                    text.push_str(worktree.branch.as_deref().unwrap_or("detached"));
-                    text.push(' ');
-                    text.push_str(match self.statuses.get(&worktree.path) {
-                        Some(StatusState::Pending) => "local status loading",
-                        Some(StatusState::Ready(status)) if status.is_dirty() => "local changes",
-                        Some(StatusState::Ready(_)) => "clean",
-                        Some(StatusState::Error(_)) => "local status unavailable",
-                        None => "",
-                    });
-                    if let Some(pull_request) = self
-                        .github
-                        .get(&worktree.path)
-                        .and_then(GitHubState::data)
-                        .and_then(|data| data.pull_request.as_ref())
-                    {
-                        let identity = self.pull_request_identity(repository, pull_request);
-                        text.push(' ');
-                        text.push_str(&pull_request_tree_search_text(
-                            pull_request,
-                            identity
-                                .as_ref()
-                                .and_then(|identity| self.pull_request_details.get(identity)),
-                            false,
-                            identity
-                                .as_ref()
-                                .is_some_and(|identity| self.backburner.contains(identity)),
-                        ));
-                    }
-                }
-                text
-            }
-            VisibleRow::Worktree {
-                repository_index,
-                worktree_index,
-                ..
-            } => {
-                let repository = &self.repositories[*repository_index];
-                let worktree = &repository.worktrees[*worktree_index];
-                let mut parts = vec![
-                    worktree.branch.clone().unwrap_or_default(),
-                    worktree.path.display().to_string(),
-                    worktree.head.clone().unwrap_or_default(),
-                    worktree.locked.clone().unwrap_or_default(),
-                    worktree.prunable.clone().unwrap_or_default(),
-                    if contains_path(&worktree.path, &self.current_directory) {
-                        "current".to_owned()
-                    } else {
-                        String::new()
-                    },
-                ];
-                parts.push(match self.statuses.get(&worktree.path) {
-                    Some(StatusState::Pending) => "local status loading".to_owned(),
-                    Some(StatusState::Ready(status)) => status.inline_summary(),
-                    Some(StatusState::Error(error)) => {
-                        format!("local status unavailable {error}")
-                    }
-                    None => String::new(),
-                });
-                if let Some(pull_request) = self
-                    .github
-                    .get(&worktree.path)
-                    .and_then(GitHubState::data)
-                    .and_then(|data| data.pull_request.as_ref())
-                {
-                    let identity = self.pull_request_identity(repository, pull_request);
-                    parts.push(pull_request_tree_search_text(
-                        pull_request,
-                        identity
-                            .as_ref()
-                            .and_then(|identity| self.pull_request_details.get(identity)),
-                        false,
-                        identity
-                            .as_ref()
-                            .is_some_and(|identity| self.backburner.contains(identity)),
-                    ));
-                }
-                parts.join(" ")
-            }
-            VisibleRow::VirtualRepository {
-                virtual_repository_index,
-                ..
-            } => {
-                let repository = &self.virtual_repositories[*virtual_repository_index];
-                format!(
-                    "{} {} {}",
-                    repository.identity.full_name(),
-                    repository.identity.host,
-                    if repository.mapped_repository.is_none() {
-                        "no local repo"
-                    } else {
-                        ""
-                    }
-                )
-            }
-            VisibleRow::VirtualPullRequest {
-                virtual_repository_index,
-                pull_request_index,
-                ..
-            } => {
-                let authored = &self.virtual_repositories[*virtual_repository_index].pull_requests
-                    [*pull_request_index];
-                let pull_request = &authored.pull_request;
-                format!(
-                    "{} {} {} {} {}",
-                    authored.identity.repository.full_name(),
-                    pull_request.head.branch,
-                    pull_request.title,
-                    authored.author,
-                    pull_request_tree_search_text(
-                        pull_request,
-                        self.pull_request_details.get(&authored.identity),
-                        true,
-                        self.backburner.contains(&authored.identity),
-                    ),
-                )
-            }
-            VisibleRow::Backburner { .. } => "backburner".to_owned(),
-            VisibleRow::Inline { text, id, .. } => {
-                format!("{} {}", text, self.inline_identity_search_text(id))
-            }
-        };
-        query.is_match(&text)
-    }
-
-    fn inline_identity_search_text(&self, id: &RowId) -> String {
-        let (identity, kind) = match id {
-            RowId::Check(identity, name) => {
-                let details = self.pull_request_details.get(identity);
-                let text = details
-                    .into_iter()
-                    .flat_map(|details| &details.checks)
-                    .filter(|check| check.name.eq_ignore_ascii_case(name))
-                    .map(|check| {
-                        format!(
-                            "{} {:?} {} {}",
-                            check.name,
-                            check.state,
-                            check.target_url.as_deref().unwrap_or_default(),
-                            if check.required {
-                                "required"
-                            } else {
-                                "optional"
-                            }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                return format!("{name} {text}");
-            }
-            RowId::Reviewer(identity, reviewer) => (identity, Some(reviewer.as_str())),
-            RowId::OpenComment(identity, id) => {
-                let text = self
-                    .pull_request_details
-                    .get(identity)
-                    .into_iter()
-                    .flat_map(|details| &details.feedback)
-                    .filter(|feedback| feedback.id == *id)
-                    .map(feedback_search_text)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                return format!("{id} {text}");
-            }
-            RowId::Section(_, _) | RowId::Metadata(_, _) => return String::new(),
-            RowId::Repository(_)
-            | RowId::Worktree(_)
-            | RowId::VirtualRepository(_)
-            | RowId::Backburner(_)
-            | RowId::VirtualPullRequest(_) => return String::new(),
-        };
-        let Some(details) = self.pull_request_details.get(identity) else {
-            return kind.unwrap_or_default().to_owned();
-        };
-        let reviewer = kind.unwrap_or_default();
-        let mut parts = vec![reviewer.to_owned()];
-        parts.extend(
-            details
-                .review_requests
-                .iter()
-                .filter(|request| request.name.eq_ignore_ascii_case(reviewer))
-                .flat_map(|request| [request.id.clone(), format!("{:?}", request.kind)]),
-        );
-        parts.extend(
-            details
-                .reviewer_reviews
-                .iter()
-                .filter(|review| review.reviewer.eq_ignore_ascii_case(reviewer))
-                .flat_map(|review| {
-                    [
-                        review.id.clone(),
-                        review
-                            .database_id
-                            .map(|id| id.to_string())
-                            .unwrap_or_default(),
-                        format!("{:?}", review.state),
-                    ]
-                }),
-        );
-        parts.join(" ")
+        query.is_match(&crate::ui::row_search_text(self, row))
     }
 
     fn visible_row_depth(&self, row: &VisibleRow) -> usize {
@@ -4477,78 +4253,6 @@ fn pull_request_identity_matches(
             .is_some_and(|(head, base)| head.eq_ignore_ascii_case(base))
 }
 
-fn feedback_search_text(feedback: &crate::model::PullRequestFeedback) -> String {
-    [
-        feedback.id.clone(),
-        feedback
-            .database_id
-            .map(|id| id.to_string())
-            .unwrap_or_default(),
-        feedback.thread_id.clone().unwrap_or_default(),
-        feedback.author.clone(),
-        feedback.body.clone(),
-        feedback.path.clone().unwrap_or_default(),
-        feedback.permalink.clone().unwrap_or_default(),
-        format!("{:?}", feedback.kind),
-        if feedback.outdated {
-            "outdated".to_owned()
-        } else {
-            String::new()
-        },
-    ]
-    .join(" ")
-}
-
-fn pull_request_tree_search_text(
-    pull_request: &PullRequest,
-    details: Option<&PullRequestDetails>,
-    virtual_row: bool,
-    backburnered: bool,
-) -> String {
-    let mut parts = vec![
-        format!("PR #{}", pull_request.number),
-        pull_request.title.clone(),
-        pull_request.state.to_string(),
-        pull_request.review_decision.clone().unwrap_or_default(),
-    ];
-    if pull_request.auto_merge {
-        parts.push("auto-merge".to_owned());
-    }
-    if let Some(summary) = details.map(PullRequestDetails::attention_summary) {
-        if summary.required_checks == RequiredCheckReadiness::Failure {
-            parts.push("checks failing".to_owned());
-        }
-        match summary.review {
-            crate::model::ReviewReadiness::ChangesRequested => {
-                parts.push("changes requested".to_owned())
-            }
-            crate::model::ReviewReadiness::Waiting => parts.push("review required".to_owned()),
-            crate::model::ReviewReadiness::Approved | crate::model::ReviewReadiness::Unknown => {}
-        }
-        if summary.unresolved_feedback > 0 {
-            parts.push(format!(
-                "{} unresolved {}",
-                summary.unresolved_feedback,
-                if summary.unresolved_feedback == 1 {
-                    "comment"
-                } else {
-                    "comments"
-                }
-            ));
-        }
-        if summary.merge_conflict == crate::model::MergeConflictState::Conflicting {
-            parts.push("conflicts present".to_owned());
-        }
-    }
-    if virtual_row {
-        parts.push("virtual-only".to_owned());
-    }
-    if backburnered {
-        parts.push("backburner".to_owned());
-    }
-    parts.join(" ")
-}
-
 fn check_attention_rank(state: crate::model::CheckState) -> u8 {
     match state {
         crate::model::CheckState::Failure | crate::model::CheckState::Error => 0,
@@ -6693,7 +6397,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_matches_pull_request_enrichment() {
+    fn filter_matches_only_visible_pull_request_presentation() {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         let path = PathBuf::from("/repo-topic");
         let repository_identity = GitHubRepositoryIdentity::canonical("github.com", "team", "repo");
@@ -6771,19 +6475,20 @@ mod tests {
             "platform-team",
             "race condition",
             "src/hidden.rs",
-            "123",
         ] {
             app.filter = filter.to_owned();
             assert!(app.visible_rows().iter().any(
                 |row| matches!(row, VisibleRow::Worktree { id: RowId::Worktree(found), .. } if found == &path)
             ));
         }
-        for filter in ["/repo-topic", "1234567890"] {
-            app.filter = filter.to_owned();
-            assert!(app.visible_rows().iter().any(
-                |row| matches!(row, VisibleRow::Worktree { id: RowId::Worktree(found), .. } if found == &path)
-            ));
-        }
+        app.filter = "123".to_owned();
+        assert!(app.visible_rows().is_empty());
+        app.filter = "/repo-topic".to_owned();
+        assert!(app.visible_rows().iter().any(
+            |row| matches!(row, VisibleRow::Worktree { id: RowId::Worktree(found), .. } if found == &path)
+        ));
+        app.filter = "1234567890".to_owned();
+        assert!(app.visible_rows().is_empty());
         app.filter.clear();
         let owner = BranchId::Worktree(path);
         app.selected = Some(RowId::Section(owner.clone(), InlineSection::Overview));
@@ -6898,7 +6603,7 @@ mod tests {
                 ],
             ),
             (
-                "request-hidden-id",
+                "Alice",
                 vec![
                     repository.clone(),
                     branch.clone(),
@@ -6907,7 +6612,7 @@ mod tests {
                 ],
             ),
             (
-                "thread-hidden-id",
+                "comment needle body",
                 vec![
                     repository.clone(),
                     branch.clone(),
@@ -6934,7 +6639,7 @@ mod tests {
                 ],
             ),
             (
-                "failure-hidden",
+                "failure-needle",
                 vec![
                     repository.clone(),
                     branch.clone(),
@@ -6944,10 +6649,6 @@ mod tests {
             ),
             ("checks failing", vec![repository.clone(), branch.clone()]),
             ("review required", vec![repository.clone(), branch.clone()]),
-            (
-                "1 unresolved comment",
-                vec![repository.clone(), branch.clone()],
-            ),
         ] {
             app.filter = query.to_owned();
             assert_eq!(
@@ -6960,7 +6661,10 @@ mod tests {
             );
         }
 
-        app.filter = "thread-hidden-id".to_owned();
+        app.filter = "1 unresolved comment".to_owned();
+        assert!(app.visible_rows().is_empty());
+
+        app.filter = "comment needle body".to_owned();
         app.filter_active = false;
         let committed = app
             .visible_rows()
@@ -6986,6 +6690,24 @@ mod tests {
         ] {
             assert!(!committed.contains(&still_collapsed));
         }
+    }
+
+    #[test]
+    fn search_does_not_match_required_metadata_hidden_by_the_check_renderer() {
+        let (mut app, identity) = filter_test_app();
+        app.filter = "required".to_owned();
+        app.filter_active = true;
+
+        let rows = app.visible_rows();
+        assert!(
+            rows.iter()
+                .any(|row| { matches!(row.id(), RowId::Section(_, InlineSection::Checks)) })
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row.id(), RowId::Check(found, _) if found == &identity))
+        );
     }
 
     #[test]
@@ -7097,7 +6819,7 @@ mod tests {
             vec![repository("/first", true), repository("/second", true)],
             PathBuf::from("/elsewhere"),
         );
-        app.set_committed_filter("first-topic|second-topic");
+        app.set_committed_filter("^topic$");
         app.selected = Some(RowId::Repository(PathBuf::from("/first")));
         let first = RowId::Worktree(PathBuf::from("/first-topic"));
         let second = RowId::Worktree(PathBuf::from("/second-topic"));

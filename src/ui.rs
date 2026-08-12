@@ -61,6 +61,162 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
+pub(crate) fn row_search_text(app: &App, row: &VisibleRow) -> String {
+    let spans = match row {
+        VisibleRow::Repository {
+            repository_index,
+            singleton_worktree_index,
+            ..
+        } => {
+            let repository = &app.repositories[*repository_index];
+            let mut spans = vec![Span::raw(repository.config.display_label())];
+            if let Some(worktree) =
+                singleton_worktree_index.map(|worktree_index| &repository.worktrees[worktree_index])
+            {
+                spans.push(Span::raw(format!(" ({})", worktree_identity(worktree))));
+                spans.extend(local_state_spans(
+                    app.statuses.get(&worktree.path),
+                    worktree,
+                ));
+                let pull_request = app
+                    .github
+                    .get(&worktree.path)
+                    .and_then(GitHubState::data)
+                    .and_then(|data| data.pull_request.as_ref());
+                if let Some(pull_request) = pull_request {
+                    let details = app
+                        .pull_request_details_for(repository, pull_request)
+                        .map(|(_, details)| details);
+                    let backburnered = app
+                        .pull_request_identity(repository, pull_request)
+                        .is_some_and(|identity| app.is_backburnered(&identity));
+                    spans.extend(pull_request_tree_spans(
+                        pull_request,
+                        details,
+                        false,
+                        backburnered,
+                        worktree_is_pull_request_base(worktree, pull_request),
+                    ));
+                }
+                spans.extend(github_freshness_spans(
+                    app.github_network_active(&worktree.path),
+                    app.github_spinner_frame(),
+                ));
+            }
+            for state in [
+                repository.is_bare().then_some("bare"),
+                repository.session_only.then_some("session-only"),
+                repository
+                    .stale_error
+                    .is_some()
+                    .then_some(if repository.config.path.exists() {
+                        "invalid"
+                    } else {
+                        "stale"
+                    }),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                spans.push(Span::raw(format!(" [{state}]")));
+            }
+            if let Some(error) = &repository.stale_error {
+                spans.push(Span::raw(format!(" · {error}")));
+            }
+            spans
+        }
+        VisibleRow::Worktree {
+            repository_index,
+            worktree_index,
+            ..
+        } => {
+            let repository = &app.repositories[*repository_index];
+            let worktree = &repository.worktrees[*worktree_index];
+            let mut spans = vec![Span::raw(worktree_identity(worktree))];
+            spans.extend(local_state_spans(
+                app.statuses.get(&worktree.path),
+                worktree,
+            ));
+            let pull_request = app
+                .github
+                .get(&worktree.path)
+                .and_then(GitHubState::data)
+                .and_then(|data| data.pull_request.as_ref());
+            if let Some(pull_request) = pull_request {
+                let details = app
+                    .pull_request_details_for(repository, pull_request)
+                    .map(|(_, details)| details);
+                let backburnered = app
+                    .pull_request_identity(repository, pull_request)
+                    .is_some_and(|identity| app.is_backburnered(&identity));
+                spans.extend(pull_request_tree_spans(
+                    pull_request,
+                    details,
+                    false,
+                    backburnered,
+                    worktree_is_pull_request_base(worktree, pull_request),
+                ));
+            }
+            spans.extend(github_freshness_spans(
+                app.github_network_active(&worktree.path),
+                app.github_spinner_frame(),
+            ));
+            spans
+        }
+        VisibleRow::VirtualRepository {
+            virtual_repository_index,
+            ..
+        } => {
+            let repository = &app.virtual_repositories[*virtual_repository_index];
+            vec![Span::raw(format!(
+                "{}{}",
+                repository.identity.full_name(),
+                if repository.mapped_repository.is_none() {
+                    " [no local repo]"
+                } else {
+                    ""
+                }
+            ))]
+        }
+        VisibleRow::VirtualPullRequest {
+            virtual_repository_index,
+            pull_request_index,
+            ..
+        } => {
+            let authored = &app.virtual_repositories[*virtual_repository_index].pull_requests
+                [*pull_request_index];
+            let mut spans = vec![Span::raw(authored.pull_request.head.branch.clone())];
+            spans.extend(pull_request_tree_spans(
+                &authored.pull_request,
+                app.pull_request_details.get(&authored.identity),
+                true,
+                app.is_backburnered(&authored.identity),
+                false,
+            ));
+            spans
+        }
+        VisibleRow::Backburner { .. } => vec![Span::raw("Backburner")],
+        VisibleRow::Inline {
+            kind,
+            section,
+            text,
+            expanded,
+            ..
+        } => inline_row_spans(
+            *kind,
+            *section,
+            text,
+            *expanded,
+            String::new(),
+            usize::MAX / 4,
+        ),
+    };
+    spans
+        .into_iter()
+        .map(|span| span.content.into_owned())
+        .collect()
+}
+
 fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let rows = app.visible_rows();
     app.set_viewport_height(area.height.saturating_sub(2) as usize);

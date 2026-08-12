@@ -622,23 +622,6 @@ impl WorktreeStatus {
             self.staged, self.unstaged, self.untracked
         )
     }
-
-    pub fn inline_summary(&self) -> String {
-        if !self.is_dirty() {
-            return "clean".to_owned();
-        }
-        let mut parts = Vec::new();
-        if self.staged > 0 {
-            parts.push(format!("+{}", self.staged));
-        }
-        if self.unstaged > 0 {
-            parts.push(format!("~{}", self.unstaged));
-        }
-        if self.untracked > 0 {
-            parts.push(format!("?{}", self.untracked));
-        }
-        format!("[{}]", parts.join(" "))
-    }
 }
 
 impl Worktree {
@@ -936,21 +919,6 @@ mod tests {
                 ReviewerSummaryToken::Requested,
                 ReviewerSummaryToken::ChangesRequested,
             ]
-        );
-    }
-
-    #[test]
-    fn worktree_inline_summary_is_compact_and_attention_first() {
-        assert_eq!(WorktreeStatus::default().inline_summary(), "clean");
-        assert_eq!(
-            WorktreeStatus {
-                staged: 2,
-                unstaged: 1,
-                untracked: 3,
-                ..WorktreeStatus::default()
-            }
-            .inline_summary(),
-            "[+2 ~1 ?3]"
         );
     }
 }
