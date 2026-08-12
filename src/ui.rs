@@ -93,7 +93,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } => {
                 let repository = &app.repositories[*repository_index];
                 let arrow = if !has_children {
-                    "  "
+                    ""
                 } else if *expanded {
                     "▾ "
                 } else {
@@ -1446,6 +1446,7 @@ mod tests {
             .find(|line| line.contains("project"))
             .unwrap();
         assert!(repository_line.contains("project (main)"));
+        assert!(repository_line.contains("▶ ● project (main)"));
         assert!(repository_line.contains('●'));
         assert!(!repository_line.contains('▾'));
         assert!(!repository_line.contains('▸'));
