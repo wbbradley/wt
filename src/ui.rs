@@ -1040,7 +1040,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 return shortcut_line(&[("Enter", "apply"), ("Esc", "cancel search")]);
             }
             let exit_key = if app.filter.is_empty() { "q/Esc" } else { "q" };
-            shortcut_line(&[
+            let mut shortcuts = vec![
                 ("w", "web"),
                 ("c", "prompt"),
                 ("p", "review"),
@@ -1049,7 +1049,14 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 ("P", "prune"),
                 ("m", "move"),
                 (exit_key, "cancel"),
-            ])
+            ];
+            if app
+                .action_availability(crate::app::Action::RegisterRepository)
+                .enabled
+            {
+                shortcuts.insert(0, ("a", "register"));
+            }
+            shortcut_line(&shortcuts)
         },
         |error| {
             Line::styled(
@@ -1387,7 +1394,7 @@ mod tests {
                 ..WorktreeStatus::default()
             }),
         );
-        app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
+        app.selected = Some(RowId::Repository(PathBuf::from("/repo")));
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(app.viewport_height, 19);
@@ -1402,6 +1409,7 @@ mod tests {
         assert!(!row.contains("12345678"));
         assert!(!content.contains(" Details "));
         assert!(!content.contains("Tab"));
+        assert!(content.contains("a register  w web"));
 
         let mut narrow_terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         narrow_terminal
@@ -2039,6 +2047,7 @@ mod tests {
         for expected in ["c prompt", "p review", "n create", "P prune"] {
             assert!(shortcut_content.contains(expected), "missing {expected}");
         }
+        assert!(!shortcut_content.contains("a register"));
 
         app.filter = "project".to_owned();
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
