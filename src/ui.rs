@@ -6,9 +6,11 @@ use ratatui::widgets::{
     Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::app::{App, DetailRowId, GitHubState, Modal, Pane, StatusState, VisibleRow};
+use crate::app::{App, GitHubState, InlineRowKind, InlineSection, Modal, StatusState, VisibleRow};
+#[cfg(test)]
+use crate::model::CheckRollup;
 use crate::model::{
-    CheckRollup, MergeConflictState, PullRequestDetails, PullRequestState, RequiredCheckReadiness,
+    MergeConflictState, PullRequestDetails, PullRequestState, RequiredCheckReadiness,
     ReviewReadiness,
 };
 
@@ -48,12 +50,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         vertical[0],
     );
 
-    let body = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(63), Constraint::Percentage(37)])
-        .split(vertical[1]);
-    render_list(frame, app, body[0]);
-    render_detail(frame, app, body[1]);
+    render_list(frame, app, vertical[1]);
     render_footer(frame, app, vertical[2]);
     if let Some(modal) = &app.modal {
         render_modal(frame, app, modal, area);
@@ -120,6 +117,12 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 spans.extend(states.into_iter().map(|(state, color)| {
                     Span::styled(format!(" [{state}]"), Style::default().fg(color))
                 }));
+                if let Some(error) = &repository.stale_error {
+                    spans.push(Span::styled(
+                        format!(" · {error}"),
+                        Style::default().fg(DANGER),
+                    ));
+                }
                 ListItem::new(Line::from(spans))
             }
             VisibleRow::Worktree {
@@ -261,6 +264,21 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     ),
                 ]))
             }
+            VisibleRow::Inline {
+                kind,
+                section,
+                text,
+                expanded,
+                ..
+            } => {
+                let line_width = area.width.saturating_sub(4) as usize;
+                let prefix_width = tree_prefix.chars().count();
+                wrapped_tree_item(
+                    inline_row_spans(*kind, *section, text, *expanded, tree_prefix),
+                    line_width,
+                    prefix_width,
+                )
+            }
         })
         .collect();
     let selected = app
@@ -370,6 +388,7 @@ fn visible_row_depth(app: &App, row: &VisibleRow) -> usize {
                 1
             }
         }
+        VisibleRow::Inline { depth, .. } => *depth,
     }
 }
 
@@ -386,14 +405,64 @@ fn virtual_repository_has_header(app: &App, index: usize) -> bool {
 }
 
 fn list_block(app: &App) -> Block<'static> {
+    let _ = app;
     Block::default()
-        .title(" Repositories / Worktrees / Authored PRs ")
+        .title(" Repositories / Worktrees / Authored PRs · h/l collapse/expand · Enter/w opens ")
         .borders(Borders::ALL)
-        .border_style(if app.pane == Pane::List {
-            Style::default().fg(ACCENT)
-        } else {
-            Style::default()
-        })
+        .border_style(Style::default().fg(ACCENT))
+}
+
+fn inline_row_spans(
+    kind: InlineRowKind,
+    section: InlineSection,
+    text: &str,
+    expanded: Option<bool>,
+    tree_prefix: String,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(tree_prefix, Style::default().fg(MUTED))];
+    if let Some(expanded) = expanded {
+        spans.push(Span::styled(
+            if expanded { "▾ " } else { "▸ " },
+            Style::default().fg(MUTED),
+        ));
+    }
+    if kind == InlineRowKind::Section {
+        let (label, summary) = text.split_once(" · ").unwrap_or((text, ""));
+        spans.push(Span::styled(
+            label.to_owned(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        if !summary.is_empty() {
+            spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+            let style = if section == InlineSection::Feedback {
+                if summary == "none" {
+                    Style::default().fg(MUTED)
+                } else {
+                    Style::default().fg(DANGER)
+                }
+            } else {
+                status_text_style(&summary.to_ascii_lowercase())
+            };
+            spans.push(Span::styled(summary.to_owned(), style));
+        }
+        return spans;
+    }
+    let lower = text.to_ascii_lowercase();
+    let style = match kind {
+        InlineRowKind::Metadata => semantic_text_style(&lower),
+        InlineRowKind::Check | InlineRowKind::Review => status_text_style(&lower),
+        InlineRowKind::ReviewRequest => Style::default().fg(WARNING),
+        InlineRowKind::Feedback => {
+            if lower.contains(" · outdated") {
+                Style::default().fg(DANGER)
+            } else {
+                Style::default().fg(REMOTE)
+            }
+        }
+        InlineRowKind::Section => unreachable!("handled above"),
+    };
+    spans.extend(url_spans(text, style));
+    spans
 }
 
 fn pull_request_tree_spans(
@@ -566,290 +635,7 @@ fn truncate_label(label: &str, width: usize) -> String {
     truncated
 }
 
-fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let detail_rows = app.detail_rows();
-    if !detail_rows.is_empty() {
-        render_selectable_pr_detail(frame, app, area, detail_rows);
-        return;
-    }
-    let mut lines = Vec::new();
-    if let Some((repository, authored)) = app.selected_virtual_pull_request() {
-        let pull_request = &authored.pull_request;
-        lines.push(field("repository", repository.identity.full_name()));
-        lines.push(field(
-            "local repo",
-            repository
-                .mapped_repository
-                .as_ref()
-                .map(|path| display_path(path))
-                .unwrap_or_else(|| "[no local repo]".to_owned()),
-        ));
-        lines.push(field(
-            "pull request",
-            format!("#{}", authored.identity.number),
-        ));
-        lines.push(field("title", pull_request.title.clone()));
-        lines.push(field("author", authored.author.clone()));
-        lines.push(field(
-            "base",
-            format!(
-                "{}:{}",
-                pull_request.base.repository.as_deref().unwrap_or("unknown"),
-                pull_request.base.branch
-            ),
-        ));
-        lines.push(field(
-            "head",
-            format!(
-                "{}:{}",
-                pull_request.head.repository.as_deref().unwrap_or("unknown"),
-                pull_request.head.branch
-            ),
-        ));
-        lines.push(field(
-            "head SHA",
-            pull_request
-                .head
-                .oid
-                .clone()
-                .unwrap_or_else(|| "-".to_owned()),
-        ));
-        lines.push(field("state", pull_request.state.to_string()));
-        lines.push(styled_field(
-            "checks",
-            pull_request.checks.to_string(),
-            check_color(pull_request.checks),
-        ));
-        lines.push(field(
-            "auto-merge",
-            if pull_request.auto_merge {
-                "enabled"
-            } else {
-                "not enabled"
-            }
-            .to_owned(),
-        ));
-        lines.push(field(
-            "review",
-            pull_request
-                .review_decision
-                .clone()
-                .unwrap_or_else(|| "-".to_owned()),
-        ));
-        lines.push(field("URL", pull_request.url.clone()));
-        lines.push(Line::styled(
-            "Enter to create worktree",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
-    } else if let Some((repository, worktree, _)) = app.selected_worktree() {
-        lines.push(field("repository", repository.config.display_label()));
-        lines.push(field(
-            "anchor",
-            repository.config.path.display().to_string(),
-        ));
-        lines.push(field("path", worktree.path.display().to_string()));
-        lines.push(field(
-            "branch",
-            worktree
-                .branch
-                .clone()
-                .unwrap_or_else(|| "detached".to_owned()),
-        ));
-        lines.push(field(
-            "HEAD",
-            worktree.head.clone().unwrap_or_else(|| "-".to_owned()),
-        ));
-        lines.push(field(
-            "locked",
-            worktree.locked.clone().unwrap_or_else(|| "no".to_owned()),
-        ));
-        lines.push(field(
-            "prunable",
-            worktree.prunable.clone().unwrap_or_else(|| "no".to_owned()),
-        ));
-        match app.statuses.get(&worktree.path) {
-            Some(StatusState::Ready(status)) => {
-                lines.push(field(
-                    "upstream",
-                    status.upstream.clone().unwrap_or_else(|| "-".to_owned()),
-                ));
-                lines.push(field("local", status.summary()));
-            }
-            Some(StatusState::Pending) => {
-                lines.push(styled_field("local", "loading…".to_owned(), WARNING))
-            }
-            Some(StatusState::Error(error)) => lines.push(Line::styled(
-                format!("status error {error}"),
-                Style::default().fg(DANGER),
-            )),
-            None => {}
-        }
-        let github_network_active = app.github_network_active(&worktree.path);
-        if github_network_active {
-            lines.push(field("GitHub", "loading…".to_owned()));
-        }
-        match app.github.get(&worktree.path) {
-            Some(GitHubState::Loading {
-                previous: Some(data),
-            }) => append_github_details(&mut lines, data),
-            Some(GitHubState::Loading { previous: None }) => {}
-            Some(GitHubState::Ready(data)) => append_github_details(&mut lines, data),
-            Some(GitHubState::Stale {
-                previous: Some(data),
-                ..
-            }) => append_github_details(&mut lines, data),
-            Some(GitHubState::Stale { previous: None, .. }) => {}
-            None => {}
-        }
-    } else if let Some((repository, _)) = app.selected_repository() {
-        lines.push(field("label", repository.config.display_label()));
-        lines.push(field(
-            "anchor",
-            repository.config.path.display().to_string(),
-        ));
-        lines.push(field(
-            "catalog",
-            if repository.session_only {
-                "session-only; press a to register".to_owned()
-            } else {
-                "registered".to_owned()
-            },
-        ));
-        if let Some(error) = &repository.stale_error {
-            lines.push(Line::styled(
-                format!(
-                    "{}       {error}",
-                    if repository.config.path.exists() {
-                        "invalid"
-                    } else {
-                        "stale"
-                    }
-                ),
-                Style::default().fg(DANGER),
-            ));
-        }
-    } else if let Some(VisibleRow::VirtualRepository {
-        virtual_repository_index,
-        ..
-    }) = app.selected_row()
-    {
-        let repository = &app.virtual_repositories[virtual_repository_index];
-        lines.push(field("repository", repository.identity.full_name()));
-        lines.push(field("host", repository.identity.host.clone()));
-        lines.push(field(
-            "local repo",
-            repository
-                .mapped_repository
-                .as_ref()
-                .map(|path| display_path(path))
-                .unwrap_or_else(|| "[no local repo]".to_owned()),
-        ));
-        lines.push(field(
-            "authored PRs",
-            repository.pull_requests.len().to_string(),
-        ));
-    } else {
-        lines.push(Line::styled(
-            "Select a repository or worktree.",
-            Style::default().fg(MUTED),
-        ));
-    }
-    let block = Block::default()
-        .title(" Details ")
-        .borders(Borders::ALL)
-        .border_style(if app.pane == Pane::Detail {
-            Style::default().fg(ACCENT)
-        } else {
-            Style::default()
-        });
-    let inner = block.inner(area);
-    let line_count = wrapped_line_count(&lines, inner.width);
-    let paragraph = Paragraph::new(Text::from(lines))
-        .wrap(Wrap { trim: false })
-        .block(block);
-    app.set_detail_max_scroll(line_count.saturating_sub(inner.height as usize));
-    let paragraph = paragraph.scroll((app.detail_scroll.min(u16::MAX as usize) as u16, 0));
-    frame.render_widget(paragraph, area);
-}
-
-fn render_selectable_pr_detail(
-    frame: &mut Frame<'_>,
-    app: &mut App,
-    area: Rect,
-    rows: Vec<crate::app::DetailRow>,
-) {
-    let block = Block::default()
-        .title(" Details · h/l collapse/expand · Enter/w opens selected item ")
-        .borders(Borders::ALL)
-        .border_style(if app.pane == Pane::Detail {
-            Style::default().fg(ACCENT)
-        } else {
-            Style::default()
-        });
-    let inner = block.inner(area);
-    app.set_detail_viewport_height(inner.height as usize);
-    let items: Vec<ListItem<'_>> = rows
-        .iter()
-        .map(|row| {
-            let text = row.lines.first().map(String::as_str).unwrap_or_default();
-            ListItem::new(Line::from(detail_row_spans(row, text)))
-        })
-        .collect();
-    let selected = app
-        .detail_selected
-        .as_ref()
-        .and_then(|selected| rows.iter().position(|row| &row.id == selected))
-        .or(Some(0));
-    let mut state = ListState::default()
-        .with_selected(selected)
-        .with_offset(app.detail_scroll);
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol("▶ ")
-        .highlight_style(Style::default().bg(SELECTION).add_modifier(Modifier::BOLD));
-    frame.render_stateful_widget(list, area, &mut state);
-    app.set_detail_scroll(state.offset());
-}
-
-fn detail_row_spans(row: &crate::app::DetailRow, text: &str) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::styled(
-        row.tree_prefix.clone(),
-        Style::default().fg(MUTED),
-    )];
-    if let Some(expanded) = row.expanded {
-        spans.push(Span::styled(
-            if expanded { "▾ " } else { "▸ " },
-            Style::default().fg(MUTED),
-        ));
-    }
-    if matches!(row.id, DetailRowId::Section(_, _)) {
-        let (label, summary) = text.split_once(" · ").unwrap_or((text, ""));
-        spans.push(Span::styled(
-            label.to_owned(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
-        if !summary.is_empty() {
-            spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
-            spans.push(Span::styled(
-                summary.to_owned(),
-                detail_section_summary_style(&row.id, summary),
-            ));
-        }
-        return spans;
-    }
-    if matches!(row.id, DetailRowId::Summary(_)) {
-        spans.extend(pr_number_spans(text, detail_row_style(&row.id, text)));
-        return spans;
-    }
-    let base_style = if text.starts_with("URL:") {
-        Style::default().fg(MUTED)
-    } else {
-        detail_row_style(&row.id, text)
-    };
-    spans.extend(url_spans(text, base_style));
-    spans
-}
-
+#[cfg(test)]
 fn pr_number_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
     let Some(hash) = text.find('#') else {
         return vec![Span::styled(text.to_owned(), base_style)];
@@ -897,49 +683,6 @@ fn url_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
         spans.push(Span::styled(text[end..].to_owned(), base_style));
     }
     spans
-}
-
-fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
-    let width = width.max(1) as usize;
-    lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
-        .sum()
-}
-
-fn detail_row_style(id: &DetailRowId, text: &str) -> Style {
-    let lower = text.to_ascii_lowercase();
-    match id {
-        DetailRowId::Summary(_) => Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-        DetailRowId::Section(_, _) => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        DetailRowId::Metadata(_, _) => semantic_text_style(&lower),
-        DetailRowId::Check(_, _) => status_text_style(&lower),
-        DetailRowId::ReviewRequest(_, _) => Style::default().fg(WARNING),
-        DetailRowId::Review(_, _) => status_text_style(&lower),
-        DetailRowId::Feedback(_, _) => {
-            if lower.contains(" · outdated") {
-                Style::default().fg(DANGER)
-            } else {
-                Style::default().fg(REMOTE)
-            }
-        }
-    }
-}
-
-fn detail_section_summary_style(id: &DetailRowId, summary: &str) -> Style {
-    match id {
-        DetailRowId::Section(_, crate::app::DetailSection::Feedback) => {
-            if summary == "none" {
-                Style::default().fg(MUTED)
-            } else {
-                Style::default().fg(DANGER)
-            }
-        }
-        DetailRowId::Section(_, _) => status_text_style(&summary.to_ascii_lowercase()),
-        _ => Style::default(),
-    }
 }
 
 fn semantic_text_style(text: &str) -> Style {
@@ -1054,7 +797,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         shortcut_line(&[
             ("j/k", "move"),
             ("[/]", "attention"),
-            ("Tab", "pane"),
+            ("h/l", "fold"),
             ("/", "filter"),
             ("r", "refresh"),
             ("?", "actions"),
@@ -1203,6 +946,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
     }
 }
 
+#[cfg(test)]
 fn field(label: &str, value: String) -> Line<'static> {
     let value_style = field_value_style(label, &value);
     let mut spans = vec![Span::styled(
@@ -1217,13 +961,7 @@ fn field(label: &str, value: String) -> Line<'static> {
     Line::from(spans)
 }
 
-fn styled_field(label: &str, value: String, color: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label:<11}"), Style::default().fg(MUTED)),
-        Span::styled(value, Style::default().fg(color)),
-    ])
-}
-
+#[cfg(test)]
 fn field_value_style(label: &str, value: &str) -> Style {
     let label = label.to_ascii_lowercase();
     let value = value.to_ascii_lowercase();
@@ -1292,75 +1030,13 @@ fn header_progress(app: &App) -> String {
     }
 }
 
+#[cfg(test)]
 fn check_color(checks: CheckRollup) -> Color {
     match checks {
         CheckRollup::Success => Color::Green,
         CheckRollup::Failure | CheckRollup::Error => Color::Red,
         CheckRollup::Pending | CheckRollup::Expected => Color::Yellow,
         CheckRollup::Unknown => Color::DarkGray,
-    }
-}
-
-fn append_github_details(lines: &mut Vec<Line<'static>>, data: &crate::model::GitHubBranchData) {
-    if let Some(pull_request) = &data.pull_request {
-        lines.push(field(
-            "PR",
-            format!("#{} {}", pull_request.number, pull_request.state),
-        ));
-        lines.push(field("title", pull_request.title.clone()));
-        lines.push(field("URL", pull_request.url.clone()));
-        lines.push(field(
-            "base",
-            format!(
-                "{}:{}",
-                pull_request.base.repository.as_deref().unwrap_or("?"),
-                pull_request.base.branch
-            ),
-        ));
-        lines.push(field(
-            "head",
-            format!(
-                "{}:{}",
-                pull_request.head.repository.as_deref().unwrap_or("?"),
-                pull_request.head.branch
-            ),
-        ));
-        lines.push(field(
-            "review",
-            pull_request
-                .review_decision
-                .clone()
-                .unwrap_or_else(|| "-".to_owned()),
-        ));
-        lines.push(styled_field(
-            "checks",
-            pull_request.checks.to_string(),
-            check_color(pull_request.checks),
-        ));
-        lines.push(field(
-            "auto-merge",
-            if pull_request.auto_merge {
-                "enabled"
-            } else {
-                "not enabled"
-            }
-            .to_owned(),
-        ));
-        lines.push(field("PR updated", pull_request.updated_at.clone()));
-    } else {
-        lines.push(field("GitHub", "no associated PR".to_owned()));
-    }
-    if let Some(rate) = &data.rate_limit {
-        lines.push(field(
-            "rate limit",
-            format!("{} remaining · reset {}", rate.remaining, rate.reset_at),
-        ));
-    }
-    for warning in &data.warnings {
-        lines.push(Line::styled(
-            format!("warning: {warning}"),
-            Style::default().fg(Color::Yellow),
-        ));
     }
 }
 
@@ -1412,7 +1088,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{GitHubState, RepositoryView, RowId, VirtualRepositoryView};
+    use crate::app::{BranchId, GitHubState, RepositoryView, RowId, VirtualRepositoryView};
     use crate::model::{
         AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, CheckState, FeedbackKind,
         GitHubBranchData, GitHubRepositoryIdentity, MergeConflictState, PullRequest,
@@ -1461,10 +1137,10 @@ mod tests {
         app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        assert_eq!(app.viewport_height, 11);
+        assert_eq!(app.viewport_height, 19);
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("project [session-only]"));
-        assert!(content.contains("branch"));
+        assert!(content.contains("Worktree"));
         let row = buffer_lines(terminal.backend().buffer())
             .into_iter()
             .find(|line| line.contains("main"))
@@ -1476,6 +1152,21 @@ mod tests {
         assert!(colored_text(terminal.backend().buffer(), MUTED).contains("?3"));
         assert!(!row.contains("/repo"));
         assert!(!row.contains("12345678"));
+        assert!(!content.contains(" Details "));
+        assert!(!content.contains("Tab"));
+
+        app.selected = Some(RowId::Section(
+            BranchId::Worktree(PathBuf::from("/repo")),
+            InlineSection::Worktree,
+        ));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let expanded = buffer_text(terminal.backend().buffer());
+        assert!(expanded.contains("path: /repo"));
+        assert!(expanded.contains("HEAD: 1234567890"));
         let mut narrow_terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         narrow_terminal
             .draw(|frame| render(frame, &mut app))
@@ -1626,11 +1317,9 @@ mod tests {
                 ..PullRequestDetails::default()
             },
         );
-        app.selected = Some(RowId::VirtualPullRequest(pull_request_id.clone()));
-        app.pane = Pane::Detail;
-        app.detail_selected = Some(DetailRowId::Section(
-            pull_request_id.clone(),
-            crate::app::DetailSection::Attention,
+        app.selected = Some(RowId::Section(
+            BranchId::VirtualPullRequest(pull_request_id.clone()),
+            InlineSection::Overview,
         ));
         app.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('l'),
@@ -1658,10 +1347,10 @@ mod tests {
         assert!(red.contains("1 unresolved comment"));
         assert!(red.contains("conflicts present"));
         assert!(content.contains("head: viewer/fork:"));
-        assert!(content.contains("head-sha"));
+        assert!(content.contains("head SHA: head-sha"));
         assert!(content.contains("changes requested"));
         assert!(content.contains("auto-merge: enabled"));
-        assert!(content.contains("h/l collapse/expand · Enter/w opens selected item"));
+        assert!(content.contains("h/l collapse/expand · Enter/w opens"));
         assert!(content.contains("Overview · draft · auto-merge enabled · conflicts conflicting"));
         assert!(content.contains("Checks · success · 1/1 required · 2 total · 1 optional failure"));
         assert!(content.contains("Reviews · changes requested · 0 requested · 1 submitted"));
@@ -1812,7 +1501,7 @@ mod tests {
             .unwrap();
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("lost [invalid]"));
-        assert!(content.contains("invalid       exists but is not a usable Git repository"));
+        assert!(content.contains("exists but is not a usable Git repository"));
     }
 
     #[test]
@@ -1907,15 +1596,17 @@ mod tests {
         let stale = buffer_text(terminal.backend().buffer());
         assert!(!stale.contains("GitHub stale"));
         assert!(!stale.contains("network unavailable"));
-        app.pane = Pane::Detail;
-        for _ in 0..20 {
-            app.handle_key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('j'),
-                crossterm::event::KeyModifiers::NONE,
-            ));
-        }
+        app.selected = Some(RowId::Section(
+            BranchId::Worktree(PathBuf::from("/repo")),
+            InlineSection::Worktree,
+        ));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let scrolled = buffer_text(terminal.backend().buffer());
+        assert!(scrolled.contains("GitHub stale: network unavailable"));
         assert!(scrolled.contains("12 remaining"));
         assert!(scrolled.contains("warning: partial response"));
     }

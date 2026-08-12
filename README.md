@@ -48,18 +48,17 @@ An ambiguous qualified selector opens the TUI prefiltered instead of guessing. T
 
 ## TUI
 
-The initial selection is the worktree containing the current directory. Repository rows can be collapsed, and the detail pane shows local status and administrative state. For PR selections, Details is a tree with a one-line PR summary and collapsible Overview, Checks, Reviews, and Feedback sections. Overview, Checks, and Reviews start collapsed with their rollup state and counts visible on the header; unresolved Feedback starts expanded. Resolved review threads and historical review-summary bodies are omitted from Feedback. Expanded checks are ordered with failures first, and every check, reviewer/request, review, and feedback item is keyboard-selectable. Loading or stale snapshots remain visible and labeled.
+The initial selection is the worktree containing the current directory. The TUI is one full-width selectable tree: every local worktree has a collapsed Worktree section, and PR-backed local or virtual branches add inline Overview, Checks, Reviews, and Feedback sections. Overview, Checks, and Reviews start collapsed with their rollup state and counts visible on the header; unresolved Feedback starts expanded. Resolved review threads and historical review-summary bodies are omitted from Feedback. Expanded checks are ordered with failures first, and every metadata, check, reviewer/request, review, and feedback row is keyboard-selectable. Loading or stale snapshots remain visible and labeled.
 
 Navigation keys:
 
-- `j`/`k` or arrows: move; `g`/`G`: first/last; `Ctrl-d`/`Ctrl-u`: half-page (tree rows or selectable Detail items according to focus)
+- `j`/`k` or arrows: move through all branch, section, and inline rows; `g`/`G`: first/last; `Ctrl-d`/`Ctrl-u`: half-page
 - `]`/`[`: next/previous actionable PR, wrapping and skipping Backburner
-- `Tab`: toggle between the tree and Details panes
-- `h`/`l` or left/right: collapse/expand tree nodes; in Details, collapsing a child returns selection to its section header
+- `h`/`l` or left/right: collapse/expand repository and inline section rows; collapsing an inline child returns selection to its section header
 - `/`: filter across repository, path, branch, status, PR, checks, review, warning, and error text
 - `r`: coalesced local and GitHub refresh
-- `Enter`: in the tree, select a worktree, toggle a repository, or materialize a virtual authored-PR row; in PR Details, open the selected check/comment/review URL, falling back to the PR URL
-- `w`: on a local or virtual PR branch, open the PR page; in PR Details, open the selected item's URL with the same PR fallback as Enter
+- `Enter`: select a worktree, toggle a repository, materialize a virtual authored-PR row, or open an inline item's URL with PR fallback
+- `w`: on a local or virtual PR branch, open the PR page; on an inline row, open that item's URL with PR fallback
 - `q`/`Esc`/`Ctrl-c`: cancel; during PR materialization, Ctrl-C cancels the operation and returns to the TUI
 - `?` or Space: action palette
 
@@ -75,11 +74,11 @@ Forms show the exact operation inputs before a separate confirmation. Disabled p
 
 Authored pull requests appear once under their canonical base `owner/repository`. A yellow `[no local repo]` marker means the base repository is not yet registered, and `virtual-only` means no ordinary local worktree represents that PR. Enter materializes a virtual row; ordinary worktree actions and direct selectors never create PR worktrees.
 
-Tree rows use classic `├─`, `└─`, and `│` connectors to show repository, stack, virtual-repository, and Backburner ancestry. They reserve their compact, color-coded status labels for states that need attention. A typical local row might read `├─ ● feature/login · PR #42 · checks failing · review required · 2 unresolved comments · [~1]`; a virtual draft might read `└─   feature/api · PR #51 · draft · [auto-merge] · virtual-only`. The green circle marks the worktree containing the current directory, and PR numbers are orange throughout the UI. Titles, full paths, and commit SHAs stay in Details, but `/` filtering still searches them as well as check names, reviewers, and feedback text.
+Tree rows use classic `├─`, `└─`, and `│` connectors to show repository, stack, virtual-repository, Backburner, and inline-section ancestry. They reserve their compact, color-coded status labels for states that need attention. A typical local row might read `├─ ● feature/login · PR #42 · checks failing · review required · 2 unresolved comments · [~1]`; a virtual draft might read `└─   feature/api · PR #51 · draft · [auto-merge] · virtual-only`. The green circle marks the worktree containing the current directory, and PR numbers are orange throughout the UI. Titles, full paths, and commit SHAs are available in the inline Worktree and Overview sections; `/` filtering also searches them, check names, reviewers, and feedback text.
 
 Tree status language:
 
-- Failed required checks read `checks failing`; successful, pending, and unknown checks stay out of the main tree line. Optional failures remain available in Details.
+- Failed required checks read `checks failing`; successful, pending, and unknown checks stay out of the branch line. Optional failures remain available in the inline Checks section.
 - Outstanding reviews read `review required`, changes requests remain explicit, and unresolved feedback is shown as a comment count. Approved and unknown review states stay out of the main tree line.
 - Only actual merge conflicts appear in the tree. `[auto-merge]` appears only when auto-merge is enabled.
 - `draft`, `merged`, and `closed` show non-open PR state. Local Git status uses git-stack-style `[+N ~N ?N]`: staged, unstaged, and untracked counts respectively. A path present in both staged and unstaged categories appears in both counts. `locked` and `prunable` remain explicit; `●` marks the current worktree.
@@ -219,7 +218,7 @@ Configured repositories use `<worktree_root>/<sanitized-local-branch>`; otherwis
 - **Authored PR is missing:** confirm the token resolves to the expected viewer and that its host is present in `github_hosts` or a registered remote.
 - **PR materialization is waiting:** another `wt` process holds the catalog sidecar lock; wait or press Ctrl-C to cancel without changing directories.
 - **SSO/SAML or classic PAT error:** authorize the token for the organization or use a token type allowed by its policy.
-- **Rate limited:** the detail pane shows the reset value; `wt` suppresses requests until then while retaining stale data.
+- **Rate limited:** expand the affected Worktree section to see the reset value; `wt` suppresses requests until then while retaining stale data.
 - **Removal disabled:** inspect dirtiness, locks, whether the row is the main/bare worktree, and whether it contains the current directory.
 - **Shell does not change directory:** ensure `eval "$(wt shell-init bash)"` runs in the current interactive shell and that `command -v wt` finds the binary. From a development checkout, `source shell/wt.bash` is equivalent.
 - **Terminal looks altered after an external kill:** run `reset`. Normal success, cancellation, errors, Ctrl-C, and panics restore raw mode, cursor visibility, and the alternate screen automatically.

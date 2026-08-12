@@ -14,12 +14,33 @@ use crate::prompt::{PromptPullRequest, format_agent_prompt};
 const LIST_SCROLL_MARGIN: usize = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BranchId {
+    Worktree(PathBuf),
+    VirtualPullRequest(CanonicalPullRequestId),
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum InlineSection {
+    Worktree,
+    Overview,
+    Checks,
+    Reviews,
+    Feedback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RowId {
     Repository(PathBuf),
     Worktree(PathBuf),
     VirtualRepository(GitHubRepositoryIdentity),
     Backburner(GitHubRepositoryIdentity),
     VirtualPullRequest(CanonicalPullRequestId),
+    Section(BranchId, InlineSection),
+    Metadata(BranchId, String),
+    Check(CanonicalPullRequestId, String),
+    ReviewRequest(CanonicalPullRequestId, String),
+    Review(CanonicalPullRequestId, String),
+    Feedback(CanonicalPullRequestId, String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,34 +226,26 @@ pub enum VisibleRow {
         virtual_repository_index: usize,
         id: RowId,
     },
+    Inline {
+        owner: BranchId,
+        section: InlineSection,
+        depth: usize,
+        kind: InlineRowKind,
+        text: String,
+        url: Option<String>,
+        expanded: Option<bool>,
+        id: RowId,
+    },
 }
 
-#[derive(Clone, Copy, Debug, Hash, Ord, PartialEq, PartialOrd, Eq)]
-pub enum DetailSection {
-    Attention,
-    Checks,
-    Reviews,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineRowKind {
+    Section,
+    Metadata,
+    Check,
+    ReviewRequest,
+    Review,
     Feedback,
-}
-
-#[derive(Clone, Debug, Hash, Ord, PartialEq, PartialOrd, Eq)]
-pub enum DetailRowId {
-    Summary(CanonicalPullRequestId),
-    Section(CanonicalPullRequestId, DetailSection),
-    Metadata(CanonicalPullRequestId, String),
-    Check(CanonicalPullRequestId, String),
-    ReviewRequest(CanonicalPullRequestId, String),
-    Review(CanonicalPullRequestId, String),
-    Feedback(CanonicalPullRequestId, String),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DetailRow {
-    pub id: DetailRowId,
-    pub lines: Vec<String>,
-    pub url: String,
-    pub tree_prefix: String,
-    pub expanded: Option<bool>,
 }
 
 impl VisibleRow {
@@ -242,15 +255,29 @@ impl VisibleRow {
             | Self::Worktree { id, .. }
             | Self::VirtualRepository { id, .. }
             | Self::Backburner { id, .. }
-            | Self::VirtualPullRequest { id, .. } => id,
+            | Self::VirtualPullRequest { id, .. }
+            | Self::Inline { id, .. } => id,
         }
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Pane {
-    List,
-    Detail,
+    pub fn owner(&self) -> Option<BranchId> {
+        match self {
+            Self::Worktree {
+                id: RowId::Worktree(path),
+                ..
+            } => Some(BranchId::Worktree(path.clone())),
+            Self::VirtualPullRequest {
+                id: RowId::VirtualPullRequest(identity),
+                ..
+            } => Some(BranchId::VirtualPullRequest(identity.clone())),
+            Self::Inline { owner, .. } => Some(owner.clone()),
+            Self::Repository { .. }
+            | Self::Worktree { .. }
+            | Self::VirtualRepository { .. }
+            | Self::VirtualPullRequest { .. }
+            | Self::Backburner { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -382,15 +409,10 @@ pub struct App {
     pub selected: Option<RowId>,
     pub filter: String,
     pub filter_active: bool,
-    pub pane: Pane,
     pub scroll: usize,
     pub viewport_height: usize,
     viewport_initialized: bool,
-    pub detail_scroll: usize,
-    detail_max_scroll: usize,
-    pub detail_selected: Option<DetailRowId>,
-    detail_viewport_height: usize,
-    detail_expanded: HashMap<(CanonicalPullRequestId, DetailSection), bool>,
+    inline_expanded: HashMap<(BranchId, InlineSection), bool>,
     pub modal: Option<Modal>,
     pub inline_error: Option<String>,
     pub progress: Option<String>,
@@ -423,15 +445,10 @@ impl App {
             selected: None,
             filter: String::new(),
             filter_active: false,
-            pane: Pane::List,
             scroll: 0,
             viewport_height: 1,
             viewport_initialized: false,
-            detail_scroll: 0,
-            detail_max_scroll: 0,
-            detail_selected: None,
-            detail_viewport_height: 1,
-            detail_expanded: HashMap::new(),
+            inline_expanded: HashMap::new(),
             modal: None,
             inline_error: None,
             progress: None,
@@ -550,6 +567,12 @@ impl App {
                         stack_depth: tree_row.depth,
                         id: RowId::Worktree(worktree.path.clone()),
                     });
+                    self.append_worktree_inline_rows(
+                        &mut rows,
+                        repository_index,
+                        worktree_index,
+                        2 + tree_row.depth,
+                    );
                 }
                 self.append_virtual_rows(
                     &mut rows,
@@ -651,6 +674,18 @@ impl App {
                         stack_depth: tree_row.depth,
                         id: RowId::VirtualPullRequest(pull_request.identity.clone()),
                     });
+                    let depth = self.virtual_pull_request_depth(
+                        virtual_repository_index,
+                        tree_row.index,
+                        mapped_repository_index,
+                        tree_row.depth,
+                    );
+                    self.append_virtual_pull_request_inline_rows(
+                        rows,
+                        virtual_repository_index,
+                        tree_row.index,
+                        depth + 1,
+                    );
                 }
                 if !backburner_pull_requests.is_empty() {
                     rows.push(VisibleRow::Backburner {
@@ -671,6 +706,18 @@ impl App {
                                 stack_depth: tree_row.depth,
                                 id: RowId::VirtualPullRequest(pull_request.identity.clone()),
                             });
+                            let depth = self.virtual_pull_request_depth(
+                                virtual_repository_index,
+                                tree_row.index,
+                                mapped_repository_index,
+                                tree_row.depth,
+                            );
+                            self.append_virtual_pull_request_inline_rows(
+                                rows,
+                                virtual_repository_index,
+                                tree_row.index,
+                                depth + 1,
+                            );
                         }
                     }
                 }
@@ -745,7 +792,9 @@ impl App {
     }
 
     pub fn selected_worktree(&self) -> Option<(&RepositoryView, &Worktree, usize)> {
-        match self.selected_row()? {
+        let row = self.selected_row()?;
+        let owner = row.owner();
+        match row {
             VisibleRow::Worktree {
                 repository_index,
                 worktree_index,
@@ -755,6 +804,18 @@ impl App {
                 &self.repositories[repository_index].worktrees[worktree_index],
                 worktree_index,
             )),
+            VisibleRow::Inline { .. } => {
+                let BranchId::Worktree(path) = owner? else {
+                    return None;
+                };
+                self.repositories.iter().find_map(|repository| {
+                    repository
+                        .worktrees
+                        .iter()
+                        .position(|worktree| worktree.path == path)
+                        .map(|index| (repository, &repository.worktrees[index], index))
+                })
+            }
             VisibleRow::Repository { .. }
             | VisibleRow::VirtualRepository { .. }
             | VisibleRow::Backburner { .. }
@@ -771,7 +832,17 @@ impl App {
             | VisibleRow::Worktree {
                 repository_index, ..
             } => repository_index,
-            VisibleRow::VirtualRepository { .. }
+            VisibleRow::Inline {
+                owner: BranchId::Worktree(path),
+                ..
+            } => self.repositories.iter().position(|repository| {
+                repository
+                    .worktrees
+                    .iter()
+                    .any(|worktree| worktree.path == path)
+            })?,
+            VisibleRow::Inline { .. }
+            | VisibleRow::VirtualRepository { .. }
             | VisibleRow::Backburner { .. }
             | VisibleRow::VirtualPullRequest { .. } => {
                 return None;
@@ -783,7 +854,9 @@ impl App {
     pub fn selected_virtual_pull_request(
         &self,
     ) -> Option<(&VirtualRepositoryView, &AuthoredPullRequest)> {
-        match self.selected_row()? {
+        let row = self.selected_row()?;
+        let owner = row.owner();
+        match row {
             VisibleRow::VirtualPullRequest {
                 virtual_repository_index,
                 pull_request_index,
@@ -793,76 +866,325 @@ impl App {
                 &self.virtual_repositories[virtual_repository_index].pull_requests
                     [pull_request_index],
             )),
+            VisibleRow::Inline { .. } => {
+                let BranchId::VirtualPullRequest(identity) = owner? else {
+                    return None;
+                };
+                self.virtual_repositories.iter().find_map(|repository| {
+                    repository
+                        .pull_requests
+                        .iter()
+                        .find(|pull_request| pull_request.identity == identity)
+                        .map(|pull_request| (repository, pull_request))
+                })
+            }
             _ => None,
         }
     }
 
-    pub fn detail_rows(&self) -> Vec<DetailRow> {
-        let Some((identity, pull_request, details, mut context)) =
-            self.selected_pull_request_data()
-        else {
-            return Vec::new();
+    fn append_worktree_inline_rows(
+        &self,
+        rows: &mut Vec<VisibleRow>,
+        repository_index: usize,
+        worktree_index: usize,
+        depth: usize,
+    ) {
+        let repository = &self.repositories[repository_index];
+        let worktree = &repository.worktrees[worktree_index];
+        let owner = BranchId::Worktree(worktree.path.clone());
+        let local_summary = match self.statuses.get(&worktree.path) {
+            Some(StatusState::Pending) => "loading".to_owned(),
+            Some(StatusState::Ready(status)) => status.summary(),
+            Some(StatusState::Error(error)) => format!("error: {error}"),
+            None => "unknown".to_owned(),
         };
+        let worktree_expanded = self.inline_section_expanded(&owner, InlineSection::Worktree);
+        self.push_inline_row(
+            rows,
+            owner.clone(),
+            InlineSection::Worktree,
+            depth,
+            InlineRowKind::Section,
+            format!(
+                "Worktree · {local_summary} · {}",
+                worktree
+                    .branch
+                    .as_deref()
+                    .unwrap_or("detached")
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(worktree.branch.as_deref().unwrap_or("detached"))
+            ),
+            None,
+            Some(worktree_expanded),
+            RowId::Section(owner.clone(), InlineSection::Worktree),
+        );
+        if worktree_expanded {
+            let mut metadata = vec![
+                (
+                    "repository".to_owned(),
+                    format!("repository: {}", repository.config.display_label()),
+                ),
+                (
+                    "anchor".to_owned(),
+                    format!("anchor: {}", repository.config.path.display()),
+                ),
+                (
+                    "path".to_owned(),
+                    format!("path: {}", worktree.path.display()),
+                ),
+                (
+                    "branch".to_owned(),
+                    format!(
+                        "branch: {}",
+                        worktree.branch.as_deref().unwrap_or("detached")
+                    ),
+                ),
+                (
+                    "head".to_owned(),
+                    format!("HEAD: {}", worktree.head.as_deref().unwrap_or("-")),
+                ),
+                (
+                    "locked".to_owned(),
+                    format!("locked: {}", worktree.locked.as_deref().unwrap_or("no")),
+                ),
+                (
+                    "prunable".to_owned(),
+                    format!("prunable: {}", worktree.prunable.as_deref().unwrap_or("no")),
+                ),
+            ];
+            match self.statuses.get(&worktree.path) {
+                Some(StatusState::Ready(status)) => {
+                    metadata.push((
+                        "upstream".to_owned(),
+                        format!("upstream: {}", status.upstream.as_deref().unwrap_or("-")),
+                    ));
+                    metadata.push(("local".to_owned(), format!("local: {}", status.summary())));
+                }
+                Some(StatusState::Pending) => {
+                    metadata.push(("local".to_owned(), "local: loading".to_owned()))
+                }
+                Some(StatusState::Error(error)) => {
+                    metadata.push(("local".to_owned(), format!("local status error: {error}")))
+                }
+                None => {}
+            }
+            if let Some(github_state) = self.github.get(&worktree.path) {
+                if let GitHubState::Stale { error, .. } = github_state {
+                    metadata.push(("github-stale".to_owned(), format!("GitHub stale: {error}")));
+                }
+                if let Some(data) = github_state.data() {
+                    for (index, warning) in data.warnings.iter().enumerate() {
+                        metadata.push((
+                            format!("github-warning-{index}"),
+                            format!("warning: {warning}"),
+                        ));
+                    }
+                    if let Some(rate_limit) = &data.rate_limit {
+                        metadata.push((
+                            "github-rate-limit".to_owned(),
+                            format!(
+                                "rate limit: {} remaining · resets {}",
+                                rate_limit.remaining, rate_limit.reset_at
+                            ),
+                        ));
+                    }
+                }
+            }
+            for (key, text) in metadata {
+                self.push_inline_row(
+                    rows,
+                    owner.clone(),
+                    InlineSection::Worktree,
+                    depth + 1,
+                    InlineRowKind::Metadata,
+                    text,
+                    None,
+                    None,
+                    RowId::Metadata(owner.clone(), format!("worktree-{key}")),
+                );
+            }
+        }
+
+        let Some(github_state) = self.github.get(&worktree.path) else {
+            return;
+        };
+        let Some(data) = github_state.data() else {
+            return;
+        };
+        let Some(pull_request) = data.pull_request.as_ref() else {
+            return;
+        };
+        let Some(identity) = self.pull_request_identity(repository, pull_request) else {
+            return;
+        };
+        let mut context = vec![
+            (
+                "repository".to_owned(),
+                format!("repository: {}", repository.config.display_label()),
+            ),
+            (
+                "local-path".to_owned(),
+                format!("local path: {}", worktree.path.display()),
+            ),
+        ];
+        match github_state {
+            GitHubState::Loading { .. } => {
+                context.push(("github".to_owned(), "GitHub: refreshing".to_owned()))
+            }
+            GitHubState::Stale { error, .. } => {
+                context.push(("github-stale".to_owned(), format!("GitHub stale: {error}")))
+            }
+            GitHubState::Ready(_) => {}
+        }
+        context.extend(
+            data.warnings.iter().enumerate().map(|(index, warning)| {
+                (format!("warning-{index}"), format!("warning: {warning}"))
+            }),
+        );
+        self.append_pull_request_inline_rows(
+            rows,
+            owner,
+            depth,
+            &identity,
+            pull_request,
+            self.pull_request_details.get(&identity),
+            context,
+        );
+    }
+
+    fn append_virtual_pull_request_inline_rows(
+        &self,
+        rows: &mut Vec<VisibleRow>,
+        virtual_repository_index: usize,
+        pull_request_index: usize,
+        depth: usize,
+    ) {
+        let repository = &self.virtual_repositories[virtual_repository_index];
+        let authored = &repository.pull_requests[pull_request_index];
+        let owner = BranchId::VirtualPullRequest(authored.identity.clone());
+        let mut context = vec![
+            (
+                "repository".to_owned(),
+                format!("repository: {}", repository.identity.full_name()),
+            ),
+            (
+                "local-repo".to_owned(),
+                format!(
+                    "local repo: {}",
+                    repository
+                        .mapped_repository
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "none (virtual)".to_owned())
+                ),
+            ),
+            ("author".to_owned(), format!("author: {}", authored.author)),
+        ];
+        if self.authored_pull_requests.loading {
+            context.push(("github".to_owned(), "GitHub: refreshing".to_owned()));
+        } else if let Some(error) = &self.authored_pull_requests.stale_error {
+            context.push(("github-stale".to_owned(), format!("GitHub stale: {error}")));
+        }
+        self.append_pull_request_inline_rows(
+            rows,
+            owner,
+            depth,
+            &authored.identity,
+            &authored.pull_request,
+            self.pull_request_details.get(&authored.identity),
+            context,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_pull_request_inline_rows(
+        &self,
+        rows: &mut Vec<VisibleRow>,
+        owner: BranchId,
+        depth: usize,
+        identity: &CanonicalPullRequestId,
+        pull_request: &PullRequest,
+        details: Option<&PullRequestDetails>,
+        mut context: Vec<(String, String)>,
+    ) {
         let pr_url = pull_request.url.clone();
         context.extend([
-            format!("URL: {}", pull_request.url),
-            format!(
-                "base: {}:{}",
-                pull_request.base.repository.as_deref().unwrap_or("unknown"),
-                pull_request.base.branch
+            ("url".to_owned(), format!("URL: {}", pull_request.url)),
+            (
+                "base".to_owned(),
+                format!(
+                    "base: {}:{}",
+                    pull_request.base.repository.as_deref().unwrap_or("unknown"),
+                    pull_request.base.branch
+                ),
             ),
-            format!(
-                "head: {}:{}",
-                pull_request.head.repository.as_deref().unwrap_or("unknown"),
-                pull_request.head.branch
+            (
+                "head".to_owned(),
+                format!(
+                    "head: {}:{}",
+                    pull_request.head.repository.as_deref().unwrap_or("unknown"),
+                    pull_request.head.branch
+                ),
             ),
-            format!(
-                "head SHA: {}",
-                pull_request.head.oid.as_deref().unwrap_or("unknown")
+            (
+                "head-sha".to_owned(),
+                format!(
+                    "head SHA: {}",
+                    pull_request.head.oid.as_deref().unwrap_or("unknown")
+                ),
             ),
-            format!(
-                "state: {} · updated {}",
-                pull_request.state, pull_request.updated_at
+            (
+                "state".to_owned(),
+                format!(
+                    "state: {} · updated {}",
+                    pull_request.state, pull_request.updated_at
+                ),
             ),
-            format!(
-                "auto-merge: {}",
-                if pull_request.auto_merge {
-                    "enabled"
-                } else {
-                    "off"
-                }
+            (
+                "auto-merge".to_owned(),
+                format!(
+                    "auto-merge: {}",
+                    if pull_request.auto_merge {
+                        "enabled"
+                    } else {
+                        "off"
+                    }
+                ),
             ),
         ]);
-        if let Some(error) = self.pull_request_detail_errors.get(&identity) {
-            context.push(format!("details stale: {error}"));
+        if let Some(error) = self.pull_request_detail_errors.get(identity) {
+            context.push((
+                "details-stale".to_owned(),
+                format!("details stale: {error}"),
+            ));
         }
-        if let Some(details) = &details {
-            context.push(format!("conflict: {}", debug_label(details.merge_conflict)));
-            context.extend(
-                details
-                    .warnings
-                    .iter()
-                    .map(|warning| format!("warning: {warning}")),
-            );
+        if let Some(details) = details {
+            context.push((
+                "conflict".to_owned(),
+                format!("conflict: {}", debug_label(details.merge_conflict)),
+            ));
+            context.extend(details.warnings.iter().enumerate().map(|(index, warning)| {
+                (
+                    format!("detail-warning-{index}"),
+                    format!("warning: {warning}"),
+                )
+            }));
         } else {
-            context.push("attention details: loading or unavailable".to_owned());
+            context.push((
+                "attention-details".to_owned(),
+                "attention details: loading or unavailable".to_owned(),
+            ));
         }
-        let mut rows = vec![DetailRow {
-            id: DetailRowId::Summary(identity.clone()),
-            lines: vec![format!(
-                "PR #{} · {}",
-                pull_request.number, pull_request.title
-            )],
-            url: pr_url.clone(),
-            tree_prefix: String::new(),
-            expanded: None,
-        }];
 
-        let summary = details.as_ref().map(PullRequestDetails::attention_summary);
-        let overview_expanded = self.detail_section_expanded(&identity, DetailSection::Attention);
-        rows.push(DetailRow {
-            id: DetailRowId::Section(identity.clone(), DetailSection::Attention),
-            lines: vec![format!(
+        let summary = details.map(PullRequestDetails::attention_summary);
+        let overview_expanded = self.inline_section_expanded(&owner, InlineSection::Overview);
+        self.push_inline_row(
+            rows,
+            owner.clone(),
+            InlineSection::Overview,
+            depth,
+            InlineRowKind::Section,
+            format!(
                 "Overview · {} · auto-merge {} · conflicts {}",
                 pull_request.state,
                 if pull_request.auto_merge {
@@ -873,33 +1195,32 @@ impl App {
                 summary
                     .map(|summary| debug_label(summary.merge_conflict))
                     .unwrap_or_else(|| "unknown".to_owned()),
-            )],
-            url: pr_url.clone(),
-            tree_prefix: "├─ ".to_owned(),
-            expanded: Some(overview_expanded),
-        });
+            ),
+            Some(pr_url.clone()),
+            Some(overview_expanded),
+            RowId::Section(owner.clone(), InlineSection::Overview),
+        );
         if overview_expanded {
-            let count = context.len();
-            rows.extend(
-                context
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, line)| DetailRow {
-                        id: DetailRowId::Metadata(identity.clone(), format!("overview-{index}")),
-                        lines: vec![line],
-                        url: pr_url.clone(),
-                        tree_prefix: detail_child_prefix(DetailSection::Attention, index, count),
-                        expanded: None,
-                    }),
-            );
+            for (key, text) in context {
+                self.push_inline_row(
+                    rows,
+                    owner.clone(),
+                    InlineSection::Overview,
+                    depth + 1,
+                    InlineRowKind::Metadata,
+                    text,
+                    Some(pr_url.clone()),
+                    None,
+                    RowId::Metadata(owner.clone(), format!("overview-{key}")),
+                );
+            }
         }
 
         let mut checks = details
-            .as_ref()
             .map(|details| details.checks.clone())
             .unwrap_or_default();
         checks.sort_by_key(|check| (check_attention_rank(check.state), check.source_order));
-        let checks_expanded = self.detail_section_expanded(&identity, DetailSection::Checks);
+        let checks_expanded = self.inline_section_expanded(&owner, InlineSection::Checks);
         let required_total = checks.iter().filter(|check| check.required).count();
         let required_passed = checks
             .iter()
@@ -945,18 +1266,21 @@ impl App {
                 }
             ));
         }
-        rows.push(DetailRow {
-            id: DetailRowId::Section(identity.clone(), DetailSection::Checks),
-            lines: vec![checks_header],
-            url: pr_url.clone(),
-            tree_prefix: "├─ ".to_owned(),
-            expanded: Some(checks_expanded),
-        });
+        self.push_inline_row(
+            rows,
+            owner.clone(),
+            InlineSection::Checks,
+            depth,
+            InlineRowKind::Section,
+            checks_header,
+            Some(pr_url.clone()),
+            Some(checks_expanded),
+            RowId::Section(owner.clone(), InlineSection::Checks),
+        );
         if checks_expanded {
-            let count = checks.len();
-            rows.extend(checks.into_iter().enumerate().map(|(index, check)| {
-                let target_url = check.target_url.clone();
-                let mut line = format!(
+            for check in checks {
+                let target_url = check.target_url.clone().unwrap_or_else(|| pr_url.clone());
+                let mut text = format!(
                     "{} · {} · {}",
                     check.name,
                     debug_label(check.state),
@@ -966,111 +1290,112 @@ impl App {
                         "optional"
                     }
                 );
-                if let Some(url) = &target_url {
-                    line.push_str(&format!(" · {url}"));
+                if check.target_url.is_some() {
+                    text.push_str(&format!(" · {target_url}"));
                 }
-                DetailRow {
-                    id: DetailRowId::Check(identity.clone(), check.name),
-                    lines: vec![line],
-                    url: target_url.unwrap_or_else(|| pr_url.clone()),
-                    tree_prefix: detail_child_prefix(DetailSection::Checks, index, count),
-                    expanded: None,
-                }
-            }));
+                self.push_inline_row(
+                    rows,
+                    owner.clone(),
+                    InlineSection::Checks,
+                    depth + 1,
+                    InlineRowKind::Check,
+                    text,
+                    Some(target_url),
+                    None,
+                    RowId::Check(identity.clone(), check.name),
+                );
+            }
         }
 
         let review_requests = details
-            .as_ref()
             .map(|details| details.review_requests.clone())
             .unwrap_or_default();
         let reviewer_reviews = details
-            .as_ref()
             .map(|details| details.reviewer_reviews.clone())
             .unwrap_or_default();
-        let reviews_expanded = self.detail_section_expanded(&identity, DetailSection::Reviews);
+        let reviews_expanded = self.inline_section_expanded(&owner, InlineSection::Reviews);
         let review_state = summary
             .map(|summary| debug_label(summary.review))
             .unwrap_or_else(|| "unknown".to_owned());
-        rows.push(DetailRow {
-            id: DetailRowId::Section(identity.clone(), DetailSection::Reviews),
-            lines: vec![format!(
+        self.push_inline_row(
+            rows,
+            owner.clone(),
+            InlineSection::Reviews,
+            depth,
+            InlineRowKind::Section,
+            format!(
                 "Reviews · {review_state} · {} requested · {} submitted",
                 review_requests.len(),
                 reviewer_reviews.len()
-            )],
-            url: pr_url.clone(),
-            tree_prefix: "├─ ".to_owned(),
-            expanded: Some(reviews_expanded),
-        });
+            ),
+            Some(pr_url.clone()),
+            Some(reviews_expanded),
+            RowId::Section(owner.clone(), InlineSection::Reviews),
+        );
         if reviews_expanded {
-            let count = review_requests.len() + reviewer_reviews.len();
-            rows.extend(
-                review_requests
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, request)| DetailRow {
-                        id: DetailRowId::ReviewRequest(identity.clone(), request.id.clone()),
-                        lines: vec![format!(
-                            "requested: {} ({}) · github id {}",
-                            request.name,
-                            debug_label(request.kind),
-                            request.id
-                        )],
-                        url: pr_url.clone(),
-                        tree_prefix: detail_child_prefix(DetailSection::Reviews, index, count),
-                        expanded: None,
-                    }),
-            );
-            let offset = rows
-                .iter()
-                .filter(|row| matches!(row.id, DetailRowId::ReviewRequest(_, _)))
-                .count();
-            rows.extend(
-                reviewer_reviews
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, review)| DetailRow {
-                        id: DetailRowId::Review(identity.clone(), review.id.clone()),
-                        lines: vec![format!(
-                            "{} · {} · github id {}{}",
-                            review.reviewer,
-                            debug_label(review.state),
-                            review.id,
-                            review
-                                .database_id
-                                .map(|id| format!(" · review id {id}"))
-                                .unwrap_or_default()
-                        )],
-                        url: pr_url.clone(),
-                        tree_prefix: detail_child_prefix(
-                            DetailSection::Reviews,
-                            offset + index,
-                            count,
-                        ),
-                        expanded: None,
-                    }),
-            );
+            for request in review_requests {
+                self.push_inline_row(
+                    rows,
+                    owner.clone(),
+                    InlineSection::Reviews,
+                    depth + 1,
+                    InlineRowKind::ReviewRequest,
+                    format!(
+                        "requested: {} ({}) · github id {}",
+                        request.name,
+                        debug_label(request.kind),
+                        request.id
+                    ),
+                    Some(pr_url.clone()),
+                    None,
+                    RowId::ReviewRequest(identity.clone(), request.id),
+                );
+            }
+            for review in reviewer_reviews {
+                self.push_inline_row(
+                    rows,
+                    owner.clone(),
+                    InlineSection::Reviews,
+                    depth + 1,
+                    InlineRowKind::Review,
+                    format!(
+                        "{} · {} · github id {}{}",
+                        review.reviewer,
+                        debug_label(review.state),
+                        review.id,
+                        review
+                            .database_id
+                            .map(|id| format!(" · review id {id}"))
+                            .unwrap_or_default()
+                    ),
+                    Some(pr_url.clone()),
+                    None,
+                    RowId::Review(identity.clone(), review.id),
+                );
+            }
         }
 
         let feedback: Vec<_> = details
-            .as_ref()
             .map(|details| details.unresolved_feedback().cloned().collect())
             .unwrap_or_default();
-        let feedback_expanded = self.detail_section_expanded(&identity, DetailSection::Feedback);
-        rows.push(DetailRow {
-            id: DetailRowId::Section(identity.clone(), DetailSection::Feedback),
-            lines: vec![if feedback.is_empty() {
+        let feedback_expanded = self.inline_section_expanded(&owner, InlineSection::Feedback);
+        self.push_inline_row(
+            rows,
+            owner.clone(),
+            InlineSection::Feedback,
+            depth,
+            InlineRowKind::Section,
+            if feedback.is_empty() {
                 "Feedback · none".to_owned()
             } else {
                 format!("Feedback · {} unresolved", feedback.len())
-            }],
-            url: pr_url.clone(),
-            tree_prefix: "└─ ".to_owned(),
-            expanded: Some(feedback_expanded),
-        });
+            },
+            Some(pr_url.clone()),
+            Some(feedback_expanded),
+            RowId::Section(owner.clone(), InlineSection::Feedback),
+        );
         if feedback_expanded {
-            let count = feedback.len();
-            rows.extend(feedback.into_iter().enumerate().map(|(index, feedback)| {
+            for feedback in feedback {
                 let body = feedback
                     .body
                     .split_whitespace()
@@ -1086,33 +1411,79 @@ impl App {
                 let url = feedback.permalink.unwrap_or_else(|| pr_url.clone());
                 metadata.push(url.clone());
                 metadata.push(format!("github id {}", feedback.id));
-                if let Some(id) = feedback.database_id {
-                    metadata.push(format!("id {id}"));
+                if let Some(database_id) = feedback.database_id {
+                    metadata.push(format!("id {database_id}"));
                 }
                 if let Some(thread_id) = feedback.thread_id {
                     metadata.push(format!("thread {thread_id}"));
                 }
-                DetailRow {
-                    id: DetailRowId::Feedback(identity.clone(), feedback.id),
-                    lines: vec![metadata.join(" · ")],
-                    url,
-                    tree_prefix: detail_child_prefix(DetailSection::Feedback, index, count),
-                    expanded: None,
-                }
-            }));
+                self.push_inline_row(
+                    rows,
+                    owner.clone(),
+                    InlineSection::Feedback,
+                    depth + 1,
+                    InlineRowKind::Feedback,
+                    metadata.join(" · "),
+                    Some(url),
+                    None,
+                    RowId::Feedback(identity.clone(), feedback.id),
+                );
+            }
         }
-        rows
     }
 
-    fn detail_section_expanded(
+    #[allow(clippy::too_many_arguments)]
+    fn push_inline_row(
         &self,
-        identity: &CanonicalPullRequestId,
-        section: DetailSection,
-    ) -> bool {
-        self.detail_expanded
-            .get(&(identity.clone(), section))
+        rows: &mut Vec<VisibleRow>,
+        owner: BranchId,
+        section: InlineSection,
+        depth: usize,
+        kind: InlineRowKind,
+        text: String,
+        url: Option<String>,
+        expanded: Option<bool>,
+        id: RowId,
+    ) {
+        rows.push(VisibleRow::Inline {
+            owner,
+            section,
+            depth,
+            kind,
+            text,
+            url,
+            expanded,
+            id,
+        });
+    }
+
+    fn inline_section_expanded(&self, owner: &BranchId, section: InlineSection) -> bool {
+        self.inline_expanded
+            .get(&(owner.clone(), section))
             .copied()
-            .unwrap_or(section == DetailSection::Feedback)
+            .unwrap_or(section == InlineSection::Feedback)
+    }
+
+    fn virtual_pull_request_depth(
+        &self,
+        virtual_repository_index: usize,
+        pull_request_index: usize,
+        mapped_repository_index: Option<usize>,
+        stack_depth: usize,
+    ) -> usize {
+        let repository = &self.virtual_repositories[virtual_repository_index];
+        let base_depth = if mapped_repository_index.is_some() {
+            1
+        } else if repository.mapped_repository.is_some() {
+            2
+        } else {
+            1
+        };
+        base_depth
+            + stack_depth
+            + usize::from(
+                self.is_backburnered(&repository.pull_requests[pull_request_index].identity),
+            )
     }
 
     fn selected_pull_request_data(
@@ -1249,84 +1620,27 @@ impl App {
             return match key.code {
                 KeyCode::Char('c') => Intent::Cancel,
                 KeyCode::Char('d') => {
-                    if self.pane == Pane::Detail {
-                        let distance = (self.detail_viewport_height / 2).max(1) as isize;
-                        if self.detail_rows().is_empty() {
-                            self.scroll_detail(distance);
-                        } else {
-                            self.move_detail_selection(distance);
-                        }
-                    } else {
-                        self.move_selection((self.viewport_height / 2).max(1) as isize);
-                    }
+                    self.move_selection((self.viewport_height / 2).max(1) as isize);
                     Intent::None
                 }
                 KeyCode::Char('u') => {
-                    if self.pane == Pane::Detail {
-                        let distance = (self.detail_viewport_height / 2).max(1) as isize;
-                        if self.detail_rows().is_empty() {
-                            self.scroll_detail(-distance);
-                        } else {
-                            self.move_detail_selection(-distance);
-                        }
-                    } else {
-                        self.move_selection(-((self.viewport_height / 2).max(1) as isize));
-                    }
+                    self.move_selection(-((self.viewport_height / 2).max(1) as isize));
                     Intent::None
                 }
                 _ => Intent::None,
             };
         }
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.pane == Pane::Detail {
-                    if self.detail_rows().is_empty() {
-                        self.scroll_detail(1);
-                    } else {
-                        self.move_detail_selection(1);
-                    }
-                    Intent::None
-                } else {
-                    self.move_and_continue(1)
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.pane == Pane::Detail {
-                    if self.detail_rows().is_empty() {
-                        self.scroll_detail(-1);
-                    } else {
-                        self.move_detail_selection(-1);
-                    }
-                    Intent::None
-                } else {
-                    self.move_and_continue(-1)
-                }
-            }
+            KeyCode::Char('j') | KeyCode::Down => self.move_and_continue(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_and_continue(-1),
             KeyCode::Char('g') => {
-                if self.pane == Pane::Detail {
-                    if self.detail_rows().is_empty() {
-                        self.detail_scroll = 0;
-                    } else {
-                        self.select_detail_index(0);
-                    }
-                } else {
-                    self.select_index(0);
-                }
+                self.select_index(0);
                 Intent::None
             }
             KeyCode::Char('G') => {
-                if self.pane == Pane::Detail {
-                    let detail_rows = self.detail_rows();
-                    if detail_rows.is_empty() {
-                        self.detail_scroll = self.detail_max_scroll;
-                    } else {
-                        self.select_detail_index(detail_rows.len() - 1);
-                    }
-                } else {
-                    let length = self.visible_rows().len();
-                    if length > 0 {
-                        self.select_index(length - 1);
-                    }
+                let length = self.visible_rows().len();
+                if length > 0 {
+                    self.select_index(length - 1);
                 }
                 Intent::None
             }
@@ -1335,11 +1649,7 @@ impl App {
                 Intent::None
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                self.expand_or_focus_detail();
-                Intent::None
-            }
-            KeyCode::Tab => {
-                self.toggle_pane();
+                self.expand_selected();
                 Intent::None
             }
             KeyCode::Char('/') => {
@@ -1361,15 +1671,9 @@ impl App {
                 Intent::None
             }
             KeyCode::Char('q') => Intent::Cancel,
-            KeyCode::Char('w') if self.pane == Pane::Detail => self.open_selected_detail(),
+            KeyCode::Char('w') => self.open_selected_url(),
             KeyCode::Char(character) => self.direct_action(character),
-            KeyCode::Enter => {
-                if self.pane == Pane::Detail {
-                    self.open_selected_detail()
-                } else {
-                    self.accept_or_toggle()
-                }
-            }
+            KeyCode::Enter => self.accept_or_toggle(),
             KeyCode::Esc => Intent::Cancel,
             _ => Intent::None,
         }
@@ -1540,7 +1844,14 @@ impl App {
         }
         if matches!(
             self.selected_row(),
-            Some(VisibleRow::VirtualRepository { .. } | VisibleRow::VirtualPullRequest { .. })
+            Some(
+                VisibleRow::VirtualRepository { .. }
+                    | VisibleRow::VirtualPullRequest { .. }
+                    | VisibleRow::Inline {
+                        owner: BranchId::VirtualPullRequest(_),
+                        ..
+                    }
+            )
         ) {
             return disabled("virtual pull requests support only Enter to create a worktree");
         }
@@ -1755,7 +2066,7 @@ impl App {
                 }
             }
         }
-        self.reconcile_detail_selection();
+        self.ensure_selection_visible();
         true
     }
 
@@ -1872,8 +2183,6 @@ impl App {
                     .map(|row| row.id().clone())
             })
             .or_else(|| current_rows.first().map(|row| row.id().clone()));
-            self.detail_scroll = 0;
-            self.detail_selected = None;
         }
         self.ensure_selected_in_view();
     }
@@ -1888,74 +2197,11 @@ impl App {
         }
     }
 
-    pub fn set_detail_max_scroll(&mut self, max_scroll: usize) {
-        self.detail_max_scroll = max_scroll;
-        self.detail_scroll = self.detail_scroll.min(max_scroll);
-    }
-
-    pub fn set_detail_viewport_height(&mut self, height: usize) {
-        self.detail_viewport_height = height.max(1);
-        self.reconcile_detail_selection();
-    }
-
-    pub fn set_detail_scroll(&mut self, scroll: usize) {
-        self.detail_scroll = scroll;
-    }
-
-    fn reconcile_detail_selection(&mut self) {
-        let rows = self.detail_rows();
-        if rows.is_empty() {
-            self.detail_selected = None;
-            return;
+    fn open_selected_url(&mut self) -> Intent {
+        match self.selected_row() {
+            Some(VisibleRow::Inline { url: Some(url), .. }) => Intent::OpenUrl(url),
+            _ => self.direct_action('w'),
         }
-        let previous_index = self
-            .detail_selected
-            .as_ref()
-            .and_then(|selected| rows.iter().position(|row| &row.id == selected));
-        if previous_index.is_some() {
-            return;
-        }
-        let fallback = self.detail_selected.as_ref().map_or(0, |selected| {
-            rows.iter()
-                .position(|row| row.id > *selected)
-                .unwrap_or_else(|| rows.len().saturating_sub(1))
-        });
-        self.detail_selected = rows.get(fallback).map(|row| row.id.clone());
-        self.detail_scroll = self.detail_scroll.min(fallback);
-    }
-
-    fn move_detail_selection(&mut self, delta: isize) {
-        let rows = self.detail_rows();
-        if rows.is_empty() {
-            return;
-        }
-        let current = self
-            .detail_selected
-            .as_ref()
-            .and_then(|selected| rows.iter().position(|row| &row.id == selected))
-            .unwrap_or(0);
-        let next = (current as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
-        self.detail_selected = Some(rows[next].id.clone());
-    }
-
-    fn select_detail_index(&mut self, index: usize) {
-        if let Some(row) = self.detail_rows().get(index) {
-            self.detail_selected = Some(row.id.clone());
-        }
-    }
-
-    fn open_selected_detail(&mut self) -> Intent {
-        let rows = self.detail_rows();
-        if rows.is_empty() {
-            return Intent::None;
-        }
-        let row = self
-            .detail_selected
-            .as_ref()
-            .and_then(|selected| rows.iter().find(|row| &row.id == selected))
-            .or_else(|| rows.first());
-        row.map(|row| Intent::OpenUrl(row.url.clone()))
-            .unwrap_or(Intent::None)
     }
 
     pub fn selected_pull_request_url(&self) -> Option<String> {
@@ -1965,11 +2211,8 @@ impl App {
 
     pub fn agent_prompt(&self) -> Option<String> {
         let all = self.prompt_pull_requests();
-        let selected_detail = (self.pane == Pane::Detail)
-            .then_some(self.detail_selected.as_ref())
-            .flatten();
-        let scoped = match selected_detail {
-            Some(DetailRowId::Check(identity, name)) => all
+        let scoped = match self.selected.as_ref() {
+            Some(RowId::Check(identity, name)) => all
                 .get(identity)
                 .map(|pull_request| PromptPullRequest {
                     identity: identity.clone(),
@@ -1984,7 +2227,7 @@ impl App {
                 })
                 .into_iter()
                 .collect(),
-            Some(DetailRowId::Feedback(identity, id)) => all
+            Some(RowId::Feedback(identity, id)) => all
                 .get(identity)
                 .map(|pull_request| PromptPullRequest {
                     identity: identity.clone(),
@@ -1999,33 +2242,39 @@ impl App {
                 })
                 .into_iter()
                 .collect(),
-            Some(DetailRowId::Section(identity, DetailSection::Checks)) => all
-                .get(identity)
-                .map(|pull_request| PromptPullRequest {
-                    identity: identity.clone(),
+            Some(RowId::Section(
+                owner,
+                section @ (InlineSection::Checks | InlineSection::Feedback),
+            )) => self
+                .pull_request_identity_for_branch(owner)
+                .and_then(|identity| {
+                    all.get(&identity)
+                        .map(|pull_request| (identity, pull_request))
+                })
+                .map(|(identity, pull_request)| PromptPullRequest {
+                    identity,
                     pull_request: pull_request.pull_request.clone(),
-                    checks: pull_request.checks.clone(),
-                    feedback: Vec::new(),
+                    checks: if *section == InlineSection::Checks {
+                        pull_request.checks.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    feedback: if *section == InlineSection::Feedback {
+                        pull_request.feedback.clone()
+                    } else {
+                        Vec::new()
+                    },
                 })
                 .into_iter()
                 .collect(),
-            Some(DetailRowId::Section(identity, DetailSection::Feedback)) => all
-                .get(identity)
-                .map(|pull_request| PromptPullRequest {
-                    identity: identity.clone(),
-                    pull_request: pull_request.pull_request.clone(),
-                    checks: Vec::new(),
-                    feedback: pull_request.feedback.clone(),
-                })
-                .into_iter()
-                .collect(),
-            Some(DetailRowId::Summary(identity))
-            | Some(DetailRowId::Metadata(identity, _))
-            | Some(DetailRowId::Section(identity, DetailSection::Attention))
-            | Some(DetailRowId::Section(identity, DetailSection::Reviews))
-            | Some(DetailRowId::ReviewRequest(identity, _))
-            | Some(DetailRowId::Review(identity, _)) => self.prompt_stack(&all, identity),
-            None => self.prompt_scope_from_tree(&all),
+            Some(RowId::Section(owner, _)) | Some(RowId::Metadata(owner, _)) => self
+                .pull_request_identity_for_branch(owner)
+                .map(|identity| self.prompt_stack(&all, &identity))
+                .unwrap_or_default(),
+            Some(RowId::ReviewRequest(identity, _)) | Some(RowId::Review(identity, _)) => {
+                self.prompt_stack(&all, identity)
+            }
+            _ => self.prompt_scope_from_tree(&all),
         };
         format_agent_prompt(&scoped)
     }
@@ -2035,21 +2284,6 @@ impl App {
     }
 
     fn selected_pull_request_identity(&self) -> Option<CanonicalPullRequestId> {
-        if self.pane == Pane::Detail {
-            let identity = match self.detail_selected.as_ref() {
-                Some(DetailRowId::Summary(identity))
-                | Some(DetailRowId::Section(identity, _))
-                | Some(DetailRowId::Metadata(identity, _))
-                | Some(DetailRowId::Check(identity, _))
-                | Some(DetailRowId::ReviewRequest(identity, _))
-                | Some(DetailRowId::Review(identity, _))
-                | Some(DetailRowId::Feedback(identity, _)) => Some(identity.clone()),
-                None => None,
-            };
-            if identity.is_some() {
-                return identity;
-            }
-        }
         match self.selected.as_ref()? {
             RowId::VirtualPullRequest(identity) => Some(identity.clone()),
             RowId::Worktree(path) => {
@@ -2066,7 +2300,34 @@ impl App {
                     .and_then(|data| data.pull_request.as_ref())?;
                 self.pull_request_identity(repository, pull_request)
             }
+            RowId::Section(owner, _) | RowId::Metadata(owner, _) => {
+                self.pull_request_identity_for_branch(owner)
+            }
+            RowId::Check(identity, _)
+            | RowId::ReviewRequest(identity, _)
+            | RowId::Review(identity, _)
+            | RowId::Feedback(identity, _) => Some(identity.clone()),
             RowId::Repository(_) | RowId::VirtualRepository(_) | RowId::Backburner(_) => None,
+        }
+    }
+
+    fn pull_request_identity_for_branch(&self, owner: &BranchId) -> Option<CanonicalPullRequestId> {
+        match owner {
+            BranchId::VirtualPullRequest(identity) => Some(identity.clone()),
+            BranchId::Worktree(path) => {
+                let repository = self.repositories.iter().find(|repository| {
+                    repository
+                        .worktrees
+                        .iter()
+                        .any(|worktree| worktree.path == *path)
+                })?;
+                let pull_request = self
+                    .github
+                    .get(path)
+                    .and_then(GitHubState::data)
+                    .and_then(|data| data.pull_request.as_ref())?;
+                self.pull_request_identity(repository, pull_request)
+            }
         }
     }
 
@@ -2095,7 +2356,6 @@ impl App {
         {
             self.selected = Some(RowId::Backburner(identity.repository));
         }
-        self.reconcile_detail_selection();
         self.ensure_selection_visible();
         Intent::PersistBackburner
     }
@@ -2185,8 +2445,6 @@ impl App {
             _ => {}
         }
         self.selected = Some(row);
-        self.pane = Pane::List;
-        self.reconcile_detail_selection();
         self.ensure_selection_visible();
     }
 
@@ -2343,6 +2601,14 @@ impl App {
                 })
                 .cloned()
                 .collect(),
+            Some(RowId::Section(owner, _)) | Some(RowId::Metadata(owner, _)) => self
+                .pull_request_identity_for_branch(owner)
+                .map(|identity| self.prompt_stack(all, &identity))
+                .unwrap_or_default(),
+            Some(RowId::Check(identity, _))
+            | Some(RowId::ReviewRequest(identity, _))
+            | Some(RowId::Review(identity, _))
+            | Some(RowId::Feedback(identity, _)) => self.prompt_stack(all, identity),
             None => Vec::new(),
         }
     }
@@ -2425,24 +2691,32 @@ impl App {
                     .identity
                     .clone(),
             ),
+            Some(VisibleRow::Inline { url, .. }) => {
+                url.map(Intent::OpenUrl).unwrap_or(Intent::None)
+            }
             None => Intent::None,
         }
     }
 
     fn collapse_or_focus_list(&mut self) {
-        if self.pane == Pane::Detail {
-            if self.detail_rows().is_empty() {
-                self.pane = Pane::List;
-            } else {
-                self.collapse_detail_section();
+        if let Some(VisibleRow::Inline {
+            owner,
+            section,
+            expanded,
+            ..
+        }) = self.selected_row()
+        {
+            if expanded == Some(false) {
+                return;
             }
+            self.inline_expanded.insert((owner.clone(), section), false);
+            self.selected = Some(RowId::Section(owner, section));
+            self.ensure_selected_in_view();
             return;
         }
         if let Some((_, repository_index)) = self.selected_repository() {
             self.repositories[repository_index].expanded = false;
             self.selected = Some(self.repositories[repository_index].id());
-            self.detail_scroll = 0;
-            self.detail_selected = None;
             self.ensure_selected_in_view();
         } else if let Some(row) = self.selected_row() {
             match row {
@@ -2473,17 +2747,24 @@ impl App {
                         .clone();
                     self.backburner_expanded.remove(&identity);
                 }
-                VisibleRow::Repository { .. } | VisibleRow::Worktree { .. } => return,
+                VisibleRow::Repository { .. }
+                | VisibleRow::Worktree { .. }
+                | VisibleRow::Inline { .. } => return,
             }
-            self.detail_scroll = 0;
-            self.detail_selected = None;
             self.ensure_selected_in_view();
         }
     }
 
-    fn expand_or_focus_detail(&mut self) {
-        if self.pane == Pane::Detail {
-            self.expand_detail_section();
+    fn expand_selected(&mut self) {
+        if let Some(VisibleRow::Inline {
+            owner,
+            section,
+            kind: InlineRowKind::Section,
+            ..
+        }) = self.selected_row()
+        {
+            self.inline_expanded.insert((owner, section), true);
+            self.ensure_selected_in_view();
             return;
         }
         if matches!(self.selected_row(), Some(VisibleRow::Repository { .. })) {
@@ -2506,51 +2787,6 @@ impl App {
                     .identity
                     .clone(),
             );
-        } else {
-            self.pane = Pane::Detail;
-            self.reconcile_detail_selection();
-        }
-    }
-
-    fn expand_detail_section(&mut self) {
-        let Some(DetailRowId::Section(identity, section)) = self.detail_selected.clone() else {
-            return;
-        };
-        self.detail_expanded.insert((identity, section), true);
-        self.reconcile_detail_selection();
-    }
-
-    fn collapse_detail_section(&mut self) -> bool {
-        let Some(selected) = self.detail_selected.clone() else {
-            return false;
-        };
-        let (identity, section) = match selected {
-            DetailRowId::Section(identity, section) => (identity, section),
-            DetailRowId::Metadata(identity, _) => (identity, DetailSection::Attention),
-            DetailRowId::Check(identity, _) => (identity, DetailSection::Checks),
-            DetailRowId::ReviewRequest(identity, _) | DetailRowId::Review(identity, _) => {
-                (identity, DetailSection::Reviews)
-            }
-            DetailRowId::Feedback(identity, _) => (identity, DetailSection::Feedback),
-            DetailRowId::Summary(_) => return false,
-        };
-        if !self.detail_section_expanded(&identity, section) {
-            return false;
-        }
-        self.detail_expanded
-            .insert((identity.clone(), section), false);
-        self.detail_selected = Some(DetailRowId::Section(identity, section));
-        self.reconcile_detail_selection();
-        true
-    }
-
-    fn toggle_pane(&mut self) {
-        self.pane = match self.pane {
-            Pane::List => Pane::Detail,
-            Pane::Detail => Pane::List,
-        };
-        if self.pane == Pane::Detail {
-            self.reconcile_detail_selection();
         }
     }
 
@@ -2572,26 +2808,13 @@ impl App {
             .unwrap_or(0);
         let next = (current as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
         let next_id = rows[next].id().clone();
-        if self.selected.as_ref() != Some(&next_id) {
-            self.detail_scroll = 0;
-            self.detail_selected = None;
-        }
         self.selected = Some(next_id);
         self.ensure_selected_in_view();
-    }
-
-    fn scroll_detail(&mut self, delta: isize) {
-        self.detail_scroll = (self.detail_scroll as isize + delta)
-            .clamp(0, self.detail_max_scroll as isize) as usize;
     }
 
     fn select_index(&mut self, index: usize) {
         if let Some(row) = self.visible_rows().get(index) {
             let id = row.id().clone();
-            if self.selected.as_ref() != Some(&id) {
-                self.detail_scroll = 0;
-                self.detail_selected = None;
-            }
             self.selected = Some(id);
             self.ensure_selected_in_view();
         }
@@ -2616,24 +2839,74 @@ impl App {
     }
 
     fn ensure_selection_visible(&mut self) {
-        let previous = self.selected.clone();
+        let owner = self
+            .selected
+            .as_ref()
+            .and_then(|selected| self.branch_for_row_id(selected));
         let rows = self.visible_rows();
         let visible = self
             .selected
             .as_ref()
             .is_some_and(|selected| rows.iter().any(|row| row.id() == selected));
         if !visible {
-            self.selected = rows
-                .iter()
-                .find(|row| matches!(row, VisibleRow::Worktree { .. }))
-                .or_else(|| rows.first())
-                .map(|row| row.id().clone());
-        }
-        if self.selected != previous {
-            self.detail_scroll = 0;
-            self.detail_selected = None;
+            self.selected = owner
+                .and_then(|owner| {
+                    let owner_id = match owner {
+                        BranchId::Worktree(path) => RowId::Worktree(path),
+                        BranchId::VirtualPullRequest(identity) => {
+                            RowId::VirtualPullRequest(identity)
+                        }
+                    };
+                    rows.iter()
+                        .find(|row| row.id() == &owner_id)
+                        .map(|row| row.id().clone())
+                })
+                .or_else(|| {
+                    rows.iter()
+                        .find(|row| matches!(row, VisibleRow::Worktree { .. }))
+                        .map(|row| row.id().clone())
+                })
+                .or_else(|| rows.first().map(|row| row.id().clone()));
         }
         self.ensure_selected_in_view();
+    }
+
+    fn branch_for_row_id(&self, row: &RowId) -> Option<BranchId> {
+        match row {
+            RowId::Worktree(path) => Some(BranchId::Worktree(path.clone())),
+            RowId::VirtualPullRequest(identity) => {
+                Some(BranchId::VirtualPullRequest(identity.clone()))
+            }
+            RowId::Section(owner, _) | RowId::Metadata(owner, _) => Some(owner.clone()),
+            RowId::Check(identity, _)
+            | RowId::ReviewRequest(identity, _)
+            | RowId::Review(identity, _)
+            | RowId::Feedback(identity, _) => self.branch_for_pull_request(identity),
+            RowId::Repository(_) | RowId::VirtualRepository(_) | RowId::Backburner(_) => None,
+        }
+    }
+
+    fn branch_for_pull_request(&self, identity: &CanonicalPullRequestId) -> Option<BranchId> {
+        for repository in &self.repositories {
+            for worktree in &repository.worktrees {
+                let matches = self
+                    .github
+                    .get(&worktree.path)
+                    .and_then(GitHubState::data)
+                    .and_then(|data| data.pull_request.as_ref())
+                    .and_then(|pull_request| self.pull_request_identity(repository, pull_request))
+                    .as_ref()
+                    == Some(identity);
+                if matches {
+                    return Some(BranchId::Worktree(worktree.path.clone()));
+                }
+            }
+        }
+        self.virtual_repositories
+            .iter()
+            .flat_map(|repository| &repository.pull_requests)
+            .find(|pull_request| pull_request.identity == *identity)
+            .map(|_| BranchId::VirtualPullRequest(identity.clone()))
     }
 
     fn ensure_selected_in_view(&mut self) {
@@ -2983,22 +3256,6 @@ fn debug_label(value: impl std::fmt::Debug) -> String {
     label
 }
 
-fn detail_child_prefix(section: DetailSection, index: usize, count: usize) -> String {
-    let ancestor = if section == DetailSection::Feedback {
-        "   "
-    } else {
-        "│  "
-    };
-    format!(
-        "{ancestor}{} ",
-        if index + 1 == count {
-            "└─"
-        } else {
-            "├─"
-        }
-    )
-}
-
 fn contains_path(worktree: &Path, candidate: &Path) -> bool {
     let worktree = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_owned());
     let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_owned());
@@ -3162,7 +3419,13 @@ mod tests {
                 .any(|row| { row.id() == &RowId::VirtualPullRequest(unmapped.identity.clone()) })
         );
         app.filter = "viewer".to_owned();
-        assert_eq!(app.visible_rows().len(), 7);
+        assert_eq!(
+            app.visible_rows()
+                .iter()
+                .filter(|row| matches!(row, VisibleRow::VirtualPullRequest { .. }))
+                .count(),
+            4
+        );
     }
 
     #[test]
@@ -3280,11 +3543,15 @@ mod tests {
             vec![
                 RowId::Repository(PathBuf::from("/repo.git")),
                 RowId::Worktree(PathBuf::from("/trees/topic")),
+                RowId::Section(
+                    BranchId::Worktree(PathBuf::from("/trees/topic")),
+                    InlineSection::Worktree,
+                ),
             ]
         );
 
         app.filter = "bare".to_owned();
-        assert_eq!(app.visible_rows().len(), 2);
+        assert_eq!(app.visible_rows().len(), 3);
     }
 
     #[test]
@@ -3343,9 +3610,14 @@ mod tests {
             vec![other.clone()],
             vec![(other.identity.clone(), Some(0))],
         );
+        assert!(
+            app.selected.as_ref().is_some_and(|selected| {
+                app.visible_rows().iter().any(|row| row.id() == selected)
+            })
+        );
         assert_eq!(
-            app.selected,
-            Some(RowId::VirtualPullRequest(other.identity.clone()))
+            app.branch_for_row_id(app.selected.as_ref().unwrap()),
+            Some(BranchId::VirtualPullRequest(other.identity.clone()))
         );
     }
 
@@ -3416,39 +3688,53 @@ mod tests {
     }
 
     #[test]
-    fn navigation_filter_collapse_and_panes_are_reducer_driven() {
+    fn navigation_filter_and_inline_collapse_are_reducer_driven() {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         assert_eq!(app.selected, Some(RowId::Worktree(PathBuf::from("/repo"))));
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(
             app.selected,
-            Some(RowId::Worktree(PathBuf::from("/repo-topic")))
+            Some(RowId::Section(
+                BranchId::Worktree(PathBuf::from("/repo")),
+                InlineSection::Worktree,
+            ))
         );
         app.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(app.selected, Some(RowId::Repository(_))));
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.visible_rows().len(), 1);
         app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.pane, Pane::Detail);
-        assert_eq!(app.visible_rows().len(), 1);
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.pane, Pane::List);
         assert_eq!(app.visible_rows().len(), 1);
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.visible_rows().len(), 3);
+        assert_eq!(app.visible_rows().len(), 5);
         app.handle_key(key(KeyCode::Char('/')));
         app.handle_key(key(KeyCode::Char('t')));
         app.handle_key(key(KeyCode::Char('o')));
         app.handle_key(key(KeyCode::Char('p')));
         app.handle_key(key(KeyCode::Char('i')));
         app.handle_key(key(KeyCode::Char('c')));
-        assert_eq!(app.visible_rows().len(), 2);
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|row| { row.id() == &RowId::Worktree(PathBuf::from("/repo-topic")) })
+        );
         app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Char('j')));
+        app.selected = Some(RowId::Section(
+            BranchId::Worktree(PathBuf::from("/repo-topic")),
+            InlineSection::Worktree,
+        ));
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.pane, Pane::Detail);
+        assert!(app.visible_rows().iter().any(|row| {
+            matches!(row, VisibleRow::Inline { id: RowId::Metadata(_, key), .. } if key == "worktree-path")
+        }));
         app.handle_key(key(KeyCode::Char('h')));
-        assert_eq!(app.pane, Pane::List);
+        assert_eq!(
+            app.selected,
+            Some(RowId::Section(
+                BranchId::Worktree(PathBuf::from("/repo-topic")),
+                InlineSection::Worktree,
+            ))
+        );
     }
 
     #[test]
@@ -3465,7 +3751,10 @@ mod tests {
         app.handle_key(key(KeyCode::Char('G')));
         assert_eq!(
             app.selected,
-            Some(RowId::Worktree(PathBuf::from("/repo-5-topic")))
+            Some(RowId::Section(
+                BranchId::Worktree(PathBuf::from("/repo-5-topic")),
+                InlineSection::Worktree,
+            ))
         );
         app.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(app.selected, Some(RowId::Repository(_))));
@@ -3476,7 +3765,7 @@ mod tests {
         let repositories = (0..6)
             .map(|index| repository(&format!("/repo-{index}"), true))
             .collect();
-        let mut app = App::new(repositories, PathBuf::from("/repo-3"));
+        let mut app = App::new(repositories, PathBuf::from("/repo-1"));
 
         app.set_viewport_height(12);
 
@@ -3496,29 +3785,24 @@ mod tests {
 
         app.set_viewport_height(12);
 
-        assert_eq!(app.scroll, 6);
+        assert_eq!(app.scroll, 15);
     }
 
     #[test]
-    fn detail_pane_scrolls_without_moving_the_list_selection() {
-        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+    fn half_page_navigation_moves_the_unified_list_selection() {
+        let repositories = (0..6)
+            .map(|index| repository(&format!("/repo-{index}"), true))
+            .collect();
+        let mut app = App::new(repositories, PathBuf::from("/elsewhere"));
+        app.set_viewport_height(6);
         let selected = app.selected.clone();
-        app.set_detail_max_scroll(2);
-        app.handle_key(key(KeyCode::Char('l')));
 
-        app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.detail_scroll, 1);
-        assert_eq!(app.selected, selected);
-        app.handle_key(key(KeyCode::Char('j')));
-        app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.detail_scroll, 2);
-        app.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(app.detail_scroll, 1);
-
-        app.handle_key(key(KeyCode::Char('h')));
-        app.handle_key(key(KeyCode::Char('j')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_ne!(app.selected, selected);
-        assert_eq!(app.detail_scroll, 0);
+        assert!(app.scroll > 0);
+        let moved = app.selected.clone();
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_ne!(app.selected, moved);
     }
 
     #[test]
@@ -3572,95 +3856,75 @@ mod tests {
                 ..PullRequestDetails::default()
             },
         );
-
-        app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.pane, Pane::Detail);
-        assert!(matches!(app.detail_selected, Some(DetailRowId::Summary(_))));
-        let initial_rows = app.detail_rows();
-        assert!(initial_rows.iter().all(|row| row.lines.len() == 1));
+        let owner = BranchId::VirtualPullRequest(identity.clone());
+        let initial_rows = app.visible_rows();
+        for section in [
+            InlineSection::Overview,
+            InlineSection::Checks,
+            InlineSection::Reviews,
+        ] {
+            assert!(initial_rows.iter().any(|row| {
+                matches!(row, VisibleRow::Inline { id: RowId::Section(found_owner, found_section), expanded: Some(false), .. }
+                    if found_owner == &owner && found_section == &section)
+            }));
+        }
         assert!(initial_rows.iter().any(|row| {
-            matches!(row.id, DetailRowId::Section(_, DetailSection::Attention))
-                && row.expanded == Some(false)
+            matches!(row, VisibleRow::Inline { id: RowId::Section(found_owner, InlineSection::Feedback), expanded: Some(true), .. }
+                if found_owner == &owner)
         }));
-        assert!(initial_rows.iter().any(|row| {
-            matches!(row.id, DetailRowId::Section(_, DetailSection::Checks))
-                && row.expanded == Some(false)
-        }));
-        assert!(initial_rows.iter().any(|row| {
-            matches!(row.id, DetailRowId::Section(_, DetailSection::Reviews))
-                && row.expanded == Some(false)
-        }));
-        assert!(initial_rows.iter().any(|row| {
-            matches!(row.id, DetailRowId::Section(_, DetailSection::Feedback))
-                && row.expanded == Some(true)
-        }));
-        app.detail_selected = Some(DetailRowId::Section(
-            identity.clone(),
-            DetailSection::Attention,
-        ));
+        app.selected = Some(RowId::Section(owner.clone(), InlineSection::Overview));
         app.handle_key(key(KeyCode::Char('l')));
         app.authored_pull_requests.loading = true;
-        assert!(
-            app.detail_rows()
-                .iter()
-                .flat_map(|row| &row.lines)
-                .any(|line| line == "GitHub: refreshing")
-        );
+        assert!(app.visible_rows().iter().any(
+            |row| matches!(row, VisibleRow::Inline { text, .. } if text == "GitHub: refreshing")
+        ));
         app.authored_pull_requests.loading = false;
-        app.set_detail_viewport_height(4);
+        app.set_viewport_height(4);
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-        assert!(!matches!(
-            app.detail_selected,
-            Some(DetailRowId::Summary(_))
-        ));
-        app.handle_key(key(KeyCode::Char('g')));
-        assert!(
-            !app.detail_rows()
-                .iter()
-                .any(|row| matches!(row.id, DetailRowId::Check(_, _)))
+        assert_ne!(
+            app.selected,
+            Some(RowId::Section(owner.clone(), InlineSection::Overview))
         );
-        app.detail_selected = Some(DetailRowId::Section(
-            identity.clone(),
-            DetailSection::Checks,
-        ));
+        assert!(
+            !app.visible_rows()
+                .iter()
+                .any(|row| matches!(row.id(), RowId::Check(_, _)))
+        );
+        app.selected = Some(RowId::Section(owner.clone(), InlineSection::Checks));
         app.handle_key(key(KeyCode::Char('l')));
-        let rows = app.detail_rows();
+        let rows = app.visible_rows();
         let check_names: Vec<_> = rows
             .iter()
-            .filter_map(|row| match &row.id {
-                DetailRowId::Check(_, name) => Some(name.as_str()),
+            .filter_map(|row| match row.id() {
+                RowId::Check(_, name) => Some(name.as_str()),
                 _ => None,
             })
             .collect();
         assert_eq!(check_names, vec!["failure", "pending", "success"]);
 
-        app.detail_selected = Some(DetailRowId::Check(identity.clone(), "failure".to_owned()));
+        app.selected = Some(RowId::Check(identity.clone(), "failure".to_owned()));
         app.handle_key(key(KeyCode::Char('h')));
-        assert_eq!(app.pane, Pane::Detail);
         assert_eq!(
-            app.detail_selected,
-            Some(DetailRowId::Section(
-                identity.clone(),
-                DetailSection::Checks
-            ))
+            app.selected,
+            Some(RowId::Section(owner.clone(), InlineSection::Checks))
         );
         assert!(
-            !app.detail_rows()
+            !app.visible_rows()
                 .iter()
-                .any(|row| matches!(row.id, DetailRowId::Check(_, _)))
+                .any(|row| matches!(row.id(), RowId::Check(_, _)))
         );
         app.handle_key(key(KeyCode::Char('l')));
-        app.detail_selected = Some(DetailRowId::Check(identity.clone(), "failure".to_owned()));
+        app.selected = Some(RowId::Check(identity.clone(), "failure".to_owned()));
         assert_eq!(
             app.handle_key(key(KeyCode::Char('w'))),
             Intent::OpenUrl("https://checks/failure".to_owned())
         );
-        app.detail_selected = Some(DetailRowId::Check(identity.clone(), "success".to_owned()));
+        app.selected = Some(RowId::Check(identity.clone(), "success".to_owned()));
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             Intent::OpenUrl(authored.pull_request.url.clone())
         );
-        app.handle_key(key(KeyCode::Char('G')));
+        app.selected = Some(RowId::Feedback(identity.clone(), feedback_id));
         assert_eq!(
             app.handle_key(key(KeyCode::Char('w'))),
             Intent::OpenUrl("https://comments/7".to_owned())
@@ -3680,16 +3944,14 @@ mod tests {
             )]),
         );
         assert!(
-            app.detail_selected
+            app.selected
                 .as_ref()
-                .is_some_and(|selected| app.detail_rows().iter().any(|row| &row.id == selected))
+                .is_some_and(|selected| app.visible_rows().iter().any(|row| row.id() == selected))
         );
-        assert!(app.detail_rows().iter().any(|row| {
-            matches!(row.id, DetailRowId::Section(_, DetailSection::Checks))
-                && row.lines[0].contains("no required checks")
+        assert!(app.visible_rows().iter().any(|row| {
+            matches!(row, VisibleRow::Inline { id: RowId::Section(_, InlineSection::Checks), text, .. }
+                if text.contains("no required checks"))
         }));
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.pane, Pane::List);
     }
 
     #[test]
@@ -3749,19 +4011,15 @@ mod tests {
         app.virtual_repositories[0].expanded = false;
         assert_eq!(app.agent_prompt().unwrap(), expanded);
 
-        app.pane = Pane::Detail;
-        app.detail_selected = Some(DetailRowId::Check(
-            parent.identity.clone(),
-            "check-1".to_owned(),
-        ));
+        app.selected = Some(RowId::Check(parent.identity.clone(), "check-1".to_owned()));
         let single = app.agent_prompt().unwrap();
         assert!(single.contains("check-1"));
         assert!(!single.contains("feedback-1"));
         assert!(!single.contains("PR #2"));
 
-        app.detail_selected = Some(DetailRowId::Section(
-            parent.identity.clone(),
-            DetailSection::Feedback,
+        app.selected = Some(RowId::Section(
+            BranchId::VirtualPullRequest(parent.identity.clone()),
+            InlineSection::Feedback,
         ));
         let feedback = app.agent_prompt().unwrap();
         assert!(feedback.contains("feedback-1"));
@@ -3943,8 +4201,10 @@ mod tests {
     #[test]
     fn enter_in_non_pr_details_never_accepts_the_worktree() {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
-        app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
-        app.pane = Pane::Detail;
+        app.selected = Some(RowId::Metadata(
+            BranchId::Worktree(PathBuf::from("/repo")),
+            "worktree-path".to_owned(),
+        ));
 
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Intent::None);
         assert_eq!(app.handle_key(key(KeyCode::Char('w'))), Intent::None);
@@ -4183,15 +4443,13 @@ mod tests {
             ));
         }
         app.filter.clear();
-        app.selected = Some(RowId::Worktree(path));
-        app.pane = Pane::Detail;
-        app.detail_selected = Some(DetailRowId::Section(detail_id, DetailSection::Attention));
+        let owner = BranchId::Worktree(path);
+        app.selected = Some(RowId::Section(owner.clone(), InlineSection::Overview));
         app.handle_key(key(KeyCode::Char('l')));
         assert!(
-            app.detail_rows()
+            app.visible_rows()
                 .iter()
-                .flat_map(|row| &row.lines)
-                .any(|line| line.contains("local path: /repo-topic"))
+                .any(|row| matches!(row, VisibleRow::Inline { text, .. } if text.contains("local path: /repo-topic")))
         );
     }
 
