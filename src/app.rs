@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -514,111 +515,150 @@ impl App {
 
     fn logical_rows(&self) -> Vec<VisibleRow> {
         let mut rows = Vec::new();
-        for (repository_index, repository) in self.repositories.iter().enumerate() {
-            let virtual_repository_indexes = self
-                .virtual_repositories
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| {
-                    candidate.mapped_repository.as_deref() == Some(repository.config.path.as_path())
-                })
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            let forest = self.branch_forest(Some(repository_index), &virtual_repository_indexes);
-            let normal = self.included_branch_nodes(&forest, |node| !node.virtual_backburnered);
-            let backburner = self.included_branch_nodes(&forest, |node| node.virtual_backburnered);
-            let singleton_worktree_index = repository
-                .singleton_worktree()
-                .map(|(worktree_index, _)| worktree_index);
-            let singleton_node = singleton_worktree_index.and_then(|worktree_index| {
-                forest.nodes.iter().position(|node| {
-                    node.source
-                        == BranchSource::Worktree {
-                            repository_index,
-                            worktree_index,
-                        }
-                })
-            });
-            let mut children = Vec::new();
-            self.append_repository_branch_roots(
-                &mut children,
-                &forest,
-                &normal,
-                1,
-                Some(repository_index),
-                singleton_node,
-            );
-            for virtual_repository_index in &virtual_repository_indexes {
-                let identity = self.virtual_repositories[*virtual_repository_index]
-                    .identity
-                    .clone();
-                let group = backburner
-                    .iter()
-                    .copied()
-                    .filter(|index| {
-                        forest.nodes[*index]
-                            .identity
-                            .as_ref()
-                            .is_some_and(|candidate| candidate.repository == identity)
-                    })
-                    .collect::<BTreeSet<_>>();
-                if !group.is_empty() {
-                    self.append_backburner(
-                        &mut children,
-                        &forest,
-                        &group,
-                        *virtual_repository_index,
-                        1,
-                        Some(repository_index),
-                    );
-                }
-            }
-            let expanded = self.disclosure_expanded(
-                &DisclosureKey::Repository(repository.config.path.clone()),
-                repository.expanded,
-            );
-            rows.push(VisibleRow::Repository {
-                repository_index,
-                expanded,
-                has_children: !children.is_empty(),
-                singleton_worktree_index,
-                id: repository.id(),
-            });
-            if expanded {
-                rows.extend(children);
-            }
-        }
-        for (virtual_repository_index, repository) in self
-            .virtual_repositories
+        let mut repositories = self
+            .repositories
             .iter()
             .enumerate()
-            .filter(|(_, repository)| repository.mapped_repository.is_none())
-        {
-            let forest = self.branch_forest(None, &[virtual_repository_index]);
-            let normal = self.included_branch_nodes(&forest, |node| !node.virtual_backburnered);
-            let backburner = self.included_branch_nodes(&forest, |node| node.virtual_backburnered);
-            rows.push(VisibleRow::VirtualRepository {
-                virtual_repository_index,
-                id: repository.id(),
-            });
-            if self.disclosure_expanded(
-                &DisclosureKey::VirtualRepository(repository.identity.clone()),
-                repository.expanded,
-            ) {
-                self.append_branch_roots(&mut rows, &forest, &normal, 1, None);
-                if !backburner.is_empty() {
-                    self.append_backburner(
-                        &mut rows,
-                        &forest,
-                        &backburner,
-                        virtual_repository_index,
-                        1,
-                        None,
-                    );
+            .map(|(index, repository)| {
+                (
+                    repository.config.display_label(),
+                    TopLevelRepository::Local(index),
+                )
+            })
+            .chain(
+                self.virtual_repositories
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, repository)| repository.mapped_repository.is_none())
+                    .map(|(index, repository)| {
+                        (
+                            repository.identity.full_name(),
+                            TopLevelRepository::Virtual(index),
+                        )
+                    }),
+            )
+            .collect::<Vec<_>>();
+        repositories.sort_by(|(left_label, left), (right_label, right)| {
+            alphabetical_cmp(left_label, right_label).then_with(|| left.cmp(right))
+        });
+        for (_, repository) in repositories {
+            match repository {
+                TopLevelRepository::Local(repository_index) => {
+                    self.append_local_repository(&mut rows, repository_index)
+                }
+                TopLevelRepository::Virtual(virtual_repository_index) => {
+                    self.append_virtual_repository(&mut rows, virtual_repository_index)
                 }
             }
         }
         rows
+    }
+
+    fn append_local_repository(&self, rows: &mut Vec<VisibleRow>, repository_index: usize) {
+        let repository = &self.repositories[repository_index];
+        let virtual_repository_indexes = self
+            .virtual_repositories
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                candidate.mapped_repository.as_deref() == Some(repository.config.path.as_path())
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let forest = self.branch_forest(Some(repository_index), &virtual_repository_indexes);
+        let normal = self.included_branch_nodes(&forest, |node| !node.virtual_backburnered);
+        let backburner = self.included_branch_nodes(&forest, |node| node.virtual_backburnered);
+        let singleton_worktree_index = repository
+            .singleton_worktree()
+            .map(|(worktree_index, _)| worktree_index);
+        let singleton_node = singleton_worktree_index.and_then(|worktree_index| {
+            forest.nodes.iter().position(|node| {
+                node.source
+                    == BranchSource::Worktree {
+                        repository_index,
+                        worktree_index,
+                    }
+            })
+        });
+        let mut children = Vec::new();
+        self.append_repository_branch_roots(
+            &mut children,
+            &forest,
+            &normal,
+            1,
+            Some(repository_index),
+            singleton_node,
+        );
+        for virtual_repository_index in &virtual_repository_indexes {
+            let identity = self.virtual_repositories[*virtual_repository_index]
+                .identity
+                .clone();
+            let group = backburner
+                .iter()
+                .copied()
+                .filter(|index| {
+                    forest.nodes[*index]
+                        .identity
+                        .as_ref()
+                        .is_some_and(|candidate| candidate.repository == identity)
+                })
+                .collect::<BTreeSet<_>>();
+            if !group.is_empty() {
+                self.append_backburner(
+                    &mut children,
+                    &forest,
+                    &group,
+                    *virtual_repository_index,
+                    1,
+                    Some(repository_index),
+                );
+            }
+        }
+        let expanded = self.disclosure_expanded(
+            &DisclosureKey::Repository(repository.config.path.clone()),
+            repository.expanded,
+        );
+        rows.push(VisibleRow::Repository {
+            repository_index,
+            expanded,
+            has_children: !children.is_empty(),
+            singleton_worktree_index,
+            id: repository.id(),
+        });
+        if expanded {
+            rows.extend(children);
+        }
+    }
+
+    fn append_virtual_repository(
+        &self,
+        rows: &mut Vec<VisibleRow>,
+        virtual_repository_index: usize,
+    ) {
+        let repository = &self.virtual_repositories[virtual_repository_index];
+        let forest = self.branch_forest(None, &[virtual_repository_index]);
+        let normal = self.included_branch_nodes(&forest, |node| !node.virtual_backburnered);
+        let backburner = self.included_branch_nodes(&forest, |node| node.virtual_backburnered);
+        rows.push(VisibleRow::VirtualRepository {
+            virtual_repository_index,
+            id: repository.id(),
+        });
+        if self.disclosure_expanded(
+            &DisclosureKey::VirtualRepository(repository.identity.clone()),
+            repository.expanded,
+        ) {
+            self.append_branch_roots(rows, &forest, &normal, 1, None);
+            if !backburner.is_empty() {
+                self.append_backburner(
+                    rows,
+                    &forest,
+                    &backburner,
+                    virtual_repository_index,
+                    1,
+                    None,
+                );
+            }
+        }
     }
 
     fn filter_mode(&self) -> bool {
@@ -1152,11 +1192,15 @@ impl App {
         depth: usize,
         mapped_repository_index: Option<usize>,
     ) {
-        for index in included.iter().copied().filter(|index| {
-            forest.nodes[*index]
-                .parent
-                .is_none_or(|parent| !included.contains(&parent))
-        }) {
+        let roots = self.sorted_branch_indexes(
+            forest,
+            included.iter().copied().filter(|index| {
+                forest.nodes[*index]
+                    .parent
+                    .is_none_or(|parent| !included.contains(&parent))
+            }),
+        );
+        for index in roots {
             self.append_branch(
                 rows,
                 forest,
@@ -1178,11 +1222,15 @@ impl App {
         mapped_repository_index: Option<usize>,
         flattened_worktree: Option<usize>,
     ) {
-        for index in included.iter().copied().filter(|index| {
-            forest.nodes[*index]
-                .parent
-                .is_none_or(|parent| !included.contains(&parent))
-        }) {
+        let roots = self.sorted_branch_indexes(
+            forest,
+            included.iter().copied().filter(|index| {
+                forest.nodes[*index]
+                    .parent
+                    .is_none_or(|parent| !included.contains(&parent))
+            }),
+        );
+        for index in roots {
             if Some(index) == flattened_worktree {
                 self.append_branch_contents(
                     rows,
@@ -1305,12 +1353,13 @@ impl App {
                 depth,
             ),
         }
-        let children = node
-            .children
-            .iter()
-            .copied()
-            .filter(|child| included.contains(child))
-            .collect::<Vec<_>>();
+        let children = self.sorted_branch_indexes(
+            forest,
+            node.children
+                .iter()
+                .copied()
+                .filter(|child| included.contains(child)),
+        );
         if children.is_empty() {
             return;
         }
@@ -1347,6 +1396,54 @@ impl App {
                     flattened_worktree_index,
                 );
             }
+        }
+    }
+
+    fn sorted_branch_indexes(
+        &self,
+        forest: &BranchForest,
+        indexes: impl Iterator<Item = usize>,
+    ) -> Vec<usize> {
+        let mut indexes = indexes.collect::<Vec<_>>();
+        indexes.sort_by(|left, right| {
+            alphabetical_cmp(
+                &self.branch_sort_label(&forest.nodes[*left]),
+                &self.branch_sort_label(&forest.nodes[*right]),
+            )
+            .then_with(|| left.cmp(right))
+        });
+        indexes
+    }
+
+    fn branch_sort_label(&self, node: &BranchNode) -> String {
+        match node.source {
+            BranchSource::Worktree {
+                repository_index,
+                worktree_index,
+            } => {
+                let worktree = &self.repositories[repository_index].worktrees[worktree_index];
+                worktree
+                    .branch
+                    .as_deref()
+                    .and_then(|branch| branch.strip_prefix("refs/heads/"))
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        worktree.head.as_ref().map(|head| {
+                            let short = head.get(..head.len().min(8)).unwrap_or(head);
+                            format!("detached:{short}")
+                        })
+                    })
+                    .unwrap_or_else(|| "unknown".to_owned())
+            }
+            BranchSource::VirtualPullRequest {
+                virtual_repository_index,
+                pull_request_index,
+            } => self.virtual_repositories[virtual_repository_index].pull_requests
+                [pull_request_index]
+                .pull_request
+                .head
+                .branch
+                .clone(),
         }
     }
 
@@ -3949,6 +4046,12 @@ impl App {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TopLevelRepository {
+    Local(usize),
+    Virtual(usize),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BranchSource {
     Worktree {
@@ -3975,6 +4078,12 @@ struct BranchNode {
 #[derive(Clone, Debug, Default)]
 struct BranchForest {
     nodes: Vec<BranchNode>,
+}
+
+fn alphabetical_cmp(left: &str, right: &str) -> Ordering {
+    left.to_lowercase()
+        .cmp(&right.to_lowercase())
+        .then_with(|| left.cmp(right))
 }
 
 fn forest_identity_order(forest: &BranchForest) -> Vec<CanonicalPullRequestId> {
@@ -4532,7 +4641,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(nested, vec![(13, 0), (10, 0), (11, 2), (12, 4)]);
+        assert_eq!(nested, vec![(10, 0), (11, 2), (12, 4), (13, 0)]);
 
         app.filter = "stack-grandchild".to_owned();
         let filtered = app
@@ -4598,6 +4707,54 @@ mod tests {
                 InlineSection::StackedBranches,
             ))
         );
+    }
+
+    #[test]
+    fn tree_sorts_repository_and_branch_labels_alphabetically() {
+        let mut zebra = repository("/zebra-path", true);
+        zebra.config.label = Some("zebra".to_owned());
+        let mut alpha = repository("/alpha-path", true);
+        alpha.config.label = Some("Alpha".to_owned());
+        let app = App::new(vec![zebra, alpha], PathBuf::from("/elsewhere"));
+
+        let repository_paths = app
+            .visible_rows()
+            .iter()
+            .filter_map(|row| match row {
+                VisibleRow::Repository {
+                    repository_index, ..
+                } => Some(app.repositories[*repository_index].config.path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repository_paths,
+            vec![PathBuf::from("/alpha-path"), PathBuf::from("/zebra-path")]
+        );
+
+        let mut branches = repository("/branches", true);
+        branches.worktrees = vec![
+            worktree("/branches-zulu", "zulu", false),
+            worktree("/branches-alpha", "Alpha", false),
+            worktree("/branches-bravo", "bravo", false),
+        ];
+        let app = App::new(vec![branches], PathBuf::from("/elsewhere"));
+        let branch_names = app
+            .visible_rows()
+            .iter()
+            .filter_map(|row| match row {
+                VisibleRow::Worktree {
+                    repository_index,
+                    worktree_index,
+                    ..
+                } => app.repositories[*repository_index].worktrees[*worktree_index]
+                    .branch
+                    .as_deref()
+                    .and_then(|branch| branch.strip_prefix("refs/heads/")),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(branch_names, vec!["Alpha", "bravo", "zulu"]);
     }
 
     #[test]
