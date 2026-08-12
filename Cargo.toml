@@ -1,7 +1,22 @@
 [package]
-name = "wt"
+name = "wtui"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["Will Bradley <williambbradley@gmail.com>"]
+description = "A terminal UI and CLI for managing Git worktrees across repositories"
+readme = "README.md"
+homepage = "https://github.com/wbbradley/wt"
+repository = "https://github.com/wbbradley/wt"
+license = "MIT"
+keywords = ["git", "worktree", "github", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["COMPLETED.md", "PLAN.md", "docs/"]
+publish = ["crates-io"]
+
+[[bin]]
+name = "wt"
+path = "src/main.rs"
 
 [dependencies]
 base64 = "0.22"

@@ -6,7 +6,13 @@ Local repository and worktree data renders first. The most recent GitHub snapsho
 
 ## Installation
 
-`wt` requires Git and a current Rust toolchain. Install the latest version directly from GitHub:
+`wt` requires Git and a current Rust toolchain. Install the latest release from crates.io:
+
+```bash
+cargo install wtui
+```
+
+To install the latest development version directly from GitHub:
 
 ```bash
 cargo install --git https://github.com/wbbradley/wt.git
@@ -278,3 +284,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 bash -n shell/wt.bash
 ```
+
+## License
+
+`wt` is available under the [MIT License](LICENSE).
