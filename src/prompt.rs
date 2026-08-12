@@ -102,6 +102,50 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
     Some(output)
 }
 
+pub fn format_review_request(pull_requests: &[PromptPullRequest]) -> Option<String> {
+    if pull_requests.is_empty() {
+        return None;
+    }
+    Some(
+        pull_requests
+            .iter()
+            .map(|pull_request| {
+                let title = strip_conventional_commit_prefix(&pull_request.pull_request.title);
+                let mut line = format!("{} - {title}", pull_request.pull_request.url);
+                if pull_request.pull_request.state == crate::model::PullRequestState::Draft {
+                    line.push_str(" - DRAFT");
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn strip_conventional_commit_prefix(title: &str) -> &str {
+    const TYPES: [&str; 11] = [
+        "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore",
+        "revert",
+    ];
+    let Some((head, rest)) = title.split_once(':') else {
+        return title;
+    };
+    let head = head.strip_suffix('!').unwrap_or(head);
+    let type_token = match head.split_once('(') {
+        Some((kind, scope)) if scope.ends_with(')') => kind,
+        Some(_) => return title,
+        None => head,
+    };
+    if !TYPES
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case(type_token))
+    {
+        return title;
+    }
+    let stripped = rest.trim_start_matches(' ');
+    if stripped.is_empty() { title } else { stripped }
+}
+
 fn repository_selector(repository: &crate::model::GitHubRepositoryIdentity) -> String {
     if repository.host == "github.com" {
         format!("{}/{}", repository.owner, repository.repository)
@@ -231,5 +275,42 @@ mod tests {
     fn github_dot_com_check_command_uses_the_native_repo_selector() {
         let repository = GitHubRepositoryIdentity::canonical("github.com", "Acme", "Web");
         assert_eq!(repository_selector(&repository), "acme/web");
+    }
+
+    #[test]
+    fn review_requests_strip_conventional_prefixes_and_mark_drafts_exactly() {
+        assert_eq!(format_review_request(&[]), None);
+
+        let mut first = pull_request();
+        first.pull_request.title = "feat: add widget".to_owned();
+        first.pull_request.url = "https://example.test/pull/1".to_owned();
+        let mut second = pull_request();
+        second.pull_request.title = "Fix(ui)!: crash: now".to_owned();
+        second.pull_request.url = "https://example.test/pull/2".to_owned();
+        second.pull_request.state = PullRequestState::Draft;
+
+        assert_eq!(
+            format_review_request(&[first, second]).as_deref(),
+            Some(
+                "https://example.test/pull/1 - add widget\n\
+                 https://example.test/pull/2 - crash: now - DRAFT"
+            )
+        );
+    }
+
+    #[test]
+    fn conventional_prefix_stripping_rejects_unknown_or_malformed_prefixes() {
+        for (title, expected) in [
+            ("chore!: drop", "drop"),
+            ("chore(deps)!: bump", "bump"),
+            ("Refactor: X", "X"),
+            ("WIP: x", "WIP: x"),
+            ("update: x", "update: x"),
+            ("fix(scope: broken", "fix(scope: broken"),
+            ("feat:", "feat:"),
+            ("no colon here", "no colon here"),
+        ] {
+            assert_eq!(strip_conventional_commit_prefix(title), expected);
+        }
     }
 }

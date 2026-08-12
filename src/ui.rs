@@ -1010,12 +1010,12 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             let exit_key = if app.filter.is_empty() { "q/Esc" } else { "q" };
             shortcut_line(&[
                 ("w", "web"),
-                ("C", "prompt"),
+                ("c", "prompt"),
+                ("p", "review"),
                 ("b", "Backburner"),
-                ("c", "create"),
+                ("C/n", "create"),
+                ("P", "prune"),
                 ("m", "move"),
-                ("L/U", "lock"),
-                ("d", "remove"),
                 (exit_key, "cancel"),
             ])
         },
@@ -1889,6 +1889,13 @@ mod tests {
             worktrees: Vec::new(),
         };
         let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        let mut shortcuts = Terminal::new(TestBackend::new(160, 12)).unwrap();
+        shortcuts.draw(|frame| render(frame, &mut app)).unwrap();
+        let shortcut_content = buffer_text(shortcuts.backend().buffer());
+        for expected in ["c prompt", "p review", "C/n create", "P prune"] {
+            assert!(shortcut_content.contains(expected), "missing {expected}");
+        }
+
         app.filter = "project".to_owned();
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -1901,13 +1908,22 @@ mod tests {
     #[test]
     fn renders_empty_stale_and_action_palette_states() {
         let mut empty = App::new(Vec::new(), PathBuf::from("/outside"));
-        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
         terminal.draw(|frame| render(frame, &mut empty)).unwrap();
         assert!(buffer_text(terminal.backend().buffer()).contains("No repositories or authored"));
 
         empty.modal = Some(Modal::Palette { selected: 0 });
         terminal.draw(|frame| render(frame, &mut empty)).unwrap();
-        assert!(buffer_text(terminal.backend().buffer()).contains("Actions"));
+        let palette = buffer_text(terminal.backend().buffer());
+        assert!(palette.contains("Actions"));
+        for expected in [
+            "[c] copy agent prompt",
+            "[p] copy review request",
+            "[C] create worktree",
+            "[P] prune stale records",
+        ] {
+            assert!(palette.contains(expected), "missing {expected}");
+        }
 
         let stale = RepositoryView {
             config: RepositoryConfig {

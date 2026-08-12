@@ -9,7 +9,7 @@ use crate::model::{
     GitHubRepositoryIdentity, PullRequest, PullRequestDetails, RepositoryConfig,
     RequiredCheckReadiness, SubmittedReviewState, Worktree, WorktreeStatus,
 };
-use crate::prompt::{PromptPullRequest, format_agent_prompt};
+use crate::prompt::{PromptPullRequest, format_agent_prompt, format_review_request};
 
 const LIST_SCROLL_MARGIN: usize = 5;
 
@@ -298,6 +298,7 @@ impl VisibleRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     CopyAgentPrompt,
+    CopyReviewRequest,
     OpenPullRequestWeb,
     Create,
     NewWorktree,
@@ -313,8 +314,9 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::CopyAgentPrompt,
+        Self::CopyReviewRequest,
         Self::OpenPullRequestWeb,
         Self::Create,
         Self::NewWorktree,
@@ -332,6 +334,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Self::CopyAgentPrompt => "copy agent prompt",
+            Self::CopyReviewRequest => "copy review request",
             Self::OpenPullRequestWeb => "open pull request in browser",
             Self::Create => "create worktree",
             Self::NewWorktree => "new tracked worktree",
@@ -349,16 +352,17 @@ impl Action {
 
     pub fn shortcut(self) -> &'static str {
         match self {
-            Self::CopyAgentPrompt => "C",
+            Self::CopyAgentPrompt => "c",
+            Self::CopyReviewRequest => "p",
             Self::OpenPullRequestWeb => "w",
-            Self::Create => "c",
+            Self::Create => "C",
             Self::NewWorktree => "n",
             Self::Move => "m",
             Self::Lock => "L",
             Self::Unlock => "U",
             Self::Remove => "d",
             Self::Repair => "R",
-            Self::Prune => "p",
+            Self::Prune => "P",
             Self::RegisterRepository => "a",
             Self::EditRepository => "e",
             Self::RemoveRepository => "x",
@@ -2365,7 +2369,7 @@ impl App {
             enabled: false,
             reason: Some(reason.to_owned()),
         };
-        if action == Action::CopyAgentPrompt {
+        if matches!(action, Action::CopyAgentPrompt | Action::CopyReviewRequest) {
             return ActionAvailability {
                 action,
                 enabled: true,
@@ -2423,6 +2427,9 @@ impl App {
                 }
             }
             Action::CopyAgentPrompt => unreachable!("handled before selection validation"),
+            Action::CopyReviewRequest => {
+                unreachable!("handled before selection validation")
+            }
             Action::OpenPullRequestWeb => unreachable!("handled before selection validation"),
             Action::EditRepository | Action::RemoveRepository => {
                 if repository.session_only {
@@ -2758,10 +2765,12 @@ impl App {
                 .map(|pull_request| PromptPullRequest {
                     identity: identity.clone(),
                     pull_request: pull_request.pull_request.clone(),
-                    checks: pull_request
-                        .checks
-                        .iter()
-                        .filter(|check| check.name == *name && check.state.is_actionable())
+                    checks: self
+                        .pull_request_details
+                        .get(identity)
+                        .into_iter()
+                        .flat_map(|details| &details.checks)
+                        .filter(|check| check.name.eq_ignore_ascii_case(name))
                         .cloned()
                         .collect(),
                     feedback: Vec::new(),
@@ -2777,7 +2786,46 @@ impl App {
                     feedback: pull_request
                         .feedback
                         .iter()
-                        .filter(|feedback| feedback.id == *id)
+                        .filter(|feedback| {
+                            feedback.id == *id
+                                && feedback.kind == crate::model::FeedbackKind::InlineThread
+                        })
+                        .cloned()
+                        .collect(),
+                })
+                .into_iter()
+                .collect(),
+            Some(RowId::ReviewSummary(identity, id)) => all
+                .get(identity)
+                .map(|pull_request| PromptPullRequest {
+                    identity: identity.clone(),
+                    pull_request: pull_request.pull_request.clone(),
+                    checks: Vec::new(),
+                    feedback: pull_request
+                        .feedback
+                        .iter()
+                        .filter(|feedback| {
+                            feedback.id == *id
+                                && feedback.kind == crate::model::FeedbackKind::ReviewSummary
+                        })
+                        .cloned()
+                        .collect(),
+                })
+                .into_iter()
+                .collect(),
+            Some(RowId::Reviewer(identity, reviewer)) => all
+                .get(identity)
+                .map(|pull_request| PromptPullRequest {
+                    identity: identity.clone(),
+                    pull_request: pull_request.pull_request.clone(),
+                    checks: Vec::new(),
+                    feedback: pull_request
+                        .feedback
+                        .iter()
+                        .filter(|feedback| {
+                            feedback.kind == crate::model::FeedbackKind::ReviewSummary
+                                && feedback.author.eq_ignore_ascii_case(reviewer)
+                        })
                         .cloned()
                         .collect(),
                 })
@@ -2785,7 +2833,9 @@ impl App {
                 .collect(),
             Some(RowId::Section(
                 owner,
-                section @ (InlineSection::Checks | InlineSection::OpenComments),
+                section @ (InlineSection::Checks
+                | InlineSection::Reviewers
+                | InlineSection::OpenComments),
             )) => self
                 .pull_request_identity_for_branch(owner)
                 .and_then(|identity| {
@@ -2800,12 +2850,19 @@ impl App {
                     } else {
                         Vec::new()
                     },
-                    feedback: if *section == InlineSection::OpenComments {
+                    feedback: if matches!(
+                        section,
+                        InlineSection::Reviewers | InlineSection::OpenComments
+                    ) {
                         pull_request
                             .feedback
                             .iter()
                             .filter(|feedback| {
-                                feedback.kind == crate::model::FeedbackKind::InlineThread
+                                (*section == InlineSection::Reviewers
+                                    && feedback.kind == crate::model::FeedbackKind::ReviewSummary)
+                                    || (*section == InlineSection::OpenComments
+                                        && feedback.kind
+                                            == crate::model::FeedbackKind::InlineThread)
                             })
                             .cloned()
                             .collect()
@@ -2815,16 +2872,25 @@ impl App {
                 })
                 .into_iter()
                 .collect(),
-            Some(RowId::Section(owner, _)) | Some(RowId::Metadata(owner, _)) => self
-                .pull_request_identity_for_branch(owner)
-                .map(|identity| self.prompt_stack(&all, &identity))
-                .unwrap_or_default(),
-            Some(RowId::Reviewer(identity, _)) | Some(RowId::ReviewSummary(identity, _)) => {
-                self.prompt_stack(&all, identity)
-            }
-            _ => self.prompt_scope_from_tree(&all),
+            Some(selected) => self
+                .structural_scope_identities(selected, false)
+                .into_iter()
+                .filter_map(|identity| all.get(&identity).cloned())
+                .collect(),
+            None => Vec::new(),
         };
         format_agent_prompt(&scoped)
+    }
+
+    pub fn review_request(&self) -> Option<String> {
+        let all = self.prompt_pull_requests();
+        let selected = self.selected.as_ref()?;
+        let scoped = self
+            .structural_scope_identities(selected, true)
+            .into_iter()
+            .filter_map(|identity| all.get(&identity).cloned())
+            .collect::<Vec<_>>();
+        format_review_request(&scoped)
     }
 
     pub fn is_backburnered(&self, identity: &CanonicalPullRequestId) -> bool {
@@ -2884,12 +2950,7 @@ impl App {
             self.inline_error = Some("select a pull request to toggle Backburner".to_owned());
             return Intent::None;
         };
-        let all = self.prompt_pull_requests();
-        let identities: Vec<_> = self
-            .prompt_stack(&all, &identity)
-            .into_iter()
-            .map(|pull_request| pull_request.identity)
-            .collect();
+        let identities = self.pull_request_stack_identities(&identity);
         let backburnering = !self.backburner.contains(&identity);
         for identity in &identities {
             if backburnering {
@@ -3113,36 +3174,38 @@ impl App {
                 .collect(),
             feedback: details
                 .into_iter()
-                .flat_map(PullRequestDetails::unresolved_feedback)
+                .flat_map(|details| &details.feedback)
                 .cloned()
                 .collect(),
         }
     }
 
-    fn prompt_stack(
+    fn pull_request_stack_identities(
         &self,
-        all: &BTreeMap<CanonicalPullRequestId, PromptPullRequest>,
         root: &CanonicalPullRequestId,
-    ) -> Vec<PromptPullRequest> {
-        let Some(root_pull_request) = all.get(root) else {
-            return Vec::new();
-        };
+    ) -> Vec<CanonicalPullRequestId> {
+        let all = self.prompt_pull_requests();
+        if !all.contains_key(root) {
+            return vec![root.clone()];
+        }
         let mut included = BTreeSet::from([root.clone()]);
-        let mut ordered = vec![root_pull_request.clone()];
+        let mut ordered = vec![root.clone()];
         loop {
             let mut added = false;
-            for (identity, candidate) in all {
+            for (identity, candidate) in &all {
                 if identity.repository != root.repository || included.contains(identity) {
                     continue;
                 }
                 if ordered.iter().any(|parent| {
-                    pull_request_identity_matches(
-                        &parent.pull_request.head,
-                        &candidate.pull_request.base,
-                    )
+                    all.get(parent).is_some_and(|parent| {
+                        pull_request_identity_matches(
+                            &parent.pull_request.head,
+                            &candidate.pull_request.base,
+                        )
+                    })
                 }) {
                     included.insert(identity.clone());
-                    ordered.push(candidate.clone());
+                    ordered.push(identity.clone());
                     added = true;
                 }
             }
@@ -3153,88 +3216,193 @@ impl App {
         ordered
     }
 
-    fn prompt_scope_from_tree(
+    fn structural_scope_identities(
         &self,
-        all: &BTreeMap<CanonicalPullRequestId, PromptPullRequest>,
-    ) -> Vec<PromptPullRequest> {
-        match self.selected.as_ref() {
-            Some(RowId::VirtualPullRequest(identity)) => self.prompt_stack(all, identity),
-            Some(RowId::Worktree(path)) => self
-                .repositories
-                .iter()
-                .find(|repository| {
+        selected: &RowId,
+        non_container_owns_pull_request: bool,
+    ) -> Vec<CanonicalPullRequestId> {
+        match selected {
+            RowId::Worktree(path) => {
+                self.branch_scope_identities(&BranchId::Worktree(path.clone()), false)
+            }
+            RowId::VirtualPullRequest(identity) => {
+                self.branch_scope_identities(&BranchId::VirtualPullRequest(identity.clone()), false)
+            }
+            RowId::Repository(path) => self.repository_scope_identities(path),
+            RowId::VirtualRepository(repository) => {
+                self.virtual_repository_scope_identities(repository, false)
+            }
+            RowId::Backburner(repository) => {
+                self.virtual_repository_scope_identities(repository, true)
+            }
+            RowId::Section(owner, InlineSection::StackedBranches) => {
+                self.branch_scope_identities(owner, true)
+            }
+            RowId::Section(owner, _) | RowId::Metadata(owner, _)
+                if non_container_owns_pull_request =>
+            {
+                self.pull_request_identity_for_branch(owner)
+                    .into_iter()
+                    .collect()
+            }
+            RowId::Check(identity, _)
+            | RowId::Reviewer(identity, _)
+            | RowId::ReviewSummary(identity, _)
+            | RowId::OpenComment(identity, _)
+                if non_container_owns_pull_request =>
+            {
+                vec![identity.clone()]
+            }
+            RowId::Section(_, _)
+            | RowId::Metadata(_, _)
+            | RowId::Check(_, _)
+            | RowId::Reviewer(_, _)
+            | RowId::ReviewSummary(_, _)
+            | RowId::OpenComment(_, _) => Vec::new(),
+        }
+    }
+
+    fn branch_scope_identities(
+        &self,
+        branch: &BranchId,
+        descendants_only: bool,
+    ) -> Vec<CanonicalPullRequestId> {
+        let Some((forest, index)) = self.branch_scope_forest(branch) else {
+            return Vec::new();
+        };
+        branch_subtree_identity_order(&forest, index, descendants_only)
+    }
+
+    fn branch_scope_forest(&self, branch: &BranchId) -> Option<(BranchForest, usize)> {
+        let (repository_index, virtual_repository_indexes) = match branch {
+            BranchId::Worktree(path) => {
+                let repository_index = self.repositories.iter().position(|repository| {
                     repository
                         .worktrees
                         .iter()
                         .any(|worktree| worktree.path == *path)
-                })
-                .and_then(|repository| {
-                    let pull_request = self
-                        .github
-                        .get(path)
-                        .and_then(GitHubState::data)
-                        .and_then(|data| data.pull_request.as_ref())?;
-                    self.pull_request_identity(repository, pull_request)
-                })
-                .map(|identity| self.prompt_stack(all, &identity))
-                .unwrap_or_default(),
-            Some(RowId::Repository(path)) => {
-                let identities: BTreeSet<_> = self
-                    .repositories
+                })?;
+                let repository_path = &self.repositories[repository_index].config.path;
+                let virtual_indexes = self
+                    .virtual_repositories
                     .iter()
-                    .find(|repository| repository.config.path == *path)
-                    .into_iter()
-                    .flat_map(|repository| repository.config.github_remotes.values())
-                    .cloned()
-                    .collect();
-                all.values()
-                    .filter(|pull_request| {
-                        identities.contains(&pull_request.identity.repository)
-                            && !self.backburner.contains(&pull_request.identity)
+                    .enumerate()
+                    .filter(|(_, repository)| {
+                        repository.mapped_repository.as_ref() == Some(repository_path)
                     })
-                    .cloned()
-                    .collect()
+                    .map(|(index, _)| index)
+                    .collect();
+                (Some(repository_index), virtual_indexes)
             }
-            Some(RowId::VirtualRepository(repository)) => all
-                .values()
-                .filter(|pull_request| {
-                    pull_request.identity.repository == *repository
-                        && !self.backburner.contains(&pull_request.identity)
-                })
-                .cloned()
-                .collect(),
-            Some(RowId::Backburner(repository)) => all
-                .values()
-                .filter(|pull_request| {
-                    pull_request.identity.repository == *repository
-                        && self.backburner.contains(&pull_request.identity)
-                })
-                .cloned()
-                .collect(),
-            Some(RowId::Section(owner, _)) | Some(RowId::Metadata(owner, _)) => self
-                .pull_request_identity_for_branch(owner)
-                .map(|identity| self.prompt_stack(all, &identity))
-                .unwrap_or_default(),
-            Some(RowId::Check(identity, _))
-            | Some(RowId::Reviewer(identity, _))
-            | Some(RowId::ReviewSummary(identity, _))
-            | Some(RowId::OpenComment(identity, _)) => self.prompt_stack(all, identity),
-            None => Vec::new(),
-        }
+            BranchId::VirtualPullRequest(identity) => {
+                let virtual_index = self.virtual_repositories.iter().position(|repository| {
+                    repository
+                        .pull_requests
+                        .iter()
+                        .any(|pull_request| pull_request.identity == *identity)
+                })?;
+                match self.virtual_repositories[virtual_index]
+                    .mapped_repository
+                    .as_ref()
+                {
+                    Some(path) => {
+                        let repository_index = self
+                            .repositories
+                            .iter()
+                            .position(|repository| repository.config.path == *path);
+                        let virtual_indexes = self
+                            .virtual_repositories
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, repository)| {
+                                repository.mapped_repository.as_ref() == Some(path)
+                            })
+                            .map(|(index, _)| index)
+                            .collect();
+                        (repository_index, virtual_indexes)
+                    }
+                    None => (None, vec![virtual_index]),
+                }
+            }
+        };
+        let forest = self.branch_forest(repository_index, &virtual_repository_indexes);
+        let index = forest.nodes.iter().position(|node| node.id == *branch)?;
+        Some((forest, index))
+    }
+
+    fn repository_scope_identities(&self, path: &Path) -> Vec<CanonicalPullRequestId> {
+        let Some(repository_index) = self
+            .repositories
+            .iter()
+            .position(|repository| repository.config.path == path)
+        else {
+            return Vec::new();
+        };
+        let virtual_indexes = self
+            .virtual_repositories
+            .iter()
+            .enumerate()
+            .filter(|(_, repository)| repository.mapped_repository.as_deref() == Some(path))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let forest = self.branch_forest(Some(repository_index), &virtual_indexes);
+        forest_identity_order(&forest)
+            .into_iter()
+            .filter(|identity| !self.backburner.contains(identity))
+            .collect()
+    }
+
+    fn virtual_repository_scope_identities(
+        &self,
+        repository: &GitHubRepositoryIdentity,
+        backburner_only: bool,
+    ) -> Vec<CanonicalPullRequestId> {
+        let Some(virtual_index) = self
+            .virtual_repositories
+            .iter()
+            .position(|candidate| candidate.identity == *repository)
+        else {
+            return Vec::new();
+        };
+        let (repository_index, virtual_indexes) = self.virtual_repositories[virtual_index]
+            .mapped_repository
+            .as_ref()
+            .map_or((None, vec![virtual_index]), |path| {
+                (
+                    self.repositories
+                        .iter()
+                        .position(|candidate| candidate.config.path == *path),
+                    self.virtual_repositories
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, candidate)| candidate.mapped_repository.as_ref() == Some(path))
+                        .map(|(index, _)| index)
+                        .collect(),
+                )
+            });
+        let forest = self.branch_forest(repository_index, &virtual_indexes);
+        forest_identity_order(&forest)
+            .into_iter()
+            .filter(|identity| {
+                identity.repository == *repository
+                    && self.backburner.contains(identity) == backburner_only
+            })
+            .collect()
     }
 
     fn direct_action(&mut self, character: char) -> Intent {
         let action = match character {
-            'C' => Action::CopyAgentPrompt,
+            'c' => Action::CopyAgentPrompt,
+            'p' => Action::CopyReviewRequest,
             'w' => Action::OpenPullRequestWeb,
-            'c' => Action::Create,
+            'C' => Action::Create,
             'n' => Action::NewWorktree,
             'm' => Action::Move,
             'L' => Action::Lock,
             'U' => Action::Unlock,
             'd' => Action::Remove,
             'R' => Action::Repair,
-            'p' => Action::Prune,
+            'P' => Action::Prune,
             'a' => Action::RegisterRepository,
             'e' => Action::EditRepository,
             'x' => Action::RemoveRepository,
@@ -3778,6 +3946,48 @@ struct BranchNode {
 #[derive(Clone, Debug, Default)]
 struct BranchForest {
     nodes: Vec<BranchNode>,
+}
+
+fn forest_identity_order(forest: &BranchForest) -> Vec<CanonicalPullRequestId> {
+    let mut identities = Vec::new();
+    let mut seen = BTreeSet::new();
+    for root in (0..forest.nodes.len()).filter(|index| forest.nodes[*index].parent.is_none()) {
+        append_branch_identities(forest, root, &mut seen, &mut identities);
+    }
+    identities
+}
+
+fn branch_subtree_identity_order(
+    forest: &BranchForest,
+    root: usize,
+    descendants_only: bool,
+) -> Vec<CanonicalPullRequestId> {
+    let mut identities = Vec::new();
+    let mut seen = BTreeSet::new();
+    if descendants_only {
+        for child in &forest.nodes[root].children {
+            append_branch_identities(forest, *child, &mut seen, &mut identities);
+        }
+    } else {
+        append_branch_identities(forest, root, &mut seen, &mut identities);
+    }
+    identities
+}
+
+fn append_branch_identities(
+    forest: &BranchForest,
+    index: usize,
+    seen: &mut BTreeSet<CanonicalPullRequestId>,
+    identities: &mut Vec<CanonicalPullRequestId>,
+) {
+    if let Some(identity) = &forest.nodes[index].identity
+        && seen.insert(identity.clone())
+    {
+        identities.push(identity.clone());
+    }
+    for child in &forest.nodes[index].children {
+        append_branch_identities(forest, *child, seen, identities);
+    }
 }
 
 fn row_id_for_branch(branch: &BranchId) -> RowId {
@@ -4415,13 +4625,13 @@ mod tests {
             identity: child.identity.repository.clone(),
             mapped_repository: Some(PathBuf::from("/repo")),
             expanded: true,
-            pull_requests: vec![child.clone()],
+            pull_requests: vec![parent.clone(), child.clone()],
         }];
 
         let rows = app.visible_rows();
         for id in [
             RowId::Worktree(PathBuf::from("/repo")),
-            RowId::Worktree(topic),
+            RowId::Worktree(topic.clone()),
             RowId::VirtualPullRequest(child.identity.clone()),
         ] {
             assert_eq!(rows.iter().filter(|row| row.id() == &id).count(), 1);
@@ -4446,6 +4656,27 @@ mod tests {
                 ..
             } if path == &PathBuf::from("/repo-topic") && text == "Stacked PRs")
         }));
+
+        app.selected = Some(RowId::Worktree(topic));
+        let review_request = app.review_request().unwrap();
+        assert_eq!(review_request.lines().count(), 2);
+        assert_eq!(
+            review_request.matches(&parent.pull_request.url).count(),
+            1,
+            "the local and authored representations must deduplicate"
+        );
+        assert_eq!(review_request.matches(&child.pull_request.url).count(), 1);
+
+        app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
+        assert_eq!(
+            app.review_request().as_deref(),
+            Some(review_request.as_str())
+        );
+        app.selected = Some(RowId::Repository(PathBuf::from("/repo")));
+        assert_eq!(
+            app.review_request().as_deref(),
+            Some(review_request.as_str())
+        );
     }
 
     #[test]
@@ -4642,7 +4873,12 @@ mod tests {
         for action in Action::ALL {
             assert_eq!(
                 app.action_availability(action).enabled,
-                matches!(action, Action::CopyAgentPrompt | Action::OpenPullRequestWeb)
+                matches!(
+                    action,
+                    Action::CopyAgentPrompt
+                        | Action::CopyReviewRequest
+                        | Action::OpenPullRequestWeb
+                )
             );
         }
         app.handle_key(key(KeyCode::Char('h')));
@@ -5252,10 +5488,14 @@ mod tests {
     fn agent_prompt_scopes_are_exact_deterministic_and_collapse_independent() {
         let mut parent = authored("team", "project", 1, "2026-01-01");
         parent.pull_request.head.branch = "stack-parent".to_owned();
+        parent.pull_request.title = "feat: parent title".to_owned();
         let mut child = authored("team", "project", 2, "2026-01-02");
         child.pull_request.base = parent.pull_request.head.clone();
         child.pull_request.head.branch = "stack-child".to_owned();
-        let unrelated = authored("team", "project", 3, "2026-01-03");
+        child.pull_request.title = "fix(scope): child title".to_owned();
+        child.pull_request.state = crate::model::PullRequestState::Draft;
+        let mut unrelated = authored("team", "project", 3, "2026-01-03");
+        unrelated.pull_request.title = "third title".to_owned();
         let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
         app.virtual_repositories = vec![VirtualRepositoryView {
             identity: parent.identity.repository.clone(),
@@ -5267,33 +5507,56 @@ mod tests {
             app.pull_request_details.insert(
                 pull_request.identity.clone(),
                 PullRequestDetails {
-                    checks: vec![crate::model::PullRequestCheck {
-                        name: format!("check-{}", pull_request.identity.number),
-                        state: crate::model::CheckState::Failure,
-                        target_url: None,
-                        required: true,
-                        source_order: 0,
-                        completed_at: None,
-                    }],
+                    checks: vec![
+                        crate::model::PullRequestCheck {
+                            name: format!("check-{}", pull_request.identity.number),
+                            state: crate::model::CheckState::Failure,
+                            target_url: None,
+                            required: true,
+                            source_order: 0,
+                            completed_at: None,
+                        },
+                        crate::model::PullRequestCheck {
+                            name: format!("valid-{}", pull_request.identity.number),
+                            state: crate::model::CheckState::Success,
+                            target_url: None,
+                            required: true,
+                            source_order: 1,
+                            completed_at: None,
+                        },
+                    ],
                     check_contexts_complete: true,
-                    feedback: vec![crate::model::PullRequestFeedback {
-                        id: format!("feedback-{}", pull_request.identity.number),
-                        database_id: None,
-                        thread_id: None,
-                        kind: crate::model::FeedbackKind::InlineThread,
-                        author: "reviewer".to_owned(),
-                        body: format!("body {}", pull_request.identity.number),
-                        path: None,
-                        permalink: None,
-                        outdated: false,
-                    }],
+                    feedback: vec![
+                        crate::model::PullRequestFeedback {
+                            id: format!("feedback-{}", pull_request.identity.number),
+                            database_id: None,
+                            thread_id: None,
+                            kind: crate::model::FeedbackKind::InlineThread,
+                            author: "reviewer".to_owned(),
+                            body: format!("body {}", pull_request.identity.number),
+                            path: None,
+                            permalink: None,
+                            outdated: false,
+                        },
+                        crate::model::PullRequestFeedback {
+                            id: format!("review-{}", pull_request.identity.number),
+                            database_id: None,
+                            thread_id: None,
+                            kind: crate::model::FeedbackKind::ReviewSummary,
+                            author: "reviewer".to_owned(),
+                            body: format!("review body {}", pull_request.identity.number),
+                            path: None,
+                            permalink: None,
+                            outdated: false,
+                        },
+                    ],
                     ..PullRequestDetails::default()
                 },
             );
         }
         app.selected = Some(RowId::VirtualPullRequest(parent.identity.clone()));
         assert_eq!(
-            app.handle_key(key(KeyCode::Char('C'))),
+            app.handle_key(key(KeyCode::Char('c'))),
             Intent::BeginAction(Action::CopyAgentPrompt)
         );
         let expanded = app.agent_prompt().unwrap();
@@ -5319,6 +5582,87 @@ mod tests {
         assert!(feedback.contains("feedback-1"));
         assert!(!feedback.contains("check-1"));
         assert!(!feedback.contains("PR #2"));
+
+        app.selected = Some(RowId::Reviewer(
+            parent.identity.clone(),
+            "reviewer".to_owned(),
+        ));
+        let reviewer = app.agent_prompt().unwrap();
+        assert!(reviewer.contains("review-1"));
+        assert!(!reviewer.contains("feedback-1"));
+        assert!(!reviewer.contains("check-1"));
+        app.selected = Some(RowId::Section(
+            BranchId::VirtualPullRequest(parent.identity.clone()),
+            InlineSection::Reviewers,
+        ));
+        assert_eq!(app.agent_prompt().as_deref(), Some(reviewer.as_str()));
+
+        app.selected = Some(RowId::Check(parent.identity.clone(), "valid-1".to_owned()));
+        let valid = app.agent_prompt().unwrap();
+        assert!(valid.contains("valid-1 [Success]"));
+        assert!(!valid.contains("check-1"));
+
+        app.selected = Some(RowId::Section(
+            BranchId::VirtualPullRequest(parent.identity.clone()),
+            InlineSection::PendingChecks,
+        ));
+        assert_eq!(app.agent_prompt(), None);
+
+        app.selected = Some(RowId::Section(
+            BranchId::VirtualPullRequest(parent.identity.clone()),
+            InlineSection::StackedBranches,
+        ));
+        let child_prompt = app.agent_prompt().unwrap();
+        assert!(!child_prompt.contains("PR #1"));
+        assert!(child_prompt.contains("PR #2"));
+        assert!(!child_prompt.contains("PR #3"));
+
+        app.selected = Some(RowId::VirtualPullRequest(parent.identity.clone()));
+        let review_request = app.review_request().unwrap();
+        assert_eq!(
+            review_request,
+            format!(
+                "{} - parent title\n{} - child title - DRAFT",
+                parent.pull_request.url, child.pull_request.url
+            )
+        );
+        app.set_disclosure_expanded(
+            DisclosureKey::Branch(BranchId::VirtualPullRequest(parent.identity.clone())),
+            false,
+        );
+        app.filter = "no visible match".to_owned();
+        assert_eq!(
+            app.review_request().as_deref(),
+            Some(review_request.as_str())
+        );
+        app.filter.clear();
+
+        app.selected = Some(RowId::Section(
+            BranchId::VirtualPullRequest(parent.identity.clone()),
+            InlineSection::StackedBranches,
+        ));
+        assert_eq!(
+            app.review_request().as_deref(),
+            Some(format!("{} - child title - DRAFT", child.pull_request.url).as_str())
+        );
+
+        app.selected = Some(RowId::Check(parent.identity.clone(), "check-1".to_owned()));
+        assert_eq!(
+            app.review_request().as_deref(),
+            Some(format!("{} - parent title", parent.pull_request.url).as_str())
+        );
+
+        app.selected = Some(RowId::VirtualRepository(parent.identity.repository.clone()));
+        assert_eq!(
+            app.review_request().as_deref(),
+            Some(
+                format!(
+                    "{} - third title\n{} - parent title\n{} - child title - DRAFT",
+                    unrelated.pull_request.url, parent.pull_request.url, child.pull_request.url
+                )
+                .as_str()
+            )
+        );
     }
 
     #[test]
@@ -5385,6 +5729,10 @@ mod tests {
         assert!(group_prompt.contains("PR #1"));
         assert!(group_prompt.contains("PR #2"));
         assert!(!group_prompt.contains("PR #3"));
+        let group_review_request = app.review_request().unwrap();
+        assert!(group_review_request.contains(&parent.pull_request.url));
+        assert!(group_review_request.contains(&child.pull_request.url));
+        assert!(!group_review_request.contains(&unrelated.pull_request.url));
 
         app.filter = "failure-1".to_owned();
         assert!(
@@ -5403,6 +5751,10 @@ mod tests {
         let repository_prompt = app.agent_prompt().unwrap();
         assert!(!repository_prompt.contains("PR #1"));
         assert!(!repository_prompt.contains("PR #2"));
+        let repository_review_request = app.review_request().unwrap();
+        assert!(!repository_review_request.contains(&parent.pull_request.url));
+        assert!(!repository_review_request.contains(&child.pull_request.url));
+        assert!(repository_review_request.contains(&unrelated.pull_request.url));
         assert!(repository_prompt.contains("PR #3"));
 
         app.selected = Some(RowId::Backburner(parent.identity.repository.clone()));
@@ -6154,6 +6506,27 @@ mod tests {
             }),
         );
         assert!(!app.action_availability(Action::Remove).enabled);
+    }
+
+    #[test]
+    fn copy_create_and_prune_shortcuts_migrate_atomically() {
+        assert_eq!(Action::CopyAgentPrompt.shortcut(), "c");
+        assert_eq!(Action::CopyReviewRequest.shortcut(), "p");
+        assert_eq!(Action::Create.shortcut(), "C");
+        assert_eq!(Action::Prune.shortcut(), "P");
+
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        for (key_code, expected) in [
+            ('c', Action::CopyAgentPrompt),
+            ('p', Action::CopyReviewRequest),
+            ('C', Action::Create),
+            ('P', Action::Prune),
+        ] {
+            assert_eq!(
+                app.handle_key(key(KeyCode::Char(key_code))),
+                Intent::BeginAction(expected)
+            );
+        }
     }
 
     #[test]

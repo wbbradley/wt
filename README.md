@@ -64,11 +64,12 @@ Navigation keys:
 
 Direct action shortcuts:
 
-- `C`: copy an agent-ready prompt for the selected check, feedback item, section, PR stack, or repository
+- `c`: copy an agent-ready prompt for the selected actionable item, section, branch subtree, or repository
+- `p`: copy one terse `{url} - {title}` review-request line per PR in the same structural scope
 - `w`: open the selected branch's pull request in a browser
 - `b`: move the selected PR and its stacked descendants into or out of Backburner
-- `c`: advanced create; `n`: new tracked worktree; `m`: move; `L`/`U`: lock/unlock; `d`: remove
-- `R`: repair; `p`: prune; `a`: register; `e`: edit/relink; `x`: unregister
+- `C`: advanced create; `n`: new tracked worktree; `m`: move; `L`/`U`: lock/unlock; `d`: remove
+- `R`: repair; `P`: prune; `a`: register; `e`: edit/relink; `x`: unregister
 
 Forms show the exact operation inputs before a separate confirmation. Disabled palette actions explain why they are unavailable.
 
@@ -86,7 +87,9 @@ Tree status language:
 
 Press `n` on a repository or one of its worktrees for the common new-worktree flow. The form pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk branch. The new local branch tracks that remote branch; after creation `wt` caches the worktree, exits, and changes the invoking shell into it.
 
-Press `C` to copy a focused repair prompt. On a check or feedback detail it includes only that item; on a Checks or Feedback heading it includes actionable items of that class; on a PR it includes that PR and its stacked descendants; and on a repository it includes every represented actionable PR. Prompts group work by branch and PR, preserve check states plus comment/review IDs and paths, and provide `gh` commands that return readable check or feedback context instead of copying per-item URLs. Empty scopes report `nothing to address here` without changing the clipboard.
+Press `c` to copy a focused repair prompt. A check or feedback row includes only that item; Checks, Reviewers, and Open comments include only their class on the owning PR. A branch includes itself and all stacked descendants, Stacked branches includes descendants only, a repository includes its represented non-Backburner PRs, and Backburner includes its explicit members. These scopes use the semantic tree regardless of current folds or filters, deduplicate canonical PR identities, and retain tree pre-order. Prompts group work by branch and PR, preserve check states plus comment/review IDs and paths, and provide `gh` commands that return readable context instead of copying per-item URLs. Empty scopes report `c: nothing to address here` without changing the clipboard.
+
+Press `p` for the same structural PR scope formatted as one `{url} - {title}` line per PR. Leading conventional-commit prefixes are removed and draft lines end in ` - DRAFT`; a leaf or non-stacking section resolves to its owning PR. A truly empty scope reports `p: no PR under selection` without changing the clipboard.
 
 ```text
 ## feature/login — PR #42: Fix login race
@@ -98,7 +101,7 @@ Inspect: gh pr checks 42 --repo acme/web
 - integration [Failure]
 ```
 
-Press `b` on a PR to toggle its entire GitHub stack in Backburner. Local worktrees stay in their ordinary ancestry position, dimmed and marked `backburner`; virtual-only PRs move under a collapsed Backburner group in their canonical repository. Their Details and explicit `C` prompts remain available, but repository prompts and `[`/`]` attention navigation skip them. Membership survives refreshes and virtual-to-local materialization because it is stored by host-aware canonical PR ID in `$XDG_STATE_HOME/wt/state.json` (normally `~/.local/state/wt/state.json`). Set `WT_STATE_PATH` to override that location.
+Press `b` on a PR to toggle its entire GitHub stack in Backburner. Local worktrees stay in their ordinary ancestry position, dimmed and marked `backburner`; virtual-only PRs move under a collapsed Backburner group in their canonical repository. Their inline details and explicit `c`/`p` scopes remain available, but repository prompts and `[`/`]` attention navigation skip them. Membership survives refreshes and virtual-to-local materialization because it is stored by host-aware canonical PR ID in `$XDG_STATE_HOME/wt/state.json` (normally `~/.local/state/wt/state.json`). Set `WT_STATE_PATH` to override that location.
 
 Local worktrees are nested by nearest commit ancestry. Local ancestry takes precedence over pull-request stack metadata, and each branch is rendered only once. Worktrees are always enumerated from each tracked repository's centralized `git worktree list --porcelain` data, including linked worktrees outside configured roots.
 

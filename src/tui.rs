@@ -591,18 +591,32 @@ impl Controller {
             }
             return Ok(());
         }
-        if action == Action::CopyAgentPrompt {
+        if matches!(action, Action::CopyAgentPrompt | Action::CopyReviewRequest) {
             self.app.progress = None;
-            if let Some(prompt) = self.app.agent_prompt() {
-                match self.clipboard.copy(&prompt) {
-                    Ok(()) => self.app.progress = Some("agent prompt copied".to_owned()),
+            let (contents, empty_message, success_message, error_prefix) = match action {
+                Action::CopyAgentPrompt => (
+                    self.app.agent_prompt(),
+                    "c: nothing to address here",
+                    "copied to clipboard",
+                    "c: clipboard error",
+                ),
+                Action::CopyReviewRequest => (
+                    self.app.review_request(),
+                    "p: no PR under selection",
+                    "copied review request",
+                    "p: clipboard error",
+                ),
+                _ => unreachable!("copy actions checked above"),
+            };
+            if let Some(contents) = contents {
+                match self.clipboard.copy(&contents) {
+                    Ok(()) => self.app.progress = Some(success_message.to_owned()),
                     Err(error) => {
-                        self.app.inline_error =
-                            Some(format!("unable to copy agent prompt: {error}"));
+                        self.app.inline_error = Some(format!("{error_prefix}: {error}"));
                     }
                 }
             } else {
-                self.app.progress = Some("nothing to address here".to_owned());
+                self.app.progress = Some(empty_message.to_owned());
             }
             return Ok(());
         }
@@ -613,6 +627,9 @@ impl Controller {
         let repository_path = repository.config.path.clone();
         match action {
             Action::CopyAgentPrompt => unreachable!("handled before repository resolution"),
+            Action::CopyReviewRequest => {
+                unreachable!("handled before repository resolution")
+            }
             Action::OpenPullRequestWeb => {
                 unreachable!("handled before repository resolution")
             }
@@ -1956,17 +1973,36 @@ mod tests {
         assert_eq!(clipboard.copied.lock().unwrap().len(), 1);
         assert_eq!(
             controller.app.progress.as_deref(),
-            Some("agent prompt copied")
+            Some("copied to clipboard")
+        );
+        controller
+            .handle_intent(Intent::BeginAction(Action::CopyReviewRequest))
+            .unwrap();
+        let copied = clipboard.copied.lock().unwrap();
+        assert_eq!(copied.len(), 2);
+        assert!(copied[1].contains("https://github.com/team/project/pull/42 - Fix CI"));
+        drop(copied);
+        assert_eq!(
+            controller.app.progress.as_deref(),
+            Some("copied review request")
         );
 
         controller.app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
         controller
             .handle_intent(Intent::BeginAction(Action::CopyAgentPrompt))
             .unwrap();
-        assert_eq!(clipboard.copied.lock().unwrap().len(), 1);
+        assert_eq!(clipboard.copied.lock().unwrap().len(), 2);
         assert_eq!(
             controller.app.progress.as_deref(),
-            Some("nothing to address here")
+            Some("c: nothing to address here")
+        );
+        controller
+            .handle_intent(Intent::BeginAction(Action::CopyReviewRequest))
+            .unwrap();
+        assert_eq!(clipboard.copied.lock().unwrap().len(), 2);
+        assert_eq!(
+            controller.app.progress.as_deref(),
+            Some("p: no PR under selection")
         );
 
         controller.app = prompt_app();
@@ -1982,7 +2018,14 @@ mod tests {
                 .app
                 .inline_error
                 .as_deref()
-                .is_some_and(|error| error.contains("clipboard unavailable"))
+                .is_some_and(|error| error == "c: clipboard error: clipboard unavailable")
+        );
+        controller
+            .handle_intent(Intent::BeginAction(Action::CopyReviewRequest))
+            .unwrap();
+        assert_eq!(
+            controller.app.inline_error.as_deref(),
+            Some("p: clipboard error: clipboard unavailable")
         );
     }
 
