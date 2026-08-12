@@ -2453,6 +2453,14 @@ impl App {
                 self.ensure_selection_visible();
                 Intent::None
             }
+            KeyCode::Char('n') if !self.filter.is_empty() => {
+                self.navigate_search_matches(true);
+                Intent::None
+            }
+            KeyCode::Char('N') if !self.filter.is_empty() => {
+                self.navigate_search_matches(false);
+                Intent::None
+            }
             KeyCode::Char('b') => self.toggle_selected_backburner(),
             KeyCode::Char(']') => {
                 self.navigate_attention(true);
@@ -2472,11 +2480,7 @@ impl App {
             KeyCode::Char(character) => self.direct_action(character),
             KeyCode::Enter => self.accept_or_toggle(),
             KeyCode::Esc if !self.filter.is_empty() => {
-                self.filter.clear();
-                self.filter_collapsed.clear();
-                self.filter_expanded.clear();
-                self.scroll = 0;
-                self.ensure_selection_visible();
+                self.clear_search_preserving_selection();
                 Intent::None
             }
             KeyCode::Esc => Intent::Cancel,
@@ -2494,10 +2498,8 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                self.filter_active = false;
-                self.filter.clear();
-                self.filter_collapsed.clear();
-                self.filter_expanded.clear();
+                self.clear_search_preserving_selection();
+                return Intent::None;
             }
             KeyCode::Backspace => {
                 self.filter.pop();
@@ -2518,6 +2520,69 @@ impl App {
         self.scroll = 0;
         self.ensure_selection_visible();
         Intent::None
+    }
+
+    fn navigate_search_matches(&mut self, forward: bool) {
+        let Ok(query) = RegexBuilder::new(&self.filter)
+            .case_insensitive(true)
+            .build()
+        else {
+            return;
+        };
+        let rows = self.visible_rows();
+        let matches = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| self.row_matches_filter(row, &query).then_some(index))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return;
+        }
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|selected| rows.iter().position(|row| row.id() == selected));
+        let next = if forward {
+            current
+                .and_then(|current| matches.iter().copied().find(|index| *index > current))
+                .unwrap_or(matches[0])
+        } else {
+            current
+                .and_then(|current| matches.iter().rev().copied().find(|index| *index < current))
+                .unwrap_or_else(|| *matches.last().unwrap())
+        };
+        self.selected = Some(rows[next].id().clone());
+        self.ensure_selected_in_view();
+    }
+
+    fn clear_search_preserving_selection(&mut self) {
+        if let Some(selected) = self.selected.as_ref() {
+            let rows = self.logical_rows();
+            if let Some(selected_index) = rows.iter().position(|row| row.id() == selected) {
+                let mut ancestors = Vec::new();
+                for row in &rows[..=selected_index] {
+                    let depth = self.visible_row_depth(row);
+                    ancestors.truncate(depth);
+                    if row.id() == selected {
+                        break;
+                    }
+                    ancestors.push(row);
+                }
+                let keys = ancestors
+                    .into_iter()
+                    .filter_map(|row| self.disclosure_key_for_row(row))
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    self.disclosure_expanded.insert(key, true);
+                }
+            }
+        }
+        self.filter_active = false;
+        self.filter.clear();
+        self.filter_collapsed.clear();
+        self.filter_expanded.clear();
+        self.scroll = 0;
+        self.ensure_selection_visible();
     }
 
     fn handle_modal_key(&mut self, modal: Modal, key: KeyEvent) -> Intent {
@@ -4885,17 +4950,16 @@ mod tests {
             BranchId::VirtualPullRequest(parent.identity.clone()),
             InlineSection::StackedBranches,
         );
-        app.set_disclosure_expanded(parent_stack, false);
+        app.set_disclosure_expanded(parent_stack.clone(), false);
         app.filter = "stack-grandchild".to_owned();
         app.selected = Some(RowId::VirtualPullRequest(grandchild.identity.clone()));
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(
             app.selected,
-            Some(RowId::Section(
-                BranchId::VirtualPullRequest(parent.identity.clone()),
-                InlineSection::StackedBranches,
-            ))
+            Some(RowId::VirtualPullRequest(grandchild.identity.clone()))
         );
+        assert!(app.filter.is_empty());
+        assert_eq!(app.disclosure_expanded.get(&parent_stack), Some(&true));
     }
 
     #[test]
@@ -6925,7 +6989,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_folds_are_temporary_and_restore_saved_disclosures_exactly() {
+    fn filter_folds_are_temporary_and_escape_preserves_the_selected_path() {
         let (mut app, identity) = filter_test_app();
         let owner = BranchId::VirtualPullRequest(identity.clone());
         let checks_key = DisclosureKey::Section(owner.clone(), InlineSection::Checks);
@@ -6956,7 +7020,25 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Intent::None);
         assert!(app.filter.is_empty());
         assert!(app.filter_collapsed.is_empty());
-        assert_eq!(app.disclosure_expanded, saved);
+        for (key, expanded) in saved {
+            assert_eq!(app.disclosure_expanded.get(&key), Some(&expanded));
+        }
+        assert_eq!(
+            app.disclosure_expanded
+                .get(&DisclosureKey::VirtualRepository(
+                    identity.repository.clone()
+                )),
+            Some(&true)
+        );
+        assert_eq!(
+            app.disclosure_expanded
+                .get(&DisclosureKey::Branch(owner.clone())),
+            Some(&true)
+        );
+        assert_eq!(
+            app.selected,
+            Some(RowId::Section(owner.clone(), InlineSection::Checks))
+        );
         assert!(!app.visible_rows().iter().any(|row| row.id() == &check_id));
         assert!(app.visible_rows().iter().any(|row| {
             matches!(
@@ -7007,6 +7089,30 @@ mod tests {
         assert!(!app.filter_active);
         assert!(app.filter.is_empty());
         assert!(app.filter_collapsed.is_empty());
+    }
+
+    #[test]
+    fn committed_search_navigates_exact_hits_in_both_directions_with_wraparound() {
+        let mut app = App::new(
+            vec![repository("/first", true), repository("/second", true)],
+            PathBuf::from("/elsewhere"),
+        );
+        app.set_committed_filter("first-topic|second-topic");
+        app.selected = Some(RowId::Repository(PathBuf::from("/first")));
+        let first = RowId::Worktree(PathBuf::from("/first-topic"));
+        let second = RowId::Worktree(PathBuf::from("/second-topic"));
+
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.selected, Some(first.clone()));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.selected, Some(second.clone()));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.selected, Some(first.clone()));
+
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(app.selected, Some(second.clone()));
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(app.selected, Some(first));
     }
 
     #[test]

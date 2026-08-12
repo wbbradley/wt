@@ -1111,7 +1111,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::styled("search: ", Style::default().fg(MUTED)),
             Span::styled(app.filter.clone(), Style::default().fg(WARNING)),
             Span::styled(
-                " · Esc clear · / replace · h/l fold",
+                " · n/N hits · Esc clear · / replace · h/l fold",
                 Style::default().fg(MUTED),
             ),
         ])
@@ -1137,11 +1137,13 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 ("c", "prompt"),
                 ("p", "review"),
                 ("b", "Backburner"),
-                ("n", "create"),
                 ("P", "prune"),
                 ("m", "move"),
                 (exit_key, "cancel"),
             ];
+            if app.filter.is_empty() {
+                shortcuts.insert(4, ("n", "create"));
+            }
             if app
                 .action_availability(crate::app::Action::RegisterRepository)
                 .enabled
@@ -2148,7 +2150,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(
             buffer_text(terminal.backend().buffer())
-                .contains("search: project · Esc clear · / replace · h/l fold")
+                .contains("search: project · n/N hits · Esc clear · / replace · h/l fold")
         );
         assert_eq!(
             styled_text(terminal.backend().buffer(), Color::Black, Color::Yellow),
