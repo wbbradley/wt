@@ -2044,7 +2044,7 @@ impl App {
             );
             if comments_expanded {
                 for feedback in open_comments {
-                    let body = single_line_text(&strip_html_comments(&feedback.body));
+                    let body = concise_comment_text(&feedback.body);
                     let mut text = format!("@{} {body}", feedback.author);
                     if let Some(path) = feedback.path {
                         text.push_str(&format!(" ({path})"));
@@ -4248,6 +4248,44 @@ fn single_line_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn concise_comment_text(text: &str) -> String {
+    let stripped = strip_html_comments(text);
+    let mut concise = String::with_capacity(stripped.len());
+
+    for line in stripped.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let line = strip_markdown_line_prefix(line);
+        let line = single_line_text(&line.replace("**", ""));
+        if line.is_empty() {
+            continue;
+        }
+
+        if !concise.is_empty() {
+            concise.push_str(" • ");
+        }
+        concise.push_str(&line);
+    }
+
+    concise
+}
+
+fn strip_markdown_line_prefix(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix("- ") {
+        return rest.trim_start();
+    }
+
+    let heading_marks = line.bytes().take_while(|byte| *byte == b'#').count();
+    if heading_marks > 0 && line.as_bytes().get(heading_marks) == Some(&b' ') {
+        return line[heading_marks + 1..].trim_start();
+    }
+
+    line
+}
+
 fn strip_html_comments(text: &str) -> String {
     let mut stripped = String::with_capacity(text.len());
     let mut remainder = text;
@@ -5387,6 +5425,24 @@ mod tests {
     }
 
     #[test]
+    fn comment_text_removes_markdown_and_separates_later_sections() {
+        assert_eq!(
+            concise_comment_text(
+                "<!-- metadata -->\n# Summary\n\n**plain** text\n- first item\n  - **second** item"
+            ),
+            "Summary • plain text • first item • second item"
+        );
+        assert_eq!(
+            concise_comment_text("intro\n## Details\nmore detail"),
+            "intro • Details • more detail"
+        );
+        assert_eq!(
+            concise_comment_text("  - first item\n- second item"),
+            "first item • second item"
+        );
+    }
+
+    #[test]
     fn selectable_pr_details_navigate_sort_route_urls_and_reconcile() {
         let authored = authored("team", "project", 42, "2026-01-01");
         let identity = authored.identity.clone();
@@ -5430,7 +5486,10 @@ mod tests {
                     author: "reviewer".to_owned(),
                     body: concat!(
                         "<!-- devin-review-comment {\"id\": \"BUG_0001\"} -->\n",
-                        " \n line one\n\tline two \n "
+                        "## Summary\n",
+                        "**line one**\n",
+                        "  - first item\n",
+                        "- **second** item\n"
                     )
                     .to_owned(),
                     path: Some("src/lib.rs".to_owned()),
@@ -5455,7 +5514,8 @@ mod tests {
         }));
         assert!(initial_rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline { id: RowId::OpenComment(found, _), text, .. }
-                if found == &identity && text == "@reviewer line one line two (src/lib.rs)")
+                if found == &identity
+                    && text == "@reviewer Summary • line one • first item • second item (src/lib.rs)")
         }));
         app.selected = Some(RowId::Section(owner.clone(), InlineSection::Overview));
         app.handle_key(key(KeyCode::Char('l')));
@@ -5624,7 +5684,7 @@ mod tests {
         assert!(rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline {
                 id: RowId::OpenComment(found, _), text, ..
-            } if found == &identity && text == "@reviewer still relevant after merge")
+            } if found == &identity && text == "@reviewer still relevant • after merge")
         }));
     }
 
