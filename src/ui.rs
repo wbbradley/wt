@@ -85,7 +85,11 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 repository_index, ..
             } => {
                 let repository = &app.repositories[*repository_index];
-                let arrow = if repository.expanded { "▾" } else { "▸" };
+                let arrow = if app.repository_expanded(*repository_index) {
+                    "▾"
+                } else {
+                    "▸"
+                };
                 let states = [
                     repository.is_bare().then_some(("bare", BRANCH)),
                     repository.session_only.then_some(("session-only", WARNING)),
@@ -128,6 +132,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             VisibleRow::Worktree {
                 repository_index,
                 worktree_index,
+                expanded,
                 ..
             } => {
                 let repository = &app.repositories[*repository_index];
@@ -169,11 +174,15 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.statuses.get(&worktree.path),
                     worktree,
                 ));
-                let prefix_width = tree_prefix.chars().count() + 2;
+                let prefix_width = tree_prefix.chars().count() + 4;
                 let line_width = area.width.saturating_sub(4) as usize;
                 let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
+                    Span::styled(
+                        if *expanded { "▾ " } else { "▸ " },
+                        Style::default().fg(MUTED),
+                    ),
                     Span::styled(
                         if current { "● " } else { "  " },
                         Style::default().fg(SUCCESS),
@@ -196,7 +205,11 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ..
             } => {
                 let repository = &app.virtual_repositories[*virtual_repository_index];
-                let arrow = if repository.expanded { "▾" } else { "▸" };
+                let arrow = if app.virtual_repository_expanded(*virtual_repository_index) {
+                    "▾"
+                } else {
+                    "▸"
+                };
                 let marker = if repository.mapped_repository.is_none() {
                     " [no local repo]"
                 } else {
@@ -219,6 +232,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             VisibleRow::VirtualPullRequest {
                 virtual_repository_index,
                 pull_request_index,
+                expanded,
                 ..
             } => {
                 let pull_request = &app.virtual_repositories[*virtual_repository_index]
@@ -232,10 +246,14 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     backburnered,
                 );
                 let line_width = area.width.saturating_sub(4) as usize;
-                let prefix_width = tree_prefix.chars().count() + 2;
+                let prefix_width = tree_prefix.chars().count() + 4;
                 let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
+                    Span::styled(
+                        if *expanded { "▾ " } else { "▸ " },
+                        Style::default().fg(MUTED),
+                    ),
                     Span::raw("  "),
                     Span::styled(
                         truncate_label(&pull_request.pull_request.head.branch, label_width),
@@ -250,20 +268,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 }
                 wrapped_tree_item(spans, line_width, prefix_width)
             }
-            VisibleRow::Backburner {
-                virtual_repository_index,
-                ..
-            } => {
-                let repository = &app.virtual_repositories[*virtual_repository_index];
-                let expanded = app.backburner_expanded.contains(&repository.identity);
-                ListItem::new(Line::from(vec![
-                    Span::styled(tree_prefix, Style::default().fg(MUTED)),
-                    Span::styled(
-                        format!("{} Backburner", if expanded { "▾" } else { "▸" }),
-                        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-                    ),
-                ]))
-            }
+            VisibleRow::Backburner { expanded, .. } => ListItem::new(Line::from(vec![
+                Span::styled(tree_prefix, Style::default().fg(MUTED)),
+                Span::styled(
+                    format!("{} Backburner", if *expanded { "▾" } else { "▸" }),
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ),
+            ])),
             VisibleRow::Inline {
                 kind,
                 section,
@@ -354,54 +365,10 @@ fn visible_row_depth(app: &App, row: &VisibleRow) -> usize {
                 .mapped_repository
                 .is_some(),
         ),
-        VisibleRow::VirtualPullRequest {
-            virtual_repository_index,
-            pull_request_index,
-            mapped_repository_index,
-            stack_depth,
-            ..
-        } => {
-            let repository = &app.virtual_repositories[*virtual_repository_index];
-            let base_depth = if mapped_repository_index.is_some() {
-                1
-            } else if repository.mapped_repository.is_some() {
-                2
-            } else {
-                1
-            };
-            base_depth
-                + *stack_depth
-                + usize::from(
-                    app.is_backburnered(&repository.pull_requests[*pull_request_index].identity),
-                )
-        }
-        VisibleRow::Backburner {
-            virtual_repository_index,
-            ..
-        } => {
-            let repository = &app.virtual_repositories[*virtual_repository_index];
-            if repository.mapped_repository.is_some()
-                && virtual_repository_has_header(app, *virtual_repository_index)
-            {
-                2
-            } else {
-                1
-            }
-        }
+        VisibleRow::VirtualPullRequest { stack_depth, .. } => 1 + *stack_depth,
+        VisibleRow::Backburner { .. } => 1,
         VisibleRow::Inline { depth, .. } => *depth,
     }
-}
-
-fn virtual_repository_has_header(app: &App, index: usize) -> bool {
-    let repository = &app.virtual_repositories[index];
-    let Some(path) = repository.mapped_repository.as_deref() else {
-        return true;
-    };
-    app.virtual_repositories
-        .iter()
-        .filter(|candidate| candidate.mapped_repository.as_deref() == Some(path))
-        .count()
-        > 1
 }
 
 fn list_block(app: &App) -> Block<'static> {
@@ -430,7 +397,13 @@ fn inline_row_spans(
         let (label, summary) = text.split_once(" · ").unwrap_or((text, ""));
         spans.push(Span::styled(
             label.to_owned(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(if section == InlineSection::StackedBranches {
+                    MUTED
+                } else {
+                    ACCENT
+                })
+                .add_modifier(Modifier::BOLD),
         ));
         if !summary.is_empty() {
             spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
@@ -1145,7 +1118,7 @@ mod tests {
             .into_iter()
             .find(|line| line.contains("main"))
             .unwrap();
-        assert!(row.contains("└─   main"));
+        assert!(row.contains("└─ ▾   main"));
         assert!(row.contains("main · [+1 ~2 ?3] · locked · prunable"));
         assert!(colored_text(terminal.backend().buffer(), SUCCESS).contains("+1"));
         assert!(colored_text(terminal.backend().buffer(), WARNING).contains("~2"));
@@ -1183,6 +1156,56 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(colored_text(terminal.backend().buffer(), SUCCESS).contains("●"));
         assert!(!buffer_text(terminal.backend().buffer()).contains("current main"));
+    }
+
+    #[test]
+    fn renders_outer_branch_disclosures_and_stacked_worktree_connectors() {
+        let repository = RepositoryView {
+            config: RepositoryConfig {
+                path: PathBuf::from("/repo"),
+                label: Some("project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            },
+            session_only: false,
+            stale_error: None,
+            expanded: true,
+            worktrees: vec![
+                Worktree {
+                    path: PathBuf::from("/repo"),
+                    head: Some("parent-head".to_owned()),
+                    branch: Some("refs/heads/parent".to_owned()),
+                    detached: false,
+                    bare: false,
+                    locked: None,
+                    prunable: None,
+                },
+                Worktree {
+                    path: PathBuf::from("/repo-child"),
+                    head: Some("child-head".to_owned()),
+                    branch: Some("refs/heads/child".to_owned()),
+                    detached: false,
+                    bare: false,
+                    locked: None,
+                    prunable: None,
+                },
+            ],
+        };
+        let mut app = App::new(vec![repository], PathBuf::from("/outside"));
+        app.branch_parents
+            .insert(PathBuf::from("/repo-child"), PathBuf::from("/repo"));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = buffer_text(buffer);
+        assert!(content.contains("▾   parent"));
+        assert!(content.contains("Stacked worktrees"));
+        assert!(content.contains("▾   child"));
+        assert!(colored_text(buffer, MUTED).contains("Stacked worktrees"));
     }
 
     #[test]
@@ -1330,7 +1353,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
-        assert!(content.contains("└─   feature/compact-attention"));
+        assert!(content.contains("└─ ▾   feature/compact-attention"));
         assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
         assert!(content.contains("PR #42 · draft · [auto-merge]"));
         assert!(content.contains("changes requested"));
@@ -1392,8 +1415,10 @@ mod tests {
         let collapsed = buffer_text(terminal.backend().buffer());
         assert!(collapsed.contains("Backburner"));
         assert!(!collapsed.contains("#42"));
-        app.backburner_expanded
-            .insert(pull_request_id.repository.clone());
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('l'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let expanded = buffer_text(terminal.backend().buffer());
         assert!(expanded.contains("PR #42 · draft · [auto-merge]"));
