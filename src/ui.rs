@@ -85,13 +85,19 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .zip(tree_prefixes)
         .map(|(row, tree_prefix)| match row {
             VisibleRow::Repository {
-                repository_index, ..
+                repository_index,
+                expanded,
+                has_children,
+                singleton_worktree_index,
+                ..
             } => {
                 let repository = &app.repositories[*repository_index];
-                let arrow = if app.repository_expanded(*repository_index) {
-                    "▾"
+                let arrow = if !has_children {
+                    "  "
+                } else if *expanded {
+                    "▾ "
                 } else {
-                    "▸"
+                    "▸ "
                 };
                 let states = [
                     repository.is_bare().then_some(("bare", BRANCH)),
@@ -108,29 +114,71 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
-                let state_width = states
-                    .iter()
-                    .map(|(state, _)| display_width(state) + 3)
-                    .sum::<usize>();
-                let available = area.width.saturating_sub(7) as usize;
-                let label = truncate_label(
-                    &repository.config.display_label(),
-                    available.saturating_sub(state_width),
-                );
-                let mut spans = vec![Span::styled(
-                    format!("{arrow} {label}"),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                )];
+                let singleton = singleton_worktree_index
+                    .map(|worktree_index| &repository.worktrees[worktree_index]);
+                let current = singleton
+                    .is_some_and(|worktree| path_contains(&worktree.path, &app.current_directory));
+                let line_width = area.width.saturating_sub(4) as usize;
+                let mut spans = vec![
+                    Span::styled(tree_prefix, Style::default().fg(MUTED)),
+                    Span::styled(arrow, Style::default().fg(MUTED)),
+                    Span::styled(
+                        if current { "● " } else { "  " },
+                        Style::default().fg(SUCCESS),
+                    ),
+                    Span::styled(
+                        repository.config.display_label(),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                if let Some(worktree) = singleton {
+                    spans.push(Span::styled(
+                        format!(" ({})", worktree_identity(worktree)),
+                        Style::default().fg(BRANCH),
+                    ));
+                }
                 spans.extend(states.into_iter().map(|(state, color)| {
                     Span::styled(format!(" [{state}]"), Style::default().fg(color))
                 }));
+                if let Some(worktree) = singleton {
+                    let github_state = app.github.get(&worktree.path);
+                    let pull_request = github_state
+                        .and_then(GitHubState::data)
+                        .and_then(|data| data.pull_request.as_ref());
+                    let details = pull_request.and_then(|pull_request| {
+                        app.pull_request_details_for(repository, pull_request)
+                            .map(|(_, details)| details)
+                    });
+                    let backburnered = pull_request
+                        .and_then(|pull_request| {
+                            app.pull_request_identity(repository, pull_request)
+                        })
+                        .is_some_and(|identity| app.is_backburnered(&identity));
+                    spans.extend(
+                        pull_request
+                            .map(|pull_request| {
+                                pull_request_tree_spans(pull_request, details, false, backburnered)
+                            })
+                            .unwrap_or_default(),
+                    );
+                    spans.extend(github_freshness_spans(
+                        app.github_network_active(&worktree.path),
+                        app.github_spinner_frame(),
+                    ));
+                    if worktree.locked.is_some() {
+                        spans.push(Span::styled(" · locked", Style::default().fg(WARNING)));
+                    }
+                    if worktree.prunable.is_some() {
+                        spans.push(Span::styled(" · prunable", Style::default().fg(DANGER)));
+                    }
+                }
                 if let Some(error) = &repository.stale_error {
                     spans.push(Span::styled(
                         format!(" · {error}"),
                         Style::default().fg(DANGER),
                     ));
                 }
-                ListItem::new(Line::from(spans))
+                single_line_tree_item(spans, line_width)
             }
             VisibleRow::Worktree {
                 repository_index,
@@ -141,18 +189,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let repository = &app.repositories[*repository_index];
                 let worktree = &repository.worktrees[*worktree_index];
                 let current = path_contains(&worktree.path, &app.current_directory);
-                let identity = worktree
-                    .branch
-                    .as_deref()
-                    .and_then(|branch| branch.strip_prefix("refs/heads/"))
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        worktree
-                            .head
-                            .as_ref()
-                            .map(|head| format!("detached:{}", short(head)))
-                    })
-                    .unwrap_or_else(|| if worktree.bare { "bare" } else { "unknown" }.to_owned());
+                let identity = worktree_identity(worktree);
                 let github_state = app.github.get(&worktree.path);
                 let pull_request = github_state
                     .and_then(GitHubState::data)
@@ -437,7 +474,6 @@ fn inline_row_spans(
         }
         InlineRowKind::Check => append_check_spans(&mut spans, text),
         InlineRowKind::Reviewer => append_reviewer_spans(&mut spans, text),
-        InlineRowKind::ReviewSummary => spans.push(Span::raw(text.to_owned())),
         InlineRowKind::OpenComment => {
             append_open_comment_spans(&mut spans, text);
             return truncate_spans(spans, line_width);
@@ -1216,6 +1252,21 @@ fn short(head: &str) -> &str {
     head.get(..head.len().min(8)).unwrap_or(head)
 }
 
+fn worktree_identity(worktree: &crate::model::Worktree) -> String {
+    worktree
+        .branch
+        .as_deref()
+        .and_then(|branch| branch.strip_prefix("refs/heads/"))
+        .map(str::to_owned)
+        .or_else(|| {
+            worktree
+                .head
+                .as_ref()
+                .map(|head| format!("detached:{}", short(head)))
+        })
+        .unwrap_or_else(|| if worktree.bare { "bare" } else { "unknown" }.to_owned())
+}
+
 fn display_path(path: &std::path::Path) -> String {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     shorten_home(path, home.as_deref())
@@ -1311,17 +1362,13 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(app.viewport_height, 19);
         let content = buffer_text(terminal.backend().buffer());
-        assert!(content.contains("project [session-only]"));
-        assert!(content.contains("Worktree"));
+        assert!(content.contains("project (main) [session-only]"));
+        assert!(content.contains("Worktree · [+1 ~2 ?3]"));
         let row = buffer_lines(terminal.backend().buffer())
             .into_iter()
-            .find(|line| line.contains("main"))
+            .find(|line| line.contains("project"))
             .unwrap();
-        assert!(row.contains("└─ ▾   main"));
-        assert!(row.contains("main · [+1 ~2 ?3] · locked · prunable"));
-        assert!(colored_text(terminal.backend().buffer(), SUCCESS).contains("+1"));
-        assert!(colored_text(terminal.backend().buffer(), WARNING).contains("~2"));
-        assert!(colored_text(terminal.backend().buffer(), MUTED).contains("?3"));
+        assert!(row.contains("project (main) [session-only] · locked · prunable"));
         assert!(!row.contains("/repo"));
         assert!(!row.contains("12345678"));
         assert!(!content.contains(" Details "));
@@ -1345,9 +1392,9 @@ mod tests {
             .unwrap();
         let narrow_row = buffer_lines(narrow_terminal.backend().buffer())
             .into_iter()
-            .find(|line| line.contains("main"))
+            .find(|line| line.contains("project"))
             .unwrap();
-        assert!(narrow_row.contains("main · [+1 ~2 ?3] · locked · prunable"));
+        assert!(narrow_row.contains("project (main) [session-only] · locked · prunable"));
         assert!(!narrow_row.contains("/repo"));
         assert!(!narrow_row.contains("12345678"));
 
@@ -1355,6 +1402,50 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(colored_text(terminal.backend().buffer(), SUCCESS).contains("●"));
         assert!(!buffer_text(terminal.backend().buffer()).contains("current main"));
+    }
+
+    #[test]
+    fn renders_clean_singleton_repository_with_inline_branch_identity() {
+        let path = PathBuf::from("/repo");
+        let repository = RepositoryView {
+            config: RepositoryConfig {
+                path: path.clone(),
+                label: Some("project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            },
+            session_only: false,
+            stale_error: None,
+            expanded: true,
+            worktrees: vec![Worktree {
+                path: path.clone(),
+                head: Some("1234567890".to_owned()),
+                branch: Some("refs/heads/main".to_owned()),
+                detached: false,
+                bare: false,
+                locked: None,
+                prunable: None,
+            }],
+        };
+        let mut app = App::new(vec![repository], path.clone());
+        app.statuses
+            .insert(path, StatusState::Ready(WorktreeStatus::default()));
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let tree_lines = buffer_lines(terminal.backend().buffer());
+        let repository_line = tree_lines
+            .iter()
+            .find(|line| line.contains("project"))
+            .unwrap();
+        assert!(repository_line.contains("project (main)"));
+        assert!(repository_line.contains('●'));
+        assert!(!repository_line.contains('▾'));
+        assert!(!repository_line.contains('▸'));
+        assert!(!buffer_text(terminal.backend().buffer()).contains("Worktree ·"));
     }
 
     #[test]
@@ -1701,22 +1792,6 @@ mod tests {
         let changes_glyph = changes.iter().find(|span| span.content == "✗").unwrap();
         assert_eq!(changes_glyph.style.fg, Some(DANGER));
         assert!(changes.iter().any(|span| span.content == "  (reviewed)"));
-
-        let summary = inline_row_spans(
-            InlineRowKind::ReviewSummary,
-            InlineSection::Reviewers,
-            "Please fix the edge case",
-            None,
-            "└─ ".to_owned(),
-            80,
-        );
-        assert_eq!(
-            summary
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>(),
-            "└─ Please fix the edge case"
-        );
     }
 
     #[test]

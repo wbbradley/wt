@@ -56,7 +56,6 @@ Rollup's defaults are an important part of its signal density:
 
 - repositories, PR subtrees, Open comments, and Stacked PRs start expanded;
 - Backburner, Checks, Pending, Valid Results, and Reviewers start collapsed;
-- Reviewers starts expanded when a human review-summary body needs attention;
 - collapsed Checks and Reviewers headers retain useful rollups;
 - filtering temporarily exposes matching descendants and their ancestor path without overwriting
   saved fold state;
@@ -81,6 +80,10 @@ The remaining differences are deliberate:
 - `wt` owns repositories and worktrees, not only authored PRs. It therefore retains selectable
   bare, stale, invalid, and non-PR worktrees plus collapsed Worktree and Overview sections. Rollup's
   other Reviewing, Merged, Releases, and Radar panes are outside this migration's scope.
+- A normal repository with one worktree folds that worktree identity into the repository row as
+  `repository (branch)`. Known-clean Worktree details disappear entirely, while dirty/loading/error
+  status and PR sections remain direct children. Bare and multi-worktree repositories keep explicit
+  branch rows.
 - Local commit ancestry wins in `wt`; GitHub base/head ancestry attaches only otherwise-unrepresented
   virtual PRs. This permits one mixed local/virtual tree without duplicating a PR. Rollup's Authored
   tree is PR-only and uses merge-target ancestry.
@@ -131,6 +134,11 @@ Repository, worktree/virtual-PR, Backburner, section, and leaf rows are all sele
 gets an outer disclosure only when it has rendered children. A non-PR worktree remains a compact
 single row unless its Worktree section is expanded.
 
+For a non-bare repository with exactly one worktree, the repository row itself represents that
+checkout and renders its branch in parentheses. The local branch row is suppressed, remaining
+sections are promoted one depth, and a known-clean Worktree section is omitted. Enter still selects
+the checkout; `h`/`l` still control any promoted repository children.
+
 ### `wt`-specific sections
 
 Rollup can put all useful PR identity on its PR row. `wt` also needs to retain local and
@@ -139,7 +147,7 @@ sections:
 
 - **Worktree** starts collapsed. Its header summarizes local state and upstream; expansion exposes
   path, anchor, full HEAD, upstream, lock reason, and prunable state. It exists only for local
-  worktrees.
+  worktrees, and is omitted for a known-clean singleton repository.
 - **Overview** starts collapsed. Its header summarizes PR state, auto-merge, and conflict state;
   expansion exposes URL, base/head repositories and branches, full head SHA, update time, stale
   detail errors, and warnings.
@@ -156,13 +164,12 @@ hidden values.
   default-collapsed **Valid Results** node. Unknown checks remain direct children with a muted
   unknown state so incomplete data is not presented as success.
 - **Reviewers** merges outstanding user/team requests with each reviewer's latest submitted review.
-  It starts collapsed unless a retained human review-summary body needs attention. Its collapsed
-  header shows stable distinct tokens such as `req`, `✓ approved`, `✗ changes`, `◉ commented`, and
-  `⊘ dismissed`. Review-summary feedback nests beneath its reviewer. Bot summaries stay omitted by
-  the existing GitHub normalization.
+  It always starts collapsed. Its collapsed header shows stable distinct tokens such as `req`,
+  `✓ approved`, `✗ changes`, `◉ commented`, and `⊘ dismissed`; expansion shows reviewer identity
+  and state rows only.
 - **Open comments** contains unresolved inline-thread feedback only, starts expanded, uses the full
-  available width for `@author excerpt (path)`, and marks outdated threads. It is omitted when
-  empty.
+  available width for `@author excerpt (path)`, and marks outdated threads. It is the only subtree
+  that renders review feedback and is omitted when empty.
 - **Stacked branches** starts expanded and owns local worktree descendants plus virtual-only PR
   descendants. The label says `Stacked PRs` when every descendant is virtual and `Stacked
   worktrees` when every descendant is local; mixed trees use `Stacked branches`. Local ancestry

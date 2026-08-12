@@ -48,7 +48,7 @@ An ambiguous qualified selector opens the TUI prefiltered instead of guessing. T
 
 ## TUI
 
-The initial selection is the worktree containing the current directory. The body is one full-width, selectable tree: repositories own local worktree and virtual pull-request branches, and every branch's metadata and attention details are inline. A local PR appears only on its worktree row. Local commit ancestry wins when it disagrees with GitHub stack ancestry; each remaining virtual PR is attached once by an unambiguous base/head relationship.
+The initial selection is the worktree containing the current directory. The body is one full-width, selectable tree: repositories own local worktree and virtual pull-request branches, and every branch's metadata and attention details are inline. A local PR appears only on its worktree row, or on the compact repository row when a normal repository has exactly one worktree. Local commit ancestry wins when it disagrees with GitHub stack ancestry; each remaining virtual PR is attached once by an unambiguous base/head relationship.
 
 ```text
 ▾ acme/web
@@ -68,22 +68,23 @@ The initial selection is the worktree containing the current directory. The body
 
 Tree connectors and disclosures are muted, the current worktree has a green `●`, PR numbers are orange, reviewer names have stable hash-derived colors, and every tree item stays on one display-width-truncated line. Branch rows show title and compact attention status: failed required checks, outstanding or changes-requested reviews, actual conflicts, auto-merge, non-open state, virtual/Backburner state, and local status. Unresolved counts live on the Open comments header instead of being repeated on the branch. `[+N ~N ?N]` means staged, unstaged, and untracked entries; `locked` and `prunable` remain explicit.
 
+A non-bare repository with exactly one worktree omits the separate branch row and renders as `● repository (branch)`. Its PR and exceptional Worktree details become direct children. When local status is known clean, the Worktree child is omitted; a clean non-PR singleton therefore occupies one selectable line. Bare and multi-worktree repositories retain the full repository → branch hierarchy.
+
 Disclosure defaults match Rollup while retaining `wt`'s local metadata:
 
 - repositories, complete branch subtrees, Open comments, and Stacked worktrees/PRs/branches start expanded;
 - Worktree, Overview, Checks, Pending, Valid Results, Reviewers, and Backburner start collapsed;
-- Reviewers starts expanded when a retained human review-summary body exists;
 - Worktree expands to repository anchor, path, branch, full HEAD, upstream, lock, prunable, local status, and GitHub warnings;
 - Overview expands to URL, base/head, full head SHA, state/update time, auto-merge, conflict, warning, and stale/loading detail state;
 - Checks keeps failure/error and unknown rows direct, Pending/Expected under Pending, and successful/neutral/skipped rows under Valid Results;
-- Reviewers combines requests and latest submitted states, with review-summary bodies nested under their reviewer; Open comments contains unresolved inline threads only.
+- Reviewers combines requests and latest submitted states without review-body children; Open comments is the only feedback subtree and contains unresolved inline threads only.
 
 A worktree at a merged PR's merge commit can still carry that GitHub association and the compact `merged` branch label. Merged associations omit Overview, Checks, and Reviewers; Open comments remains only when unresolved threads still exist.
 
 Navigation:
 
 - `j`/`k` or arrows move across every visible row; `g`/`G` select first/last; `Ctrl-d`/`Ctrl-u` move half a full-tree viewport.
-- `h`/Left collapses a selected disclosure. On a metadata, check, reviewer, review-summary, or comment leaf it collapses the nearest enclosing section and lands on its header. A branch targets its complete subtree.
+- `h`/Left collapses a selected disclosure. On a metadata, check, reviewer, or comment leaf it collapses the nearest enclosing section and lands on its header. A branch targets its complete subtree.
 - `l`/Right expands a disclosure and is a no-op on leaves. Inner fold choices survive outer folds and refreshes.
 - `]`/`[` moves to the next/previous actionable non-Backburner PR, wraps, and reveals only its required ancestor path.
 - `Enter` toggles a repository/disclosure, selects a local worktree, materializes a virtual PR, or opens an inline URL with PR fallback. `w` opens the selected item or owning PR in a browser.

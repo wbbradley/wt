@@ -51,7 +51,6 @@ pub enum RowId {
     Metadata(BranchId, String),
     Check(CanonicalPullRequestId, String),
     Reviewer(CanonicalPullRequestId, String),
-    ReviewSummary(CanonicalPullRequestId, String),
     OpenComment(CanonicalPullRequestId, String),
 }
 
@@ -195,6 +194,13 @@ impl RepositoryView {
     pub fn is_bare(&self) -> bool {
         self.worktrees.iter().any(|worktree| worktree.bare)
     }
+
+    pub fn singleton_worktree(&self) -> Option<(usize, &Worktree)> {
+        match self.worktrees.as_slice() {
+            [worktree] if !worktree.bare => Some((0, worktree)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +221,9 @@ impl VirtualRepositoryView {
 pub enum VisibleRow {
     Repository {
         repository_index: usize,
+        expanded: bool,
+        has_children: bool,
+        singleton_worktree_index: Option<usize>,
         id: RowId,
     },
     Worktree {
@@ -259,7 +268,6 @@ pub enum InlineRowKind {
     Metadata,
     Check,
     Reviewer,
-    ReviewSummary,
     OpenComment,
 }
 
@@ -519,40 +527,65 @@ impl App {
             let forest = self.branch_forest(Some(repository_index), &virtual_repository_indexes);
             let normal = self.included_branch_nodes(&forest, |node| !node.virtual_backburnered);
             let backburner = self.included_branch_nodes(&forest, |node| node.virtual_backburnered);
-            rows.push(VisibleRow::Repository {
-                repository_index,
-                id: repository.id(),
+            let singleton_worktree_index = repository
+                .singleton_worktree()
+                .map(|(worktree_index, _)| worktree_index);
+            let singleton_node = singleton_worktree_index.and_then(|worktree_index| {
+                forest.nodes.iter().position(|node| {
+                    node.source
+                        == BranchSource::Worktree {
+                            repository_index,
+                            worktree_index,
+                        }
+                })
             });
-            if self.disclosure_expanded(
+            let mut children = Vec::new();
+            self.append_repository_branch_roots(
+                &mut children,
+                &forest,
+                &normal,
+                1,
+                Some(repository_index),
+                singleton_node,
+            );
+            for virtual_repository_index in &virtual_repository_indexes {
+                let identity = self.virtual_repositories[*virtual_repository_index]
+                    .identity
+                    .clone();
+                let group = backburner
+                    .iter()
+                    .copied()
+                    .filter(|index| {
+                        forest.nodes[*index]
+                            .identity
+                            .as_ref()
+                            .is_some_and(|candidate| candidate.repository == identity)
+                    })
+                    .collect::<BTreeSet<_>>();
+                if !group.is_empty() {
+                    self.append_backburner(
+                        &mut children,
+                        &forest,
+                        &group,
+                        *virtual_repository_index,
+                        1,
+                        Some(repository_index),
+                    );
+                }
+            }
+            let expanded = self.disclosure_expanded(
                 &DisclosureKey::Repository(repository.config.path.clone()),
                 repository.expanded,
-            ) {
-                self.append_branch_roots(&mut rows, &forest, &normal, 1, Some(repository_index));
-                for virtual_repository_index in virtual_repository_indexes {
-                    let identity = self.virtual_repositories[virtual_repository_index]
-                        .identity
-                        .clone();
-                    let group = backburner
-                        .iter()
-                        .copied()
-                        .filter(|index| {
-                            forest.nodes[*index]
-                                .identity
-                                .as_ref()
-                                .is_some_and(|candidate| candidate.repository == identity)
-                        })
-                        .collect::<BTreeSet<_>>();
-                    if !group.is_empty() {
-                        self.append_backburner(
-                            &mut rows,
-                            &forest,
-                            &group,
-                            virtual_repository_index,
-                            1,
-                            Some(repository_index),
-                        );
-                    }
-                }
+            );
+            rows.push(VisibleRow::Repository {
+                repository_index,
+                expanded,
+                has_children: !children.is_empty(),
+                singleton_worktree_index,
+                id: repository.id(),
+            });
+            if expanded {
+                rows.extend(children);
             }
         }
         for (virtual_repository_index, repository) in self
@@ -662,7 +695,7 @@ impl App {
                         "stale"
                     }
                 });
-                format!(
+                let mut text = format!(
                     "{} {} {} {} {} {}",
                     repository.config.display_label(),
                     repository.config.path.display(),
@@ -674,7 +707,39 @@ impl App {
                     },
                     catalog_state,
                     repository.stale_error.as_deref().unwrap_or_default(),
-                )
+                );
+                if let Some((_, worktree)) = repository.singleton_worktree() {
+                    text.push(' ');
+                    text.push_str(worktree.branch.as_deref().unwrap_or("detached"));
+                    text.push(' ');
+                    text.push_str(match self.statuses.get(&worktree.path) {
+                        Some(StatusState::Pending) => "local status loading",
+                        Some(StatusState::Ready(status)) if status.is_dirty() => "local changes",
+                        Some(StatusState::Ready(_)) => "clean",
+                        Some(StatusState::Error(_)) => "local status unavailable",
+                        None => "",
+                    });
+                    if let Some(pull_request) = self
+                        .github
+                        .get(&worktree.path)
+                        .and_then(GitHubState::data)
+                        .and_then(|data| data.pull_request.as_ref())
+                    {
+                        let identity = self.pull_request_identity(repository, pull_request);
+                        text.push(' ');
+                        text.push_str(&pull_request_tree_search_text(
+                            pull_request,
+                            identity
+                                .as_ref()
+                                .and_then(|identity| self.pull_request_details.get(identity)),
+                            false,
+                            identity
+                                .as_ref()
+                                .is_some_and(|identity| self.backburner.contains(identity)),
+                        ));
+                    }
+                }
+                text
             }
             VisibleRow::Worktree {
                 repository_index,
@@ -793,7 +858,7 @@ impl App {
                 return format!("{name} {text}");
             }
             RowId::Reviewer(identity, reviewer) => (identity, Some(reviewer.as_str())),
-            RowId::ReviewSummary(identity, id) | RowId::OpenComment(identity, id) => {
+            RowId::OpenComment(identity, id) => {
                 let text = self
                     .pull_request_details
                     .get(identity)
@@ -910,7 +975,10 @@ impl App {
 
     fn set_row_expanded(row: &mut VisibleRow, expanded: bool) {
         match row {
-            VisibleRow::Worktree {
+            VisibleRow::Repository {
+                expanded: current, ..
+            }
+            | VisibleRow::Worktree {
                 expanded: current, ..
             }
             | VisibleRow::VirtualPullRequest {
@@ -922,7 +990,7 @@ impl App {
             VisibleRow::Inline {
                 expanded: current, ..
             } => *current = Some(expanded),
-            VisibleRow::Repository { .. } | VisibleRow::VirtualRepository { .. } => {}
+            VisibleRow::VirtualRepository { .. } => {}
         }
     }
 
@@ -1092,10 +1160,51 @@ impl App {
                 index,
                 depth,
                 mapped_repository_index,
+                None,
             );
         }
     }
 
+    fn append_repository_branch_roots(
+        &self,
+        rows: &mut Vec<VisibleRow>,
+        forest: &BranchForest,
+        included: &BTreeSet<usize>,
+        depth: usize,
+        mapped_repository_index: Option<usize>,
+        flattened_worktree: Option<usize>,
+    ) {
+        for index in included.iter().copied().filter(|index| {
+            forest.nodes[*index]
+                .parent
+                .is_none_or(|parent| !included.contains(&parent))
+        }) {
+            if Some(index) == flattened_worktree {
+                self.append_branch_contents(
+                    rows,
+                    forest,
+                    included,
+                    index,
+                    depth,
+                    mapped_repository_index,
+                    true,
+                    flattened_worktree,
+                );
+            } else {
+                self.append_branch(
+                    rows,
+                    forest,
+                    included,
+                    index,
+                    depth,
+                    mapped_repository_index,
+                    flattened_worktree,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn append_branch(
         &self,
         rows: &mut Vec<VisibleRow>,
@@ -1104,8 +1213,22 @@ impl App {
         index: usize,
         depth: usize,
         mapped_repository_index: Option<usize>,
+        flattened_worktree: Option<usize>,
     ) {
         let node = &forest.nodes[index];
+        if Some(index) == flattened_worktree {
+            self.append_branch_contents(
+                rows,
+                forest,
+                included,
+                index,
+                depth,
+                mapped_repository_index,
+                true,
+                flattened_worktree,
+            );
+            return;
+        }
         let expanded = self.disclosure_expanded(&DisclosureKey::Branch(node.id.clone()), true);
         match node.source {
             BranchSource::Worktree {
@@ -1142,13 +1265,42 @@ impl App {
         if !expanded {
             return;
         }
+        self.append_branch_contents(
+            rows,
+            forest,
+            included,
+            index,
+            depth + 1,
+            mapped_repository_index,
+            false,
+            flattened_worktree,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_branch_contents(
+        &self,
+        rows: &mut Vec<VisibleRow>,
+        forest: &BranchForest,
+        included: &BTreeSet<usize>,
+        index: usize,
+        depth: usize,
+        mapped_repository_index: Option<usize>,
+        flattened_worktree: bool,
+        flattened_worktree_index: Option<usize>,
+    ) {
+        let node = &forest.nodes[index];
         match node.source {
             BranchSource::Worktree {
                 repository_index,
                 worktree_index,
-            } => {
-                self.append_worktree_inline_rows(rows, repository_index, worktree_index, depth + 1)
-            }
+            } => self.append_worktree_inline_rows(
+                rows,
+                repository_index,
+                worktree_index,
+                depth,
+                flattened_worktree,
+            ),
             BranchSource::VirtualPullRequest {
                 virtual_repository_index,
                 pull_request_index,
@@ -1156,7 +1308,7 @@ impl App {
                 rows,
                 virtual_repository_index,
                 pull_request_index,
-                depth + 1,
+                depth,
             ),
         }
         let children = node
@@ -1182,7 +1334,7 @@ impl App {
             rows,
             node.id.clone(),
             section,
-            depth + 1,
+            depth,
             InlineRowKind::Section,
             label.to_owned(),
             None,
@@ -1196,8 +1348,9 @@ impl App {
                     forest,
                     included,
                     child,
-                    depth + 2,
+                    depth + 1,
                     mapped_repository_index,
+                    flattened_worktree_index,
                 );
             }
         }
@@ -1284,6 +1437,15 @@ impl App {
                         .map(|index| (repository, &repository.worktrees[index], index))
                 })
             }
+            VisibleRow::Repository {
+                repository_index,
+                singleton_worktree_index: Some(worktree_index),
+                ..
+            } => Some((
+                &self.repositories[repository_index],
+                &self.repositories[repository_index].worktrees[worktree_index],
+                worktree_index,
+            )),
             VisibleRow::Repository { .. }
             | VisibleRow::VirtualRepository { .. }
             | VisibleRow::Backburner { .. }
@@ -1356,6 +1518,7 @@ impl App {
         repository_index: usize,
         worktree_index: usize,
         depth: usize,
+        flattened_worktree: bool,
     ) {
         let repository = &self.repositories[repository_index];
         let worktree = &repository.worktrees[worktree_index];
@@ -1372,27 +1535,37 @@ impl App {
             Some(StatusState::Error(error)) => format!("error: {error}"),
             None => "unknown".to_owned(),
         };
+        let omit_clean_worktree = flattened_worktree
+            && matches!(
+                self.statuses.get(&worktree.path),
+                Some(StatusState::Ready(status)) if !status.is_dirty()
+            );
         let worktree_expanded = self.inline_section_expanded(&owner, InlineSection::Worktree);
-        self.push_inline_row(
-            rows,
-            owner.clone(),
-            InlineSection::Worktree,
-            depth,
-            InlineRowKind::Section,
-            format!(
-                "Worktree · {local_summary} · {}",
-                worktree
-                    .branch
-                    .as_deref()
-                    .unwrap_or("detached")
-                    .strip_prefix("refs/heads/")
-                    .unwrap_or(worktree.branch.as_deref().unwrap_or("detached"))
-            ),
-            None,
-            Some(worktree_expanded),
-            RowId::Section(owner.clone(), InlineSection::Worktree),
-        );
-        if worktree_expanded {
+        if !omit_clean_worktree {
+            let branch = worktree
+                .branch
+                .as_deref()
+                .unwrap_or("detached")
+                .strip_prefix("refs/heads/")
+                .unwrap_or(worktree.branch.as_deref().unwrap_or("detached"));
+            let text = if flattened_worktree {
+                format!("Worktree · {local_summary}")
+            } else {
+                format!("Worktree · {local_summary} · {branch}")
+            };
+            self.push_inline_row(
+                rows,
+                owner.clone(),
+                InlineSection::Worktree,
+                depth,
+                InlineRowKind::Section,
+                text,
+                None,
+                Some(worktree_expanded),
+                RowId::Section(owner.clone(), InlineSection::Worktree),
+            );
+        }
+        if !omit_clean_worktree && worktree_expanded {
             let mut metadata = vec![
                 (
                     "repository".to_owned(),
@@ -1835,7 +2008,7 @@ impl App {
             if !reviewers.is_empty() || reviews_incomplete {
                 let reviewers_expanded = self.disclosure_expanded(
                     &DisclosureKey::Section(owner.clone(), InlineSection::Reviewers),
-                    details.is_some_and(PullRequestDetails::has_review_summaries),
+                    false,
                 );
                 let reviewer_tokens = details
                     .map(PullRequestDetails::reviewer_summary)
@@ -1886,27 +2059,6 @@ impl App {
                             None,
                             RowId::Reviewer(identity.clone(), reviewer.identity.clone()),
                         );
-                        if let Some(details) = details {
-                            for feedback in details.review_summaries_for(&reviewer) {
-                                let body = single_line_text(&feedback.body);
-                                self.push_inline_row(
-                                    rows,
-                                    owner.clone(),
-                                    InlineSection::Reviewers,
-                                    depth + 2,
-                                    InlineRowKind::ReviewSummary,
-                                    body,
-                                    Some(
-                                        feedback
-                                            .permalink
-                                            .clone()
-                                            .unwrap_or_else(|| pr_url.clone()),
-                                    ),
-                                    None,
-                                    RowId::ReviewSummary(identity.clone(), feedback.id.clone()),
-                                );
-                            }
-                        }
                     }
                 }
             }
@@ -2020,14 +2172,6 @@ impl App {
                 .copied()
                 .unwrap_or(default)
         }
-    }
-
-    pub fn repository_expanded(&self, index: usize) -> bool {
-        let repository = &self.repositories[index];
-        self.displayed_disclosure_expanded(
-            &DisclosureKey::Repository(repository.config.path.clone()),
-            repository.expanded,
-        )
     }
 
     pub fn virtual_repository_expanded(&self, index: usize) -> bool {
@@ -2795,24 +2939,6 @@ impl App {
                 })
                 .into_iter()
                 .collect(),
-            Some(RowId::ReviewSummary(identity, id)) => all
-                .get(identity)
-                .map(|pull_request| PromptPullRequest {
-                    identity: identity.clone(),
-                    pull_request: pull_request.pull_request.clone(),
-                    checks: Vec::new(),
-                    feedback: pull_request
-                        .feedback
-                        .iter()
-                        .filter(|feedback| {
-                            feedback.id == *id
-                                && feedback.kind == crate::model::FeedbackKind::ReviewSummary
-                        })
-                        .cloned()
-                        .collect(),
-                })
-                .into_iter()
-                .collect(),
             Some(RowId::Reviewer(identity, reviewer)) => all
                 .get(identity)
                 .map(|pull_request| PromptPullRequest {
@@ -2900,6 +3026,19 @@ impl App {
     fn selected_pull_request_identity(&self) -> Option<CanonicalPullRequestId> {
         match self.selected.as_ref()? {
             RowId::VirtualPullRequest(identity) => Some(identity.clone()),
+            RowId::Repository(path) => {
+                let repository = self
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.config.path == *path)?;
+                let (_, worktree) = repository.singleton_worktree()?;
+                let pull_request = self
+                    .github
+                    .get(&worktree.path)
+                    .and_then(GitHubState::data)
+                    .and_then(|data| data.pull_request.as_ref())?;
+                self.pull_request_identity(repository, pull_request)
+            }
             RowId::Worktree(path) => {
                 let repository = self.repositories.iter().find(|repository| {
                     repository
@@ -2919,9 +3058,8 @@ impl App {
             }
             RowId::Check(identity, _)
             | RowId::Reviewer(identity, _)
-            | RowId::ReviewSummary(identity, _)
             | RowId::OpenComment(identity, _) => Some(identity.clone()),
-            RowId::Repository(_) | RowId::VirtualRepository(_) | RowId::Backburner(_) => None,
+            RowId::VirtualRepository(_) | RowId::Backburner(_) => None,
         }
     }
 
@@ -3247,7 +3385,6 @@ impl App {
             }
             RowId::Check(identity, _)
             | RowId::Reviewer(identity, _)
-            | RowId::ReviewSummary(identity, _)
             | RowId::OpenComment(identity, _)
                 if non_container_owns_pull_request =>
             {
@@ -3257,7 +3394,6 @@ impl App {
             | RowId::Metadata(_, _)
             | RowId::Check(_, _)
             | RowId::Reviewer(_, _)
-            | RowId::ReviewSummary(_, _)
             | RowId::OpenComment(_, _) => Vec::new(),
         }
     }
@@ -3422,6 +3558,16 @@ impl App {
             Some(VisibleRow::Repository {
                 repository_index, ..
             }) => {
+                if let Some((_, worktree)) =
+                    self.repositories[repository_index].singleton_worktree()
+                {
+                    return if worktree.navigable() && worktree.path.exists() {
+                        Intent::Accept(worktree.path.clone())
+                    } else {
+                        self.inline_error = Some("this row is not a navigable checkout".to_owned());
+                        Intent::None
+                    };
+                }
                 let path = self.repositories[repository_index].config.path.clone();
                 let expanded = self.displayed_disclosure_expanded(
                     &DisclosureKey::Repository(path.clone()),
@@ -3643,7 +3789,11 @@ impl App {
         for repository in &self.repositories {
             for worktree in &repository.worktrees {
                 if worktree.navigable() && contains_path(&worktree.path, &self.current_directory) {
-                    self.selected = Some(RowId::Worktree(worktree.path.clone()));
+                    self.selected = Some(if repository.singleton_worktree().is_some() {
+                        repository.id()
+                    } else {
+                        RowId::Worktree(worktree.path.clone())
+                    });
                     return;
                 }
             }
@@ -3651,9 +3801,19 @@ impl App {
         self.selected = self
             .repositories
             .iter()
-            .flat_map(|repository| repository.worktrees.iter())
-            .find(|worktree| worktree.navigable())
-            .map(|worktree| RowId::Worktree(worktree.path.clone()))
+            .find_map(|repository| {
+                repository
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.navigable())
+                    .map(|worktree| {
+                        if repository.singleton_worktree().is_some() {
+                            repository.id()
+                        } else {
+                            RowId::Worktree(worktree.path.clone())
+                        }
+                    })
+            })
             .or_else(|| self.visible_rows().first().map(|row| row.id().clone()));
     }
 
@@ -3764,7 +3924,7 @@ impl App {
                     candidates.push(RowId::Section(owner, InlineSection::Checks));
                 }
             }
-            RowId::Reviewer(identity, _) | RowId::ReviewSummary(identity, _) => {
+            RowId::Reviewer(identity, _) => {
                 if let Some(owner) = self.branch_for_pull_request(identity) {
                     candidates.push(RowId::Section(owner, InlineSection::Reviewers));
                 }
@@ -3844,7 +4004,6 @@ impl App {
             RowId::Section(owner, _) | RowId::Metadata(owner, _) => Some(owner.clone()),
             RowId::Check(identity, _)
             | RowId::Reviewer(identity, _)
-            | RowId::ReviewSummary(identity, _)
             | RowId::OpenComment(identity, _) => self.branch_for_pull_request(identity),
             RowId::Repository(_) | RowId::VirtualRepository(_) | RowId::Backburner(_) => None,
         }
@@ -4853,6 +5012,115 @@ mod tests {
     }
 
     #[test]
+    fn clean_singleton_repository_flattens_to_one_selectable_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository_path = directory.path().join("repo");
+        std::fs::create_dir(&repository_path).unwrap();
+        let mut singleton = repository(repository_path.to_str().unwrap(), true);
+        singleton.worktrees.truncate(1);
+        let path = singleton.worktrees[0].path.clone();
+        let mut app = App::new(vec![singleton], path.clone());
+        app.statuses
+            .insert(path.clone(), StatusState::Ready(WorktreeStatus::default()));
+        app.ensure_selection_visible();
+
+        assert_eq!(
+            app.visible_rows()
+                .into_iter()
+                .map(|row| row.id().clone())
+                .collect::<Vec<_>>(),
+            vec![RowId::Repository(path.clone())]
+        );
+        assert_eq!(app.selected, Some(RowId::Repository(path.clone())));
+        assert_eq!(
+            app.selected_worktree()
+                .map(|(_, worktree, _)| &worktree.path),
+            Some(&path)
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Intent::Accept(path));
+    }
+
+    #[test]
+    fn dirty_singleton_repository_keeps_worktree_details_without_branch_row() {
+        let mut singleton = repository("/repo", true);
+        singleton.worktrees.truncate(1);
+        let path = singleton.worktrees[0].path.clone();
+        let owner = BranchId::Worktree(path.clone());
+        let mut app = App::new(vec![singleton], PathBuf::from("/elsewhere"));
+        app.statuses.insert(
+            path.clone(),
+            StatusState::Ready(WorktreeStatus {
+                unstaged: 1,
+                ..WorktreeStatus::default()
+            }),
+        );
+
+        let rows = app.visible_rows();
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, VisibleRow::Worktree { .. }))
+        );
+        assert!(rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline {
+                owner: found,
+                id: RowId::Section(section_owner, InlineSection::Worktree),
+                depth: 1,
+                text,
+                ..
+            } if found == &owner && section_owner == &owner && text == "Worktree · [~1]")
+        }));
+    }
+
+    #[test]
+    fn singleton_repository_promotes_pull_request_sections_and_web_actions() {
+        let authored = authored("team", "project", 42, "2026-01-01");
+        let mut singleton = repository("/repo", true);
+        singleton.worktrees.truncate(1);
+        singleton
+            .config
+            .github_remotes
+            .insert("origin".to_owned(), authored.identity.repository.clone());
+        let path = singleton.worktrees[0].path.clone();
+        let owner = BranchId::Worktree(path.clone());
+        let mut app = App::new(vec![singleton], PathBuf::from("/elsewhere"));
+        app.statuses
+            .insert(path.clone(), StatusState::Ready(WorktreeStatus::default()));
+        app.github.insert(
+            path,
+            GitHubState::Ready(GitHubBranchData {
+                pull_request: Some(authored.pull_request),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+
+        let rows = app.visible_rows();
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, VisibleRow::Worktree { .. }))
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| { row.id() == &RowId::Section(owner.clone(), InlineSection::Worktree) })
+        );
+        assert!(rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline {
+                id: RowId::Section(found, InlineSection::Overview),
+                depth: 1,
+                ..
+            } if found == &owner)
+        }));
+        app.selected = Some(RowId::Repository(PathBuf::from("/repo")));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('w'))),
+            Intent::BeginAction(Action::OpenPullRequestWeb)
+        );
+    }
+
+    #[test]
     fn virtual_selection_expansion_and_enter_survive_updates_with_safe_fallback() {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         let selected = authored("team", "project", 10, "2026-01-01T00:00:00Z");
@@ -5441,19 +5709,32 @@ mod tests {
         }));
         assert!(rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline {
-                id: RowId::Section(found, InlineSection::Reviewers), text, expanded: Some(true), ..
+                id: RowId::Section(found, InlineSection::Reviewers), text, expanded: Some(false), ..
             } if found == &owner
                 && text.contains("req")
                 && text.contains("✓ approved")
                 && text.contains("✗ changes"))
         }));
         for reviewer in ["alice", "bob", "carol"] {
+            assert!(!rows.iter().any(|row| {
+                row.id() == &RowId::Reviewer(identity.clone(), reviewer.to_owned())
+            }));
+        }
+        assert!(!rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline { text, .. } if text == "Please address the edge case")
+        }));
+        app.set_disclosure_expanded(
+            DisclosureKey::Section(owner.clone(), InlineSection::Reviewers),
+            true,
+        );
+        let rows = app.visible_rows();
+        for reviewer in ["alice", "bob", "carol"] {
             assert!(rows.iter().any(|row| {
                 row.id() == &RowId::Reviewer(identity.clone(), reviewer.to_owned())
             }));
         }
-        assert!(rows.iter().any(|row| {
-            row.id() == &RowId::ReviewSummary(identity.clone(), "summary".to_owned())
+        assert!(!rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline { text, .. } if text == "Please address the edge case")
         }));
         assert!(rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline {
@@ -6275,16 +6556,6 @@ mod tests {
                 ],
             ),
             (
-                "summary-hidden-id",
-                vec![
-                    repository.clone(),
-                    branch.clone(),
-                    RowId::Section(owner.clone(), InlineSection::Reviewers),
-                    RowId::Reviewer(identity.clone(), "bob".to_owned()),
-                    RowId::ReviewSummary(identity.clone(), "summary-hidden-id".to_owned()),
-                ],
-            ),
-            (
                 "thread-hidden-id",
                 vec![
                     repository.clone(),
@@ -6453,10 +6724,6 @@ mod tests {
             ),
             (
                 RowId::Reviewer(identity.clone(), "alice".to_owned()),
-                InlineSection::Reviewers,
-            ),
-            (
-                RowId::ReviewSummary(identity.clone(), "summary-hidden-id".to_owned()),
                 InlineSection::Reviewers,
             ),
             (

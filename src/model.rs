@@ -563,22 +563,6 @@ impl PullRequestDetails {
         }
         tokens
     }
-
-    pub fn review_summaries_for<'a>(
-        &'a self,
-        reviewer: &'a ReviewerView,
-    ) -> impl Iterator<Item = &'a PullRequestFeedback> {
-        self.feedback.iter().filter(|feedback| {
-            feedback.kind == FeedbackKind::ReviewSummary
-                && feedback.author.eq_ignore_ascii_case(&reviewer.name)
-        })
-    }
-
-    pub fn has_review_summaries(&self) -> bool {
-        self.feedback
-            .iter()
-            .any(|feedback| feedback.kind == FeedbackKind::ReviewSummary)
-    }
 }
 
 fn newer_check(candidate: &PullRequestCheck, current: &PullRequestCheck) -> bool {
