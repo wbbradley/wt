@@ -248,11 +248,14 @@ one selection and one subtree scope.
 - Attention navigation lands on the actionable branch node and expands only the ancestor path
   needed to reveal it; it does not overwrite inner user folds.
 
-Filtering adopts Rollup's temporary-expansion model. Matching uses a case-insensitive regular
+Search adopts Rollup's temporary-expansion model. Matching uses a case-insensitive regular
 expression over rendered text plus the hidden Worktree/Overview fields already searched by `wt`.
-It updates incrementally, with invalid expressions matching no rows until valid. Only matching rows
-and their ancestors remain. Normally collapsed sections are temporarily expanded to reveal matches;
-temporary `h`/`l` changes live in filter-only state. Clearing the filter restores the exact saved
+It updates incrementally, highlights visible matches in black on yellow, and treats invalid
+expressions as matching no rows until valid. While editing, only exact matching rows and their
+ancestors remain. Enter commits a structural search: unmatched repository and branch/worktree
+subtrees stay hidden, while all detail siblings under every matching branch are restored. Saved
+folds remain intact and only ancestor paths required to reveal exact hits are temporarily expanded;
+temporary `h`/`l` changes live in search-only state. Clearing the search restores the exact saved
 unfiltered folds.
 
 ## Copy workflows and shortcut migration

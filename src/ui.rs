@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
+use regex::{Regex, RegexBuilder};
 
 use crate::app::{App, GitHubState, InlineRowKind, InlineSection, Modal, StatusState, VisibleRow};
 #[cfg(test)]
@@ -65,7 +66,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     app.set_viewport_height(area.height.saturating_sub(2) as usize);
     if rows.is_empty() {
         let message = if !app.filter.is_empty() {
-            "No repositories or worktrees match the filter."
+            "No repositories or worktrees match the search."
         } else if app.repositories.is_empty() {
             "No repositories or authored pull requests are available. Run `wt repo add`, or authenticate GitHub to discover authored PRs."
         } else {
@@ -80,6 +81,15 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
     let tree_prefixes = tree_prefixes(app, &rows);
+    let search_query = app
+        .filter_active
+        .then(|| {
+            RegexBuilder::new(&app.filter)
+                .case_insensitive(true)
+                .build()
+                .ok()
+        })
+        .flatten();
     let items: Vec<ListItem<'_>> = rows
         .iter()
         .zip(tree_prefixes)
@@ -171,7 +181,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         Style::default().fg(DANGER),
                     ));
                 }
-                single_line_tree_item(spans, line_width)
+                single_line_tree_item(
+                    highlight_search_matches(spans, search_query.as_ref()),
+                    line_width,
+                )
             }
             VisibleRow::Worktree {
                 repository_index,
@@ -225,7 +238,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         span.style = span.style.add_modifier(Modifier::DIM);
                     }
                 }
-                single_line_tree_item(spans, line_width)
+                single_line_tree_item(
+                    highlight_search_matches(spans, search_query.as_ref()),
+                    line_width,
+                )
             }
             VisibleRow::VirtualRepository {
                 virtual_repository_index,
@@ -247,15 +263,18 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     (area.width.saturating_sub(7) as usize)
                         .saturating_sub(display_width(&tree_prefix) + display_width(marker)),
                 );
-                ListItem::new(Line::from(vec![
-                    location_marker_span(app, row),
-                    Span::styled(tree_prefix, Style::default().fg(MUTED)),
-                    Span::styled(
-                        format!("{arrow} {label}"),
-                        Style::default().fg(REMOTE).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(marker, Style::default().fg(WARNING)),
-                ]))
+                ListItem::new(Line::from(highlight_search_matches(
+                    vec![
+                        location_marker_span(app, row),
+                        Span::styled(tree_prefix, Style::default().fg(MUTED)),
+                        Span::styled(
+                            format!("{arrow} {label}"),
+                            Style::default().fg(REMOTE).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(marker, Style::default().fg(WARNING)),
+                    ],
+                    search_query.as_ref(),
+                )))
             }
             VisibleRow::VirtualPullRequest {
                 virtual_repository_index,
@@ -294,16 +313,24 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         span.style = span.style.add_modifier(Modifier::DIM);
                     }
                 }
-                single_line_tree_item(spans, line_width)
+                single_line_tree_item(
+                    highlight_search_matches(spans, search_query.as_ref()),
+                    line_width,
+                )
             }
-            VisibleRow::Backburner { expanded, .. } => ListItem::new(Line::from(vec![
-                location_marker_span(app, row),
-                Span::styled(tree_prefix, Style::default().fg(MUTED)),
-                Span::styled(
-                    format!("{} Backburner", if *expanded { "▾" } else { "▸" }),
-                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-                ),
-            ])),
+            VisibleRow::Backburner { expanded, .. } => {
+                ListItem::new(Line::from(highlight_search_matches(
+                    vec![
+                        location_marker_span(app, row),
+                        Span::styled(tree_prefix, Style::default().fg(MUTED)),
+                        Span::styled(
+                            format!("{} Backburner", if *expanded { "▾" } else { "▸" }),
+                            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                        ),
+                    ],
+                    search_query.as_ref(),
+                )))
+            }
             VisibleRow::Inline {
                 kind,
                 section,
@@ -321,7 +348,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     line_width.saturating_sub(2),
                 );
                 spans.insert(0, location_marker_span(app, row));
-                single_line_tree_item(spans, line_width)
+                single_line_tree_item(
+                    highlight_search_matches(spans, search_query.as_ref()),
+                    line_width,
+                )
             }
         })
         .collect();
@@ -332,9 +362,14 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut state = ListState::default()
         .with_selected(selected)
         .with_offset(app.scroll);
+    let selection_style = if app.filter_active {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(SELECTION).add_modifier(Modifier::BOLD)
+    };
     let list = List::new(items)
         .block(list_block(app))
-        .highlight_style(Style::default().bg(SELECTION).add_modifier(Modifier::BOLD))
+        .highlight_style(selection_style)
         .highlight_symbol("▶")
         .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(list, area, &mut state);
@@ -831,6 +866,64 @@ fn tree_label(text: &str, color: Color) -> Span<'static> {
     Span::styled(format!(" · {text}"), Style::default().fg(color))
 }
 
+fn highlight_search_matches(
+    spans: Vec<Span<'static>>,
+    query: Option<&Regex>,
+) -> Vec<Span<'static>> {
+    let Some(query) = query else {
+        return spans;
+    };
+    let text = spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    let matches = query
+        .find_iter(&text)
+        .filter(|found| !found.is_empty())
+        .map(|found| found.range())
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return spans;
+    }
+
+    let mut highlighted = Vec::new();
+    let mut offset = 0;
+    for span in spans {
+        let content = span.content.into_owned();
+        let end = offset + content.len();
+        let mut cuts = vec![0, content.len()];
+        for range in &matches {
+            if range.start > offset && range.start < end {
+                cuts.push(range.start - offset);
+            }
+            if range.end > offset && range.end < end {
+                cuts.push(range.end - offset);
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for bounds in cuts.windows(2) {
+            let start = bounds[0];
+            let end = bounds[1];
+            if start == end {
+                continue;
+            }
+            let absolute_start = offset + start;
+            let style = if matches
+                .iter()
+                .any(|range| range.start <= absolute_start && absolute_start < range.end)
+            {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                span.style
+            };
+            highlighted.push(Span::styled(content[start..end].to_owned(), style));
+        }
+        offset = end;
+    }
+    highlighted
+}
+
 fn single_line_tree_item(spans: Vec<Span<'static>>, line_width: usize) -> ListItem<'static> {
     ListItem::new(Line::from(truncate_spans(spans, line_width)))
 }
@@ -1016,7 +1109,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ])
     } else if !app.filter.is_empty() {
         Line::from(vec![
-            Span::styled("filter: ", Style::default().fg(MUTED)),
+            Span::styled("search: ", Style::default().fg(MUTED)),
             Span::styled(app.filter.clone(), Style::default().fg(WARNING)),
             Span::styled(
                 " · Esc clear · / replace · h/l fold",
@@ -1026,9 +1119,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         shortcut_line(&[
             ("j/k", "move"),
-            ("[/]", "attention"),
+            ("[/]", "issues"),
             ("h/l", "fold"),
-            ("/", "filter"),
+            ("/", "search"),
             ("r", "refresh"),
             ("?", "actions"),
             ("Enter", "select/create"),
@@ -2025,7 +2118,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_filter_footer_explains_clear_replace_and_folding() {
+    fn search_footer_and_incremental_match_highlighting_are_explicit() {
         let repository = RepositoryView {
             config: RepositoryConfig {
                 path: PathBuf::from("/repo"),
@@ -2047,6 +2140,8 @@ mod tests {
         for expected in ["c prompt", "p review", "n create", "P prune"] {
             assert!(shortcut_content.contains(expected), "missing {expected}");
         }
+        assert!(shortcut_content.contains("[/] issues"));
+        assert!(shortcut_content.contains("/ search"));
         assert!(!shortcut_content.contains("a register"));
 
         app.filter = "project".to_owned();
@@ -2054,7 +2149,14 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(
             buffer_text(terminal.backend().buffer())
-                .contains("filter: project · Esc clear · / replace · h/l fold")
+                .contains("search: project · Esc clear · / replace · h/l fold")
+        );
+
+        app.filter_active = true;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            styled_text(terminal.backend().buffer(), Color::Black, Color::Yellow),
+            "project"
         );
     }
 
@@ -2373,6 +2475,19 @@ mod tests {
             .content()
             .iter()
             .filter(|cell| cell.fg == color)
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn styled_text(
+        buffer: &ratatui::buffer::Buffer,
+        foreground: Color,
+        background: Color,
+    ) -> String {
+        buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == foreground && cell.bg == background)
             .map(|cell| cell.symbol())
             .collect()
     }

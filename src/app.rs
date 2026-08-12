@@ -442,6 +442,7 @@ pub struct App {
     viewport_initialized: bool,
     disclosure_expanded: HashMap<DisclosureKey, bool>,
     filter_collapsed: HashSet<DisclosureKey>,
+    filter_expanded: HashSet<DisclosureKey>,
     pub modal: Option<Modal>,
     pub inline_error: Option<String>,
     pub progress: Option<String>,
@@ -478,6 +479,7 @@ impl App {
             viewport_initialized: false,
             disclosure_expanded: HashMap::new(),
             filter_collapsed: HashSet::new(),
+            filter_expanded: HashSet::new(),
             modal: None,
             inline_error: None,
             progress: None,
@@ -669,6 +671,7 @@ impl App {
         self.filter = filter.into();
         self.filter_active = false;
         self.filter_collapsed.clear();
+        self.filter_expanded.clear();
         self.scroll = 0;
         self.ensure_selection_visible();
     }
@@ -685,22 +688,92 @@ impl App {
             return Vec::new();
         };
         let mut ancestors = Vec::<usize>::new();
-        let mut retained = BTreeSet::new();
+        let mut parents = Vec::with_capacity(rows.len());
+        let mut matches = Vec::with_capacity(rows.len());
         for (index, row) in rows.iter().enumerate() {
             let depth = self.visible_row_depth(row);
             ancestors.truncate(depth);
-            if self.row_matches_filter(row, &query) {
-                retained.extend(ancestors.iter().copied());
-                retained.insert(index);
-            }
+            parents.push(ancestors.last().copied());
+            matches.push(self.row_matches_filter(row, &query));
             ancestors.push(index);
+        }
+        let required_expanded = if self.filter.is_empty() {
+            HashSet::new()
+        } else {
+            matches
+                .iter()
+                .enumerate()
+                .filter_map(|(index, matches)| matches.then_some(parents[index]))
+                .flatten()
+                .flat_map(|mut ancestor| {
+                    let mut keys = Vec::new();
+                    loop {
+                        if let Some(key) = self.disclosure_key_for_row(&rows[ancestor]) {
+                            keys.push(key);
+                        }
+                        let Some(parent) = parents[ancestor] else {
+                            break;
+                        };
+                        ancestor = parent;
+                    }
+                    keys
+                })
+                .collect::<HashSet<_>>()
+        };
+        let mut retained = BTreeSet::new();
+        if self.filter_active {
+            for index in matches
+                .iter()
+                .enumerate()
+                .filter_map(|(index, matches)| matches.then_some(index))
+            {
+                let mut ancestor = Some(index);
+                while let Some(index) = ancestor {
+                    retained.insert(index);
+                    ancestor = parents[index];
+                }
+            }
+        } else {
+            let matching_scopes = matches
+                .iter()
+                .enumerate()
+                .filter_map(|(index, matches)| {
+                    matches
+                        .then(|| self.committed_search_branch(&rows, &parents, index))
+                        .flatten()
+                })
+                .collect::<HashSet<_>>();
+            for (index, matches) in matches.iter().copied().enumerate() {
+                let exact_unscoped = matches
+                    && self
+                        .committed_search_branch(&rows, &parents, index)
+                        .is_none();
+                let belongs_to_matching_scope = self
+                    .committed_search_branch(&rows, &parents, index)
+                    .is_some_and(|scope| matching_scopes.contains(&scope));
+                if !exact_unscoped && !belongs_to_matching_scope {
+                    continue;
+                }
+                let mut ancestor = Some(index);
+                while let Some(index) = ancestor {
+                    retained.insert(index);
+                    ancestor = parents[index];
+                }
+            }
+            for scope in matching_scopes {
+                let mut ancestor = Some(scope);
+                while let Some(index) = ancestor {
+                    retained.insert(index);
+                    ancestor = parents[index];
+                }
+            }
         }
         let filtered = rows
             .into_iter()
             .enumerate()
             .filter_map(|(index, row)| retained.contains(&index).then_some(row))
             .collect::<Vec<_>>();
-        if !apply_temporary_collapses || self.filter_collapsed.is_empty() {
+        if !apply_temporary_collapses {
             return filtered;
         }
 
@@ -712,16 +785,40 @@ impl App {
                 continue;
             }
             hidden_below = None;
-            if self
-                .disclosure_key_for_row(&row)
-                .is_some_and(|key| self.filter_collapsed.contains(&key))
-            {
-                Self::set_row_expanded(&mut row, false);
-                hidden_below = Some(depth);
+            if let Some(key) = self.disclosure_key_for_row(&row) {
+                let expanded =
+                    self.search_disclosure_expanded(&key, required_expanded.contains(&key));
+                Self::set_row_expanded(&mut row, expanded);
+                if !expanded {
+                    hidden_below = Some(depth);
+                }
             }
             visible.push(row);
         }
         visible
+    }
+
+    fn committed_search_branch(
+        &self,
+        rows: &[VisibleRow],
+        parents: &[Option<usize>],
+        index: usize,
+    ) -> Option<usize> {
+        let mut candidate = Some(index);
+        while let Some(index) = candidate {
+            if matches!(
+                rows[index],
+                VisibleRow::Repository {
+                    singleton_worktree_index: Some(_),
+                    ..
+                } | VisibleRow::Worktree { .. }
+                    | VisibleRow::VirtualPullRequest { .. }
+            ) {
+                return Some(index);
+            }
+            candidate = parents[index];
+        }
+        None
     }
 
     fn row_matches_filter(&self, row: &VisibleRow, query: &Regex) -> bool {
@@ -2116,7 +2213,9 @@ impl App {
         if self.filter_mode() {
             if expanded {
                 self.filter_collapsed.remove(&key);
+                self.filter_expanded.insert(key);
             } else {
+                self.filter_expanded.remove(&key);
                 self.filter_collapsed.insert(key);
             }
         } else {
@@ -2126,13 +2225,74 @@ impl App {
 
     fn displayed_disclosure_expanded(&self, key: &DisclosureKey, default: bool) -> bool {
         if self.filter_mode() {
-            !self.filter_collapsed.contains(key)
+            self.search_disclosure_expanded(key, self.search_requires_expansion(key))
         } else {
             self.disclosure_expanded
                 .get(key)
                 .copied()
                 .unwrap_or(default)
         }
+    }
+
+    fn search_disclosure_expanded(&self, key: &DisclosureKey, required: bool) -> bool {
+        if self.filter_collapsed.contains(key) {
+            false
+        } else if self.filter_expanded.contains(key) || required {
+            true
+        } else {
+            self.saved_disclosure_expanded(key)
+        }
+    }
+
+    fn saved_disclosure_expanded(&self, key: &DisclosureKey) -> bool {
+        self.disclosure_expanded
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| match key {
+                DisclosureKey::Repository(path) => self
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.config.path == *path)
+                    .is_some_and(|repository| repository.expanded),
+                DisclosureKey::VirtualRepository(identity) => self
+                    .virtual_repositories
+                    .iter()
+                    .find(|repository| repository.identity == *identity)
+                    .is_some_and(|repository| repository.expanded),
+                DisclosureKey::Backburner(_) => false,
+                DisclosureKey::Branch(_) => true,
+                DisclosureKey::Section(_, section) => matches!(
+                    section,
+                    InlineSection::OpenComments | InlineSection::StackedBranches
+                ),
+            })
+    }
+
+    fn search_requires_expansion(&self, key: &DisclosureKey) -> bool {
+        if self.filter.is_empty() {
+            return false;
+        }
+        let Ok(query) = RegexBuilder::new(&self.filter)
+            .case_insensitive(true)
+            .build()
+        else {
+            return false;
+        };
+        let rows = self.logical_rows();
+        let mut ancestors = Vec::<usize>::new();
+        for (index, row) in rows.iter().enumerate() {
+            let depth = self.visible_row_depth(row);
+            ancestors.truncate(depth);
+            if self.row_matches_filter(row, &query)
+                && ancestors.iter().any(|ancestor| {
+                    self.disclosure_key_for_row(&rows[*ancestor]).as_ref() == Some(key)
+                })
+            {
+                return true;
+            }
+            ancestors.push(index);
+        }
+        false
     }
 
     pub fn virtual_repository_expanded(&self, index: usize) -> bool {
@@ -2286,6 +2446,7 @@ impl App {
                 self.filter_active = true;
                 self.filter.clear();
                 self.filter_collapsed.clear();
+                self.filter_expanded.clear();
                 self.scroll = 0;
                 self.ensure_selection_visible();
                 Intent::None
@@ -2311,6 +2472,7 @@ impl App {
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
                 self.filter_collapsed.clear();
+                self.filter_expanded.clear();
                 self.scroll = 0;
                 self.ensure_selection_visible();
                 Intent::None
@@ -2326,16 +2488,19 @@ impl App {
                 self.filter_active = false;
                 if self.filter.is_empty() {
                     self.filter_collapsed.clear();
+                    self.filter_expanded.clear();
                 }
             }
             KeyCode::Esc => {
                 self.filter_active = false;
                 self.filter.clear();
                 self.filter_collapsed.clear();
+                self.filter_expanded.clear();
             }
             KeyCode::Backspace => {
                 self.filter.pop();
                 self.filter_collapsed.clear();
+                self.filter_expanded.clear();
             }
             KeyCode::Char(character)
                 if !key
@@ -2344,6 +2509,7 @@ impl App {
             {
                 self.filter.push(character);
                 self.filter_collapsed.clear();
+                self.filter_expanded.clear();
             }
             _ => {}
         }
@@ -4698,6 +4864,7 @@ mod tests {
         assert_eq!(nested, vec![(10, 0), (11, 2), (12, 4), (13, 0)]);
 
         app.filter = "stack-grandchild".to_owned();
+        app.filter_active = true;
         let filtered = app
             .visible_rows()
             .iter()
@@ -4744,6 +4911,30 @@ mod tests {
                 ),
             ]
         );
+
+        app.filter_active = false;
+        let committed_branches = app
+            .visible_rows()
+            .iter()
+            .filter_map(|row| match row {
+                VisibleRow::VirtualPullRequest {
+                    pull_request_index, ..
+                } => Some(
+                    app.virtual_repositories[0].pull_requests[*pull_request_index]
+                        .identity
+                        .number,
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(committed_branches, vec![10, 11, 12]);
+        assert!(app.visible_rows().iter().any(|row| {
+            row.id()
+                == &RowId::Metadata(
+                    BranchId::VirtualPullRequest(grandchild.identity.clone()),
+                    "overview-url".to_owned(),
+                )
+        }));
 
         app.filter.clear();
         let parent_stack = DisclosureKey::Section(
@@ -5074,6 +5265,7 @@ mod tests {
         );
 
         app.filter = "bare".to_owned();
+        app.filter_active = true;
         assert_eq!(
             app.visible_rows()
                 .into_iter()
@@ -6616,6 +6808,7 @@ mod tests {
     #[test]
     fn filtered_tree_keeps_only_matches_and_complete_nested_ancestor_paths() {
         let (mut app, identity) = filter_test_app();
+        app.filter_active = true;
         let repository = RowId::VirtualRepository(identity.repository.clone());
         let branch = RowId::VirtualPullRequest(identity.clone());
         let owner = BranchId::VirtualPullRequest(identity.clone());
@@ -6702,6 +6895,33 @@ mod tests {
                 expected,
                 "unexpected filtered path for {query}"
             );
+        }
+
+        app.filter = "thread-hidden-id".to_owned();
+        app.filter_active = false;
+        let committed = app
+            .visible_rows()
+            .into_iter()
+            .map(|row| row.id().clone())
+            .collect::<Vec<_>>();
+        for restored in [
+            RowId::Section(owner.clone(), InlineSection::Overview),
+            RowId::Section(owner.clone(), InlineSection::Checks),
+            RowId::Section(owner.clone(), InlineSection::Reviewers),
+            RowId::Section(owner.clone(), InlineSection::OpenComments),
+            RowId::OpenComment(identity.clone(), "comment-hidden-id".to_owned()),
+        ] {
+            assert!(
+                committed.contains(&restored),
+                "missing committed-search sibling {restored:?}"
+            );
+        }
+        for still_collapsed in [
+            RowId::Check(identity.clone(), "failure-needle".to_owned()),
+            RowId::Check(identity.clone(), "pending-needle".to_owned()),
+            RowId::Reviewer(identity.clone(), "alice".to_owned()),
+        ] {
+            assert!(!committed.contains(&still_collapsed));
         }
     }
 
