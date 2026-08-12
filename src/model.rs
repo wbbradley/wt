@@ -270,6 +270,61 @@ pub struct PullRequestAttentionSummary {
     pub merge_conflict: MergeConflictState,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequiredCheckSummary {
+    pub readiness: RequiredCheckReadiness,
+    pub passed: usize,
+    pub total: usize,
+    pub complete: bool,
+}
+
+impl RequiredCheckSummary {
+    pub fn ratio_text(self) -> String {
+        if !self.complete || self.readiness == RequiredCheckReadiness::Unknown {
+            "unknown".to_owned()
+        } else if self.total == 0 {
+            "no required checks".to_owned()
+        } else {
+            format!("{}/{} required", self.passed, self.total)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewerSummaryToken {
+    Requested,
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+    Unknown,
+}
+
+impl ReviewerSummaryToken {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "req",
+            Self::Approved => "✓ approved",
+            Self::ChangesRequested => "✗ changes",
+            Self::Commented => "◉ commented",
+            Self::Dismissed => "⊘ dismissed",
+            Self::Unknown => "○ unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewerView {
+    pub identity: String,
+    pub name: String,
+    pub kind: ReviewerKind,
+    pub requested: bool,
+    pub request_id: Option<String>,
+    pub review_id: Option<String>,
+    pub review_database_id: Option<u64>,
+    pub state: Option<SubmittedReviewState>,
+}
+
 impl PullRequestAttentionSummary {
     pub fn is_actionable(self) -> bool {
         self.required_checks == RequiredCheckReadiness::Failure
@@ -380,6 +435,150 @@ impl PullRequestDetails {
             merge_conflict: self.merge_conflict,
         }
     }
+
+    pub fn required_check_summary(&self) -> RequiredCheckSummary {
+        let required = self
+            .checks
+            .iter()
+            .filter(|check| check.required)
+            .collect::<Vec<_>>();
+        RequiredCheckSummary {
+            readiness: self.required_check_readiness(),
+            passed: required
+                .iter()
+                .filter(|check| {
+                    matches!(
+                        check.state,
+                        CheckState::Success | CheckState::Neutral | CheckState::Skipped
+                    )
+                })
+                .count(),
+            total: required.len(),
+            complete: self.check_contexts_complete,
+        }
+    }
+
+    pub fn reviewers(&self) -> Vec<ReviewerView> {
+        let mut reviewers = BTreeMap::<String, ReviewerView>::new();
+        for request in &self.review_requests {
+            let identity = request.name.to_ascii_lowercase();
+            let reviewer = reviewers
+                .entry(identity.clone())
+                .or_insert_with(|| ReviewerView {
+                    identity,
+                    name: request.name.clone(),
+                    kind: request.kind,
+                    requested: false,
+                    request_id: None,
+                    review_id: None,
+                    review_database_id: None,
+                    state: None,
+                });
+            reviewer.name.clone_from(&request.name);
+            reviewer.kind = request.kind;
+            reviewer.requested = true;
+            reviewer.request_id = Some(request.id.clone());
+        }
+        let mut latest_reviews = BTreeMap::<String, &ReviewerReview>::new();
+        for review in &self.reviewer_reviews {
+            let identity = review.reviewer.to_ascii_lowercase();
+            match latest_reviews.get(&identity) {
+                Some(current) if !newer_review(review, current) => {}
+                _ => {
+                    latest_reviews.insert(identity, review);
+                }
+            }
+        }
+        for (identity, review) in latest_reviews {
+            let reviewer = reviewers
+                .entry(identity.clone())
+                .or_insert_with(|| ReviewerView {
+                    identity,
+                    name: review.reviewer.clone(),
+                    kind: ReviewerKind::User,
+                    requested: false,
+                    request_id: None,
+                    review_id: None,
+                    review_database_id: None,
+                    state: None,
+                });
+            reviewer.name.clone_from(&review.reviewer);
+            reviewer.review_id = Some(review.id.clone());
+            reviewer.review_database_id = review.database_id;
+            reviewer.state = Some(review.state);
+        }
+        for feedback in self
+            .feedback
+            .iter()
+            .filter(|feedback| feedback.kind == FeedbackKind::ReviewSummary)
+        {
+            let identity = feedback.author.to_ascii_lowercase();
+            reviewers
+                .entry(identity.clone())
+                .or_insert_with(|| ReviewerView {
+                    identity,
+                    name: feedback.author.clone(),
+                    kind: ReviewerKind::User,
+                    requested: false,
+                    request_id: None,
+                    review_id: None,
+                    review_database_id: None,
+                    state: Some(SubmittedReviewState::Unknown),
+                });
+        }
+        reviewers.into_values().collect()
+    }
+
+    pub fn reviewer_summary(&self) -> Vec<ReviewerSummaryToken> {
+        let reviewers = self.reviewers();
+        let mut tokens = Vec::new();
+        if reviewers.iter().any(|reviewer| reviewer.requested) {
+            tokens.push(ReviewerSummaryToken::Requested);
+        }
+        for (state, token) in [
+            (
+                SubmittedReviewState::Approved,
+                ReviewerSummaryToken::Approved,
+            ),
+            (
+                SubmittedReviewState::ChangesRequested,
+                ReviewerSummaryToken::ChangesRequested,
+            ),
+            (
+                SubmittedReviewState::Commented,
+                ReviewerSummaryToken::Commented,
+            ),
+            (
+                SubmittedReviewState::Dismissed,
+                ReviewerSummaryToken::Dismissed,
+            ),
+            (SubmittedReviewState::Unknown, ReviewerSummaryToken::Unknown),
+        ] {
+            if reviewers
+                .iter()
+                .any(|reviewer| reviewer.state == Some(state))
+            {
+                tokens.push(token);
+            }
+        }
+        tokens
+    }
+
+    pub fn review_summaries_for<'a>(
+        &'a self,
+        reviewer: &'a ReviewerView,
+    ) -> impl Iterator<Item = &'a PullRequestFeedback> {
+        self.feedback.iter().filter(|feedback| {
+            feedback.kind == FeedbackKind::ReviewSummary
+                && feedback.author.eq_ignore_ascii_case(&reviewer.name)
+        })
+    }
+
+    pub fn has_review_summaries(&self) -> bool {
+        self.feedback
+            .iter()
+            .any(|feedback| feedback.kind == FeedbackKind::ReviewSummary)
+    }
 }
 
 fn newer_check(candidate: &PullRequestCheck, current: &PullRequestCheck) -> bool {
@@ -438,6 +637,23 @@ impl WorktreeStatus {
             "{} staged, {} unstaged, {} untracked",
             self.staged, self.unstaged, self.untracked
         )
+    }
+
+    pub fn inline_summary(&self) -> String {
+        if !self.is_dirty() {
+            return "clean".to_owned();
+        }
+        let mut parts = Vec::new();
+        if self.staged > 0 {
+            parts.push(format!("+{}", self.staged));
+        }
+        if self.unstaged > 0 {
+            parts.push(format!("~{}", self.unstaged));
+        }
+        if self.untracked > 0 {
+            parts.push(format!("?{}", self.untracked));
+        }
+        format!("[{}]", parts.join(" "))
     }
 }
 
@@ -693,5 +909,64 @@ mod tests {
         assert_eq!(summary.required_checks, RequiredCheckReadiness::Pending);
         assert_eq!(summary.review, ReviewReadiness::Waiting);
         assert!(!summary.is_actionable());
+    }
+
+    #[test]
+    fn section_views_report_incomplete_checks_and_combine_reviewer_identities() {
+        let mut details = PullRequestDetails {
+            checks: vec![
+                check("required", CheckState::Success, true, 1),
+                check("optional", CheckState::Failure, false, 2),
+            ],
+            review_requests: vec![ReviewRequest {
+                id: "request".to_owned(),
+                name: "OctoCat".to_owned(),
+                kind: ReviewerKind::User,
+            }],
+            reviewer_reviews: vec![ReviewerReview {
+                id: "review".to_owned(),
+                database_id: Some(7),
+                reviewer: "octocat".to_owned(),
+                state: SubmittedReviewState::ChangesRequested,
+                submitted_at: Some("2026-01-01".to_owned()),
+            }],
+            ..PullRequestDetails::default()
+        };
+
+        assert_eq!(details.required_check_summary().ratio_text(), "unknown");
+        details.check_contexts_complete = true;
+        assert_eq!(
+            details.required_check_summary().ratio_text(),
+            "1/1 required"
+        );
+        let reviewers = details.reviewers();
+        assert_eq!(reviewers.len(), 1);
+        assert!(reviewers[0].requested);
+        assert_eq!(
+            reviewers[0].state,
+            Some(SubmittedReviewState::ChangesRequested)
+        );
+        assert_eq!(
+            details.reviewer_summary(),
+            vec![
+                ReviewerSummaryToken::Requested,
+                ReviewerSummaryToken::ChangesRequested,
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_inline_summary_is_compact_and_attention_first() {
+        assert_eq!(WorktreeStatus::default().inline_summary(), "clean");
+        assert_eq!(
+            WorktreeStatus {
+                staged: 2,
+                unstaged: 1,
+                untracked: 3,
+                ..WorktreeStatus::default()
+            }
+            .inline_summary(),
+            "[+2 ~1 ?3]"
+        );
     }
 }

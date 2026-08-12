@@ -1173,6 +1173,9 @@ fn parse_pull_request_attention(node: &Value, details: &mut PullRequestDetails) 
         if let Some(parsed) = parse_reviewer_review(review) {
             details.reviewer_reviews.push(parsed);
         }
+        if let Some(summary) = parse_review_summary(review) {
+            details.feedback.push(summary);
+        }
     }
     details.reviews_complete =
         connection_complete(node.get("reviewRequests")) && connection_complete(node.get("reviews"));
@@ -1280,6 +1283,24 @@ fn parse_reviewer_review(node: &Value) -> Option<ReviewerReview> {
             .get("submittedAt")
             .and_then(Value::as_str)
             .map(str::to_owned),
+    })
+}
+
+fn parse_review_summary(node: &Value) -> Option<PullRequestFeedback> {
+    let body = node.get("body").and_then(Value::as_str)?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(PullRequestFeedback {
+        id: node.get("id")?.as_str()?.to_owned(),
+        database_id: node.get("databaseId").and_then(Value::as_u64),
+        thread_id: None,
+        kind: FeedbackKind::ReviewSummary,
+        author: actor_name(node.get("author")),
+        body: body.to_owned(),
+        path: None,
+        permalink: node.get("url").and_then(Value::as_str).map(str::to_owned),
+        outdated: false,
     })
 }
 
@@ -2682,7 +2703,14 @@ mod tests {
         assert_eq!(details.attention_summary().optional_failures, 1);
         assert_eq!(details.review_requests[0].name, "maintainers");
         assert_eq!(details.reviewer_reviews[0].database_id, Some(91));
-        assert_eq!(details.feedback.len(), 1);
+        assert_eq!(details.feedback.len(), 2);
+        assert!(details.feedback.iter().any(|feedback| {
+            feedback.kind == FeedbackKind::ReviewSummary
+                && feedback.id == "REVIEW_1"
+                && feedback.author == "reviewer"
+                && feedback.body == "Please fix the race"
+                && feedback.permalink.as_deref() == Some("https://example/review/91")
+        }));
         assert!(
             details
                 .feedback

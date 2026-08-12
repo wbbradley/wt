@@ -1,3 +1,5 @@
+use std::hash::{Hash, Hasher};
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,6 +24,7 @@ const SUCCESS: Color = Color::Green;
 const WARNING: Color = Color::Yellow;
 const DANGER: Color = Color::Red;
 const PR_NUMBER: Color = Color::Rgb(255, 165, 0);
+const COMMENTS: Color = Color::Rgb(255, 140, 0);
 const MUTED: Color = Color::DarkGray;
 const SELECTION: Color = Color::Rgb(45, 55, 72);
 const GITHUB_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -285,7 +288,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let line_width = area.width.saturating_sub(4) as usize;
                 let prefix_width = tree_prefix.chars().count();
                 wrapped_tree_item(
-                    inline_row_spans(*kind, *section, text, *expanded, tree_prefix),
+                    inline_row_spans(*kind, *section, text, *expanded, tree_prefix, line_width),
                     line_width,
                     prefix_width,
                 )
@@ -385,6 +388,7 @@ fn inline_row_spans(
     text: &str,
     expanded: Option<bool>,
     tree_prefix: String,
+    line_width: usize,
 ) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(tree_prefix, Style::default().fg(MUTED))];
     if let Some(expanded) = expanded {
@@ -398,44 +402,261 @@ fn inline_row_spans(
         spans.push(Span::styled(
             label.to_owned(),
             Style::default()
-                .fg(if section == InlineSection::StackedBranches {
-                    MUTED
+                .fg(if section == InlineSection::OpenComments {
+                    COMMENTS
                 } else {
-                    ACCENT
+                    MUTED
                 })
                 .add_modifier(Modifier::BOLD),
         ));
-        if !summary.is_empty() {
-            spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
-            let style = if section == InlineSection::Feedback {
-                if summary == "none" {
-                    Style::default().fg(MUTED)
-                } else {
-                    Style::default().fg(DANGER)
-                }
-            } else {
-                status_text_style(&summary.to_ascii_lowercase())
-            };
-            spans.push(Span::styled(summary.to_owned(), style));
+        match section {
+            InlineSection::Checks => append_checks_header_spans(&mut spans, summary),
+            InlineSection::Reviewers => append_reviewer_header_spans(&mut spans, summary),
+            InlineSection::OpenComments if !summary.is_empty() => {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    summary.to_owned(),
+                    Style::default().fg(DANGER),
+                ));
+            }
+            _ if !summary.is_empty() => {
+                spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+                spans.push(Span::styled(
+                    summary.to_owned(),
+                    status_text_style(&summary.to_ascii_lowercase()),
+                ));
+            }
+            _ => {}
         }
         return spans;
     }
-    let lower = text.to_ascii_lowercase();
-    let style = match kind {
-        InlineRowKind::Metadata => semantic_text_style(&lower),
-        InlineRowKind::Check | InlineRowKind::Review => status_text_style(&lower),
-        InlineRowKind::ReviewRequest => Style::default().fg(WARNING),
-        InlineRowKind::Feedback => {
-            if lower.contains(" · outdated") {
-                Style::default().fg(DANGER)
-            } else {
-                Style::default().fg(REMOTE)
-            }
+    match kind {
+        InlineRowKind::Metadata => {
+            spans.extend(url_spans(
+                text,
+                semantic_text_style(&text.to_ascii_lowercase()),
+            ));
+        }
+        InlineRowKind::Check => append_check_spans(&mut spans, text),
+        InlineRowKind::Reviewer => append_reviewer_spans(&mut spans, text),
+        InlineRowKind::ReviewSummary => spans.push(Span::raw(text.to_owned())),
+        InlineRowKind::OpenComment => {
+            append_open_comment_spans(&mut spans, text);
+            return truncate_spans(spans, line_width);
         }
         InlineRowKind::Section => unreachable!("handled above"),
-    };
-    spans.extend(url_spans(text, style));
+    }
     spans
+}
+
+fn append_checks_header_spans(spans: &mut Vec<Span<'static>>, summary: &str) {
+    let mut parts = summary.split(" · ");
+    let state = parts.next().unwrap_or("unknown");
+    let ratio = parts.next().unwrap_or("unknown");
+    let (glyph, style) = readiness_glyph_style(state);
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(glyph, style));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(ratio.to_owned(), Style::default().fg(MUTED)));
+    for extra in parts {
+        spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+        spans.push(Span::styled(extra.to_owned(), status_text_style(extra)));
+    }
+}
+
+fn append_reviewer_header_spans(spans: &mut Vec<Span<'static>>, summary: &str) {
+    if summary.is_empty() {
+        return;
+    }
+    let bracket = Style::default().fg(MUTED);
+    spans.push(Span::styled("  [", bracket));
+    for (index, token) in summary.split(", ").enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(", ", bracket));
+        }
+        spans.push(Span::styled(
+            token.to_owned(),
+            reviewer_summary_token_style(token),
+        ));
+    }
+    spans.push(Span::styled("]", bracket));
+}
+
+fn readiness_glyph_style(state: &str) -> (&'static str, Style) {
+    match state {
+        "success" | "approved" => ("✓", Style::default().fg(SUCCESS)),
+        "failure" | "error" | "changes requested" => (
+            "✗",
+            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+        ),
+        "pending" | "expected" | "commented" => ("◉", Style::default().fg(WARNING)),
+        "skipped" | "dismissed" => (
+            "⊘",
+            Style::default()
+                .fg(MUTED)
+                .add_modifier(Modifier::CROSSED_OUT),
+        ),
+        _ => ("○", Style::default().fg(MUTED)),
+    }
+}
+
+fn reviewer_summary_token_style(token: &str) -> Style {
+    if token == "req" {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else if token.contains("approved") {
+        Style::default().fg(SUCCESS)
+    } else if token.contains("changes") {
+        Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+    } else if token.contains("commented") {
+        Style::default().fg(WARNING)
+    } else {
+        Style::default().fg(MUTED)
+    }
+}
+
+fn append_check_spans(spans: &mut Vec<Span<'static>>, text: &str) {
+    let mut parts = text.split(" · ");
+    let name = parts.next().unwrap_or(text);
+    let state = parts.next().unwrap_or("unknown");
+    let required = parts.next() != Some("optional");
+    let (glyph, glyph_style) = readiness_glyph_style(state);
+    spans.push(Span::styled(glyph, glyph_style));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        name.to_owned(),
+        if required {
+            Style::default()
+        } else {
+            Style::default().fg(MUTED)
+        },
+    ));
+    if !required {
+        spans.push(Span::styled(" (not required)", Style::default().fg(MUTED)));
+    }
+}
+
+fn append_reviewer_spans(spans: &mut Vec<Span<'static>>, text: &str) {
+    let mut parts = text.split(" · ");
+    let name = parts.next().unwrap_or(text);
+    let state = parts.next().unwrap_or("unknown");
+    let requested = parts.next() == Some("requested");
+    let (glyph, glyph_style) = readiness_glyph_style(state);
+    spans.push(Span::styled(glyph, glyph_style));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        name.to_owned(),
+        Style::default().fg(color_for_login(name)),
+    ));
+    if requested {
+        spans.push(Span::styled(
+            "  [req]",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::styled("  (reviewed)", Style::default().fg(MUTED)));
+    }
+}
+
+fn append_open_comment_spans(spans: &mut Vec<Span<'static>>, text: &str) {
+    let (author, remainder) = text.split_once(' ').unwrap_or((text, ""));
+    spans.push(Span::styled(
+        format!("{author} "),
+        Style::default().fg(color_for_login(author)),
+    ));
+    let (without_outdated, outdated) = text_suffix(remainder, " [outdated]");
+    let (body, path) = without_outdated
+        .rfind(" (")
+        .filter(|_| without_outdated.ends_with(')'))
+        .map_or((without_outdated, None), |index| {
+            (&without_outdated[..index], Some(&without_outdated[index..]))
+        });
+    spans.push(Span::raw(body.to_owned()));
+    if let Some(path) = path {
+        spans.push(Span::styled(path.to_owned(), Style::default().fg(MUTED)));
+    }
+    if outdated {
+        spans.push(Span::styled(" [outdated]", Style::default().fg(MUTED)));
+    }
+}
+
+fn text_suffix<'a>(text: &'a str, suffix: &str) -> (&'a str, bool) {
+    text.strip_suffix(suffix)
+        .map_or((text, false), |text| (text, true))
+}
+
+fn truncate_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    if Line::from(spans.clone()).width() <= width {
+        return spans;
+    }
+    if width == 0 {
+        return Vec::new();
+    }
+    let budget = width - 1;
+    let mut used = 0;
+    let mut visible = Vec::new();
+    'spans: for span in spans {
+        let mut text = String::new();
+        for character in span.content.chars() {
+            let character_width = Span::raw(character.to_string()).width();
+            if used + character_width > budget {
+                if !text.is_empty() {
+                    visible.push(Span::styled(text, span.style));
+                }
+                break 'spans;
+            }
+            text.push(character);
+            used += character_width;
+        }
+        if !text.is_empty() {
+            visible.push(Span::styled(text, span.style));
+        }
+    }
+    visible.push(Span::raw("…"));
+    visible
+}
+
+fn color_for_login(login: &str) -> Color {
+    let hue = (raw_login_hue(login) + login_hue_offset()).rem_euclid(360.0);
+    let (red, green, blue) = hsl_to_rgb(hue, 0.80, 0.60);
+    Color::Rgb(red, green, blue)
+}
+
+fn raw_login_hue(login: &str) -> f32 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write_u32(100);
+    login
+        .trim_start_matches('@')
+        .to_ascii_lowercase()
+        .hash(&mut hasher);
+    (hasher.finish() % 360) as f32
+}
+
+fn login_hue_offset() -> f32 {
+    const ANCHOR_LOGIN: &str = "wbbradley";
+    const ANCHOR_HUE: f32 = 27.0;
+    (ANCHOR_HUE - raw_login_hue(ANCHOR_LOGIN)).rem_euclid(360.0)
+}
+
+fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let hue_sector = hue / 60.0;
+    let secondary = chroma * (1.0 - ((hue_sector % 2.0) - 1.0).abs());
+    let (red, green, blue) = if hue_sector < 1.0 {
+        (chroma, secondary, 0.0)
+    } else if hue_sector < 2.0 {
+        (secondary, chroma, 0.0)
+    } else if hue_sector < 3.0 {
+        (0.0, chroma, secondary)
+    } else if hue_sector < 4.0 {
+        (0.0, secondary, chroma)
+    } else if hue_sector < 5.0 {
+        (secondary, 0.0, chroma)
+    } else {
+        (chroma, 0.0, secondary)
+    };
+    let match_value = lightness - chroma / 2.0;
+    let to_byte = |value: f32| ((value + match_value) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (to_byte(red), to_byte(green), to_byte(blue))
 }
 
 fn pull_request_tree_spans(
@@ -1375,9 +1596,9 @@ mod tests {
         assert!(content.contains("auto-merge: enabled"));
         assert!(content.contains("h/l collapse/expand · Enter/w opens"));
         assert!(content.contains("Overview · draft · auto-merge enabled · conflicts conflicting"));
-        assert!(content.contains("Checks · success · 1/1 required · 2 total · 1 optional failure"));
-        assert!(content.contains("Reviews · changes requested · 0 requested · 1 submitted"));
-        assert!(content.contains("Feedback · 1 unresolved"));
+        assert!(content.contains("Checks  ✓ 1/1 required · 1 optional failure"));
+        assert!(content.contains("Reviewers  [✗ changes]"));
+        assert!(content.contains("Open comments  1 unresolved"));
         assert!(content.contains("fix this"));
 
         let mut narrow_terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
@@ -1431,6 +1652,168 @@ mod tests {
         assert_eq!(check_color(CheckRollup::Failure), Color::Red);
         assert_eq!(check_color(CheckRollup::Error), Color::Red);
         assert_eq!(check_color(CheckRollup::Pending), Color::Yellow);
+    }
+
+    #[test]
+    fn inline_checks_and_reviewers_use_rollup_glyphs_tokens_and_login_colors() {
+        let checks = inline_row_spans(
+            InlineRowKind::Section,
+            InlineSection::Checks,
+            "Checks · failure · 1/2 required",
+            Some(false),
+            String::new(),
+            80,
+        );
+        assert_eq!(
+            checks
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "▸ Checks  ✗ 1/2 required"
+        );
+        let failure = checks.iter().find(|span| span.content == "✗").unwrap();
+        assert_eq!(failure.style.fg, Some(DANGER));
+        assert!(failure.style.add_modifier.contains(Modifier::BOLD));
+
+        let requested = inline_row_spans(
+            InlineRowKind::Reviewer,
+            InlineSection::Reviewers,
+            "OctoCat · approved · requested",
+            None,
+            String::new(),
+            80,
+        );
+        assert_eq!(
+            requested
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "✓ OctoCat  [req]"
+        );
+        assert_eq!(
+            requested
+                .iter()
+                .find(|span| span.content == "OctoCat")
+                .unwrap()
+                .style
+                .fg,
+            Some(color_for_login("octocat"))
+        );
+        assert_eq!(
+            requested
+                .iter()
+                .find(|span| span.content == "  [req]")
+                .unwrap()
+                .style
+                .fg,
+            Some(ACCENT)
+        );
+
+        let changes = inline_row_spans(
+            InlineRowKind::Reviewer,
+            InlineSection::Reviewers,
+            "reviewer · changes requested · reviewed",
+            None,
+            String::new(),
+            80,
+        );
+        let changes_glyph = changes.iter().find(|span| span.content == "✗").unwrap();
+        assert_eq!(changes_glyph.style.fg, Some(DANGER));
+        assert!(changes.iter().any(|span| span.content == "  (reviewed)"));
+
+        let summary = inline_row_spans(
+            InlineRowKind::ReviewSummary,
+            InlineSection::Reviewers,
+            "Please fix the edge case",
+            None,
+            "└─ ".to_owned(),
+            80,
+        );
+        assert_eq!(
+            summary
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "└─ Please fix the edge case"
+        );
+    }
+
+    #[test]
+    fn check_rows_cover_pending_valid_unknown_and_optional_styles() {
+        for (state, glyph, color) in [
+            ("expected", "◉", WARNING),
+            ("neutral", "○", MUTED),
+            ("unknown", "○", MUTED),
+            ("skipped", "⊘", MUTED),
+        ] {
+            let spans = inline_row_spans(
+                InlineRowKind::Check,
+                InlineSection::Checks,
+                &format!("ci · {state} · optional"),
+                None,
+                String::new(),
+                80,
+            );
+            let glyph_span = spans.iter().find(|span| span.content == glyph).unwrap();
+            assert_eq!(glyph_span.style.fg, Some(color));
+            assert!(spans.iter().any(|span| span.content == " (not required)"));
+            if state == "skipped" {
+                assert!(
+                    glyph_span
+                        .style
+                        .add_modifier
+                        .contains(Modifier::CROSSED_OUT)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn open_comments_color_authors_mark_outdated_and_use_true_display_width() {
+        let full = inline_row_spans(
+            InlineRowKind::OpenComment,
+            InlineSection::OpenComments,
+            "@Reviewer please inspect 🧪 unicode (src/lib.rs) [outdated]",
+            None,
+            "└─ ".to_owned(),
+            80,
+        );
+        assert_eq!(
+            full.iter()
+                .find(|span| span.content == "@Reviewer ")
+                .unwrap()
+                .style
+                .fg,
+            Some(color_for_login("reviewer"))
+        );
+        assert_eq!(
+            full.iter()
+                .find(|span| span.content == " (src/lib.rs)")
+                .unwrap()
+                .style
+                .fg,
+            Some(MUTED)
+        );
+        assert_eq!(
+            full.iter()
+                .find(|span| span.content == " [outdated]")
+                .unwrap()
+                .style
+                .fg,
+            Some(MUTED)
+        );
+
+        let narrow = inline_row_spans(
+            InlineRowKind::OpenComment,
+            InlineSection::OpenComments,
+            "@Reviewer please inspect 🧪 unicode (src/lib.rs) [outdated]",
+            None,
+            "└─ ".to_owned(),
+            24,
+        );
+        let line = Line::from(narrow.clone());
+        assert_eq!(line.width(), 24);
+        assert_eq!(narrow.last().unwrap().content.as_ref(), "…");
     }
 
     #[test]

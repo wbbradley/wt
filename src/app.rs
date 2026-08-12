@@ -5,9 +5,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::github::{GitHubError, PullRequestMapping};
 use crate::model::{
-    AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, GitHubRepositoryIdentity,
-    PullRequest, PullRequestDetails, RepositoryConfig, RequiredCheckReadiness, Worktree,
-    WorktreeStatus,
+    AuthoredPullRequest, CanonicalPullRequestId, CheckState, GitHubBranchData,
+    GitHubRepositoryIdentity, PullRequest, PullRequestDetails, RepositoryConfig,
+    RequiredCheckReadiness, SubmittedReviewState, Worktree, WorktreeStatus,
 };
 use crate::prompt::{PromptPullRequest, format_agent_prompt};
 
@@ -24,8 +24,10 @@ pub enum InlineSection {
     Worktree,
     Overview,
     Checks,
-    Reviews,
-    Feedback,
+    PendingChecks,
+    ValidResults,
+    Reviewers,
+    OpenComments,
     StackedBranches,
 }
 
@@ -48,9 +50,9 @@ pub enum RowId {
     Section(BranchId, InlineSection),
     Metadata(BranchId, String),
     Check(CanonicalPullRequestId, String),
-    ReviewRequest(CanonicalPullRequestId, String),
-    Review(CanonicalPullRequestId, String),
-    Feedback(CanonicalPullRequestId, String),
+    Reviewer(CanonicalPullRequestId, String),
+    ReviewSummary(CanonicalPullRequestId, String),
+    OpenComment(CanonicalPullRequestId, String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,9 +258,9 @@ pub enum InlineRowKind {
     Section,
     Metadata,
     Check,
-    ReviewRequest,
-    Review,
-    Feedback,
+    Reviewer,
+    ReviewSummary,
+    OpenComment,
 }
 
 impl VisibleRow {
@@ -1143,7 +1145,13 @@ impl App {
         let owner = BranchId::Worktree(worktree.path.clone());
         let local_summary = match self.statuses.get(&worktree.path) {
             Some(StatusState::Pending) => "loading".to_owned(),
-            Some(StatusState::Ready(status)) => status.summary(),
+            Some(StatusState::Ready(status)) => {
+                let mut summary = status.inline_summary();
+                if let Some(upstream) = &status.upstream {
+                    summary.push_str(&format!(" · tracks {upstream}"));
+                }
+                summary
+            }
             Some(StatusState::Error(error)) => format!("error: {error}"),
             None => "unknown".to_owned(),
         };
@@ -1470,38 +1478,19 @@ impl App {
             .unwrap_or_default();
         checks.sort_by_key(|check| (check_attention_rank(check.state), check.source_order));
         let checks_expanded = self.inline_section_expanded(&owner, InlineSection::Checks);
-        let required_total = checks.iter().filter(|check| check.required).count();
-        let required_passed = checks
-            .iter()
-            .filter(|check| {
-                check.required
-                    && matches!(
-                        check.state,
-                        crate::model::CheckState::Success
-                            | crate::model::CheckState::Neutral
-                            | crate::model::CheckState::Skipped
-                    )
-            })
-            .count();
-        let check_state = summary
-            .map(|summary| match summary.required_checks {
+        let check_summary = details.map(PullRequestDetails::required_check_summary);
+        let check_state = check_summary
+            .map(|summary| match summary.readiness {
                 RequiredCheckReadiness::Ready => "success",
                 RequiredCheckReadiness::Failure => "failure",
                 RequiredCheckReadiness::Pending => "pending",
                 RequiredCheckReadiness::Unknown => "unknown",
             })
             .unwrap_or("unknown");
-        let mut checks_header = if required_total == 0 {
-            format!(
-                "Checks · {check_state} · no required checks · {} total",
-                checks.len()
-            )
-        } else {
-            format!(
-                "Checks · {check_state} · {required_passed}/{required_total} required · {} total",
-                checks.len()
-            )
-        };
+        let ratio = check_summary
+            .map(|summary| summary.ratio_text())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let mut checks_header = format!("Checks · {check_state} · {ratio}");
         if let Some(optional_failures) = summary
             .map(|summary| summary.optional_failures)
             .filter(|failures| *failures > 0)
@@ -1527,9 +1516,14 @@ impl App {
             RowId::Section(owner.clone(), InlineSection::Checks),
         );
         if checks_expanded {
-            for check in checks {
+            for check in checks.iter().filter(|check| {
+                matches!(
+                    check.state,
+                    CheckState::Failure | CheckState::Error | CheckState::Unknown
+                )
+            }) {
                 let target_url = check.target_url.clone().unwrap_or_else(|| pr_url.clone());
-                let mut text = format!(
+                let text = format!(
                     "{} · {} · {}",
                     check.name,
                     debug_label(check.state),
@@ -1539,9 +1533,6 @@ impl App {
                         "optional"
                     }
                 );
-                if check.target_url.is_some() {
-                    text.push_str(&format!(" · {target_url}"));
-                }
                 self.push_inline_row(
                     rows,
                     owner.clone(),
@@ -1551,132 +1542,199 @@ impl App {
                     text,
                     Some(target_url),
                     None,
-                    RowId::Check(identity.clone(), check.name),
+                    RowId::Check(identity.clone(), check.name.clone()),
                 );
             }
-        }
 
-        let review_requests = details
-            .map(|details| details.review_requests.clone())
-            .unwrap_or_default();
-        let reviewer_reviews = details
-            .map(|details| details.reviewer_reviews.clone())
-            .unwrap_or_default();
-        let reviews_expanded = self.inline_section_expanded(&owner, InlineSection::Reviews);
-        let review_state = summary
-            .map(|summary| debug_label(summary.review))
-            .unwrap_or_else(|| "unknown".to_owned());
-        self.push_inline_row(
-            rows,
-            owner.clone(),
-            InlineSection::Reviews,
-            depth,
-            InlineRowKind::Section,
-            format!(
-                "Reviews · {review_state} · {} requested · {} submitted",
-                review_requests.len(),
-                reviewer_reviews.len()
-            ),
-            Some(pr_url.clone()),
-            Some(reviews_expanded),
-            RowId::Section(owner.clone(), InlineSection::Reviews),
-        );
-        if reviews_expanded {
-            for request in review_requests {
+            for (section, label, states) in [
+                (
+                    InlineSection::PendingChecks,
+                    "Pending",
+                    &[CheckState::Pending, CheckState::Expected][..],
+                ),
+                (
+                    InlineSection::ValidResults,
+                    "Valid Results",
+                    &[
+                        CheckState::Success,
+                        CheckState::Neutral,
+                        CheckState::Skipped,
+                    ][..],
+                ),
+            ] {
+                let grouped = checks
+                    .iter()
+                    .filter(|check| states.contains(&check.state))
+                    .collect::<Vec<_>>();
+                if grouped.is_empty() {
+                    continue;
+                }
+                let group_expanded = self.inline_section_expanded(&owner, section);
                 self.push_inline_row(
                     rows,
                     owner.clone(),
-                    InlineSection::Reviews,
+                    section,
                     depth + 1,
-                    InlineRowKind::ReviewRequest,
-                    format!(
-                        "requested: {} ({}) · github id {}",
-                        request.name,
-                        debug_label(request.kind),
-                        request.id
-                    ),
+                    InlineRowKind::Section,
+                    format!("{label} · {}", grouped.len()),
                     Some(pr_url.clone()),
-                    None,
-                    RowId::ReviewRequest(identity.clone(), request.id),
+                    Some(group_expanded),
+                    RowId::Section(owner.clone(), section),
                 );
-            }
-            for review in reviewer_reviews {
-                self.push_inline_row(
-                    rows,
-                    owner.clone(),
-                    InlineSection::Reviews,
-                    depth + 1,
-                    InlineRowKind::Review,
-                    format!(
-                        "{} · {} · github id {}{}",
-                        review.reviewer,
-                        debug_label(review.state),
-                        review.id,
-                        review
-                            .database_id
-                            .map(|id| format!(" · review id {id}"))
-                            .unwrap_or_default()
-                    ),
-                    Some(pr_url.clone()),
-                    None,
-                    RowId::Review(identity.clone(), review.id),
-                );
+                if group_expanded {
+                    for check in grouped {
+                        let target_url = check.target_url.clone().unwrap_or_else(|| pr_url.clone());
+                        self.push_inline_row(
+                            rows,
+                            owner.clone(),
+                            section,
+                            depth + 2,
+                            InlineRowKind::Check,
+                            format!(
+                                "{} · {} · {}",
+                                check.name,
+                                debug_label(check.state),
+                                if check.required {
+                                    "required"
+                                } else {
+                                    "optional"
+                                }
+                            ),
+                            Some(target_url),
+                            None,
+                            RowId::Check(identity.clone(), check.name.clone()),
+                        );
+                    }
+                }
             }
         }
 
-        let feedback: Vec<_> = details
+        let reviewers = details
+            .map(PullRequestDetails::reviewers)
+            .unwrap_or_default();
+        let reviews_incomplete = details.is_none_or(|details| !details.reviews_complete);
+        if !reviewers.is_empty() || reviews_incomplete {
+            let reviewers_expanded = self.disclosure_expanded(
+                &DisclosureKey::Section(owner.clone(), InlineSection::Reviewers),
+                details.is_some_and(PullRequestDetails::has_review_summaries),
+            );
+            let reviewer_tokens = details
+                .map(PullRequestDetails::reviewer_summary)
+                .unwrap_or_default();
+            let reviewer_header = if reviewer_tokens.is_empty() {
+                "Reviewers · ○ unknown".to_owned()
+            } else {
+                format!(
+                    "Reviewers · {}",
+                    reviewer_tokens
+                        .iter()
+                        .map(|token| token.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            self.push_inline_row(
+                rows,
+                owner.clone(),
+                InlineSection::Reviewers,
+                depth,
+                InlineRowKind::Section,
+                reviewer_header,
+                Some(pr_url.clone()),
+                Some(reviewers_expanded),
+                RowId::Section(owner.clone(), InlineSection::Reviewers),
+            );
+            if reviewers_expanded {
+                for reviewer in reviewers {
+                    let state = reviewer.state.unwrap_or(SubmittedReviewState::Unknown);
+                    self.push_inline_row(
+                        rows,
+                        owner.clone(),
+                        InlineSection::Reviewers,
+                        depth + 1,
+                        InlineRowKind::Reviewer,
+                        format!(
+                            "{} · {} · {}",
+                            reviewer.name,
+                            debug_label(state),
+                            if reviewer.requested {
+                                "requested"
+                            } else {
+                                "reviewed"
+                            }
+                        ),
+                        Some(pr_url.clone()),
+                        None,
+                        RowId::Reviewer(identity.clone(), reviewer.identity.clone()),
+                    );
+                    if let Some(details) = details {
+                        for feedback in details.review_summaries_for(&reviewer) {
+                            let body = feedback
+                                .body
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            self.push_inline_row(
+                                rows,
+                                owner.clone(),
+                                InlineSection::Reviewers,
+                                depth + 2,
+                                InlineRowKind::ReviewSummary,
+                                body,
+                                Some(feedback.permalink.clone().unwrap_or_else(|| pr_url.clone())),
+                                None,
+                                RowId::ReviewSummary(identity.clone(), feedback.id.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let open_comments: Vec<_> = details
             .map(|details| details.unresolved_feedback().cloned().collect())
             .unwrap_or_default();
-        let feedback_expanded = self.inline_section_expanded(&owner, InlineSection::Feedback);
-        self.push_inline_row(
-            rows,
-            owner.clone(),
-            InlineSection::Feedback,
-            depth,
-            InlineRowKind::Section,
-            if feedback.is_empty() {
-                "Feedback · none".to_owned()
-            } else {
-                format!("Feedback · {} unresolved", feedback.len())
-            },
-            Some(pr_url.clone()),
-            Some(feedback_expanded),
-            RowId::Section(owner.clone(), InlineSection::Feedback),
-        );
-        if feedback_expanded {
-            for feedback in feedback {
-                let body = feedback
-                    .body
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let mut metadata = vec![feedback.author, debug_label(feedback.kind), body];
-                if let Some(path) = feedback.path {
-                    metadata.push(path);
+        if !open_comments.is_empty() {
+            let comments_expanded =
+                self.inline_section_expanded(&owner, InlineSection::OpenComments);
+            self.push_inline_row(
+                rows,
+                owner.clone(),
+                InlineSection::OpenComments,
+                depth,
+                InlineRowKind::Section,
+                format!("Open comments · {} unresolved", open_comments.len()),
+                Some(pr_url.clone()),
+                Some(comments_expanded),
+                RowId::Section(owner.clone(), InlineSection::OpenComments),
+            );
+            if comments_expanded {
+                for feedback in open_comments {
+                    let body = feedback
+                        .body
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let mut text = format!("@{} {body}", feedback.author);
+                    if let Some(path) = feedback.path {
+                        text.push_str(&format!(" ({path})"));
+                    }
+                    if feedback.outdated {
+                        text.push_str(" [outdated]");
+                    }
+                    let url = feedback.permalink.unwrap_or_else(|| pr_url.clone());
+                    self.push_inline_row(
+                        rows,
+                        owner.clone(),
+                        InlineSection::OpenComments,
+                        depth + 1,
+                        InlineRowKind::OpenComment,
+                        text,
+                        Some(url),
+                        None,
+                        RowId::OpenComment(identity.clone(), feedback.id),
+                    );
                 }
-                if feedback.outdated {
-                    metadata.push("outdated".to_owned());
-                }
-                let url = feedback.permalink.unwrap_or_else(|| pr_url.clone());
-                metadata.push(url.clone());
-                metadata.push(format!("github id {}", feedback.id));
-                if let Some(database_id) = feedback.database_id {
-                    metadata.push(format!("id {database_id}"));
-                }
-                if let Some(thread_id) = feedback.thread_id {
-                    metadata.push(format!("thread {thread_id}"));
-                }
-                self.push_inline_row(
-                    rows,
-                    owner.clone(),
-                    InlineSection::Feedback,
-                    depth + 1,
-                    InlineRowKind::Feedback,
-                    metadata.join(" · "),
-                    Some(url),
-                    None,
-                    RowId::Feedback(identity.clone(), feedback.id),
-                );
             }
         }
     }
@@ -1709,7 +1767,7 @@ impl App {
     fn inline_section_expanded(&self, owner: &BranchId, section: InlineSection) -> bool {
         self.disclosure_expanded(
             &DisclosureKey::Section(owner.clone(), section),
-            section == InlineSection::Feedback || section == InlineSection::StackedBranches,
+            section == InlineSection::OpenComments || section == InlineSection::StackedBranches,
         )
     }
 
@@ -2485,7 +2543,7 @@ impl App {
                 })
                 .into_iter()
                 .collect(),
-            Some(RowId::Feedback(identity, id)) => all
+            Some(RowId::OpenComment(identity, id)) => all
                 .get(identity)
                 .map(|pull_request| PromptPullRequest {
                     identity: identity.clone(),
@@ -2502,7 +2560,7 @@ impl App {
                 .collect(),
             Some(RowId::Section(
                 owner,
-                section @ (InlineSection::Checks | InlineSection::Feedback),
+                section @ (InlineSection::Checks | InlineSection::OpenComments),
             )) => self
                 .pull_request_identity_for_branch(owner)
                 .and_then(|identity| {
@@ -2517,8 +2575,15 @@ impl App {
                     } else {
                         Vec::new()
                     },
-                    feedback: if *section == InlineSection::Feedback {
-                        pull_request.feedback.clone()
+                    feedback: if *section == InlineSection::OpenComments {
+                        pull_request
+                            .feedback
+                            .iter()
+                            .filter(|feedback| {
+                                feedback.kind == crate::model::FeedbackKind::InlineThread
+                            })
+                            .cloned()
+                            .collect()
                     } else {
                         Vec::new()
                     },
@@ -2529,7 +2594,7 @@ impl App {
                 .pull_request_identity_for_branch(owner)
                 .map(|identity| self.prompt_stack(&all, &identity))
                 .unwrap_or_default(),
-            Some(RowId::ReviewRequest(identity, _)) | Some(RowId::Review(identity, _)) => {
+            Some(RowId::Reviewer(identity, _)) | Some(RowId::ReviewSummary(identity, _)) => {
                 self.prompt_stack(&all, identity)
             }
             _ => self.prompt_scope_from_tree(&all),
@@ -2562,9 +2627,9 @@ impl App {
                 self.pull_request_identity_for_branch(owner)
             }
             RowId::Check(identity, _)
-            | RowId::ReviewRequest(identity, _)
-            | RowId::Review(identity, _)
-            | RowId::Feedback(identity, _) => Some(identity.clone()),
+            | RowId::Reviewer(identity, _)
+            | RowId::ReviewSummary(identity, _)
+            | RowId::OpenComment(identity, _) => Some(identity.clone()),
             RowId::Repository(_) | RowId::VirtualRepository(_) | RowId::Backburner(_) => None,
         }
     }
@@ -2926,9 +2991,9 @@ impl App {
                 .map(|identity| self.prompt_stack(all, &identity))
                 .unwrap_or_default(),
             Some(RowId::Check(identity, _))
-            | Some(RowId::ReviewRequest(identity, _))
-            | Some(RowId::Review(identity, _))
-            | Some(RowId::Feedback(identity, _)) => self.prompt_stack(all, identity),
+            | Some(RowId::Reviewer(identity, _))
+            | Some(RowId::ReviewSummary(identity, _))
+            | Some(RowId::OpenComment(identity, _)) => self.prompt_stack(all, identity),
             None => Vec::new(),
         }
     }
@@ -3228,9 +3293,9 @@ impl App {
             }
             RowId::Section(owner, _) | RowId::Metadata(owner, _) => Some(owner.clone()),
             RowId::Check(identity, _)
-            | RowId::ReviewRequest(identity, _)
-            | RowId::Review(identity, _)
-            | RowId::Feedback(identity, _) => self.branch_for_pull_request(identity),
+            | RowId::Reviewer(identity, _)
+            | RowId::ReviewSummary(identity, _)
+            | RowId::OpenComment(identity, _) => self.branch_for_pull_request(identity),
             RowId::Repository(_) | RowId::VirtualRepository(_) | RowId::Backburner(_) => None,
         }
     }
@@ -4371,18 +4436,14 @@ mod tests {
         );
         let owner = BranchId::VirtualPullRequest(identity.clone());
         let initial_rows = app.visible_rows();
-        for section in [
-            InlineSection::Overview,
-            InlineSection::Checks,
-            InlineSection::Reviews,
-        ] {
+        for section in [InlineSection::Overview, InlineSection::Checks] {
             assert!(initial_rows.iter().any(|row| {
                 matches!(row, VisibleRow::Inline { id: RowId::Section(found_owner, found_section), expanded: Some(false), .. }
                     if found_owner == &owner && found_section == &section)
             }));
         }
         assert!(initial_rows.iter().any(|row| {
-            matches!(row, VisibleRow::Inline { id: RowId::Section(found_owner, InlineSection::Feedback), expanded: Some(true), .. }
+            matches!(row, VisibleRow::Inline { id: RowId::Section(found_owner, InlineSection::OpenComments), expanded: Some(true), .. }
                 if found_owner == &owner)
         }));
         app.selected = Some(RowId::Section(owner.clone(), InlineSection::Overview));
@@ -4413,7 +4474,27 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(check_names, vec!["failure", "pending", "success"]);
+        assert_eq!(check_names, vec!["failure"]);
+        assert!(rows.iter().any(|row| {
+            matches!(
+                row,
+                VisibleRow::Inline {
+                    id: RowId::Section(_, InlineSection::PendingChecks),
+                    expanded: Some(false),
+                    ..
+                }
+            )
+        }));
+        assert!(rows.iter().any(|row| {
+            matches!(
+                row,
+                VisibleRow::Inline {
+                    id: RowId::Section(_, InlineSection::ValidResults),
+                    expanded: Some(false),
+                    ..
+                }
+            )
+        }));
 
         app.selected = Some(RowId::Check(identity.clone(), "failure".to_owned()));
         app.handle_key(key(KeyCode::Char('h')));
@@ -4432,12 +4513,14 @@ mod tests {
             app.handle_key(key(KeyCode::Char('w'))),
             Intent::OpenUrl("https://checks/failure".to_owned())
         );
+        app.selected = Some(RowId::Section(owner.clone(), InlineSection::ValidResults));
+        app.handle_key(key(KeyCode::Char('l')));
         app.selected = Some(RowId::Check(identity.clone(), "success".to_owned()));
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             Intent::OpenUrl(authored.pull_request.url.clone())
         );
-        app.selected = Some(RowId::Feedback(identity.clone(), feedback_id));
+        app.selected = Some(RowId::OpenComment(identity.clone(), feedback_id));
         assert_eq!(
             app.handle_key(key(KeyCode::Char('w'))),
             Intent::OpenUrl("https://comments/7".to_owned())
@@ -4464,6 +4547,213 @@ mod tests {
         assert!(app.visible_rows().iter().any(|row| {
             matches!(row, VisibleRow::Inline { id: RowId::Section(_, InlineSection::Checks), text, .. }
                 if text.contains("no required checks"))
+        }));
+    }
+
+    #[test]
+    fn rollup_sections_group_checks_combine_reviewers_and_omit_empty_comments() {
+        let authored = authored("team", "project", 42, "2026-01-01");
+        let identity = authored.identity.clone();
+        let owner = BranchId::VirtualPullRequest(identity.clone());
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: identity.repository.clone(),
+            mapped_repository: None,
+            expanded: true,
+            pull_requests: vec![authored],
+        }];
+        let check = |name: &str, state, order| crate::model::PullRequestCheck {
+            name: name.to_owned(),
+            state,
+            target_url: None,
+            required: true,
+            source_order: order,
+            completed_at: None,
+        };
+        app.pull_request_details.insert(
+            identity.clone(),
+            PullRequestDetails {
+                checks: vec![
+                    check("failure", crate::model::CheckState::Failure, 0),
+                    check("pending", crate::model::CheckState::Pending, 1),
+                    check("unknown", crate::model::CheckState::Unknown, 2),
+                    check("success", crate::model::CheckState::Success, 3),
+                ],
+                check_contexts_complete: false,
+                review_requests: vec![crate::model::ReviewRequest {
+                    id: "alice-request".to_owned(),
+                    name: "Alice".to_owned(),
+                    kind: crate::model::ReviewerKind::User,
+                }],
+                reviewer_reviews: vec![
+                    crate::model::ReviewerReview {
+                        id: "bob-review".to_owned(),
+                        database_id: None,
+                        reviewer: "Bob".to_owned(),
+                        state: crate::model::SubmittedReviewState::Approved,
+                        submitted_at: None,
+                    },
+                    crate::model::ReviewerReview {
+                        id: "carol-review".to_owned(),
+                        database_id: None,
+                        reviewer: "Carol".to_owned(),
+                        state: crate::model::SubmittedReviewState::ChangesRequested,
+                        submitted_at: None,
+                    },
+                ],
+                reviews_complete: true,
+                feedback: vec![
+                    crate::model::PullRequestFeedback {
+                        id: "summary".to_owned(),
+                        database_id: None,
+                        thread_id: None,
+                        kind: crate::model::FeedbackKind::ReviewSummary,
+                        author: "Bob".to_owned(),
+                        body: "Please address the edge case".to_owned(),
+                        path: None,
+                        permalink: Some("https://comments/summary".to_owned()),
+                        outdated: false,
+                    },
+                    crate::model::PullRequestFeedback {
+                        id: "thread".to_owned(),
+                        database_id: Some(9),
+                        thread_id: Some("thread-id".to_owned()),
+                        kind: crate::model::FeedbackKind::InlineThread,
+                        author: "Carol".to_owned(),
+                        body: "Old code needs fixing".to_owned(),
+                        path: Some("src/lib.rs".to_owned()),
+                        permalink: Some("https://comments/thread".to_owned()),
+                        outdated: true,
+                    },
+                ],
+                feedback_complete: true,
+                ..PullRequestDetails::default()
+            },
+        );
+
+        let rows = app.visible_rows();
+        assert!(rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline {
+                id: RowId::Section(found, InlineSection::Checks), text, expanded: Some(false), ..
+            } if found == &owner && text == "Checks · unknown · unknown")
+        }));
+        assert!(rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline {
+                id: RowId::Section(found, InlineSection::Reviewers), text, expanded: Some(true), ..
+            } if found == &owner
+                && text.contains("req")
+                && text.contains("✓ approved")
+                && text.contains("✗ changes"))
+        }));
+        for reviewer in ["alice", "bob", "carol"] {
+            assert!(rows.iter().any(|row| {
+                row.id() == &RowId::Reviewer(identity.clone(), reviewer.to_owned())
+            }));
+        }
+        assert!(rows.iter().any(|row| {
+            row.id() == &RowId::ReviewSummary(identity.clone(), "summary".to_owned())
+        }));
+        assert!(rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline {
+                id: RowId::OpenComment(found, id), text, url: Some(url), ..
+            } if found == &identity
+                && id == "thread"
+                && text == "@Carol Old code needs fixing (src/lib.rs) [outdated]"
+                && url == "https://comments/thread")
+        }));
+
+        app.set_disclosure_expanded(
+            DisclosureKey::Section(owner.clone(), InlineSection::Checks),
+            true,
+        );
+        let rows = app.visible_rows();
+        for direct in ["failure", "unknown"] {
+            assert!(rows.iter().any(|row| {
+                matches!(row, VisibleRow::Inline {
+                    section: InlineSection::Checks,
+                    id: RowId::Check(found, name), ..
+                } if found == &identity && name == direct)
+            }));
+        }
+        assert!(rows.iter().any(|row| {
+            matches!(
+                row,
+                VisibleRow::Inline {
+                    id: RowId::Section(_, InlineSection::PendingChecks),
+                    expanded: Some(false),
+                    ..
+                }
+            )
+        }));
+        assert!(rows.iter().any(|row| {
+            matches!(
+                row,
+                VisibleRow::Inline {
+                    id: RowId::Section(_, InlineSection::ValidResults),
+                    expanded: Some(false),
+                    ..
+                }
+            )
+        }));
+        assert!(!rows.iter().any(|row| {
+            matches!(row.id(), RowId::Check(_, name) if name == "pending" || name == "success")
+        }));
+
+        app.pull_request_details
+            .get_mut(&identity)
+            .unwrap()
+            .checks
+            .iter_mut()
+            .find(|check| check.name == "pending")
+            .unwrap()
+            .state = crate::model::CheckState::Failure;
+        assert!(app.visible_rows().iter().any(|row| {
+            matches!(row, VisibleRow::Inline {
+                section: InlineSection::Checks,
+                id: RowId::Check(found, name), ..
+            } if found == &identity && name == "pending")
+        }));
+
+        app.pull_request_details
+            .get_mut(&identity)
+            .unwrap()
+            .feedback
+            .retain(|feedback| feedback.kind == crate::model::FeedbackKind::ReviewSummary);
+        assert!(
+            !app.visible_rows()
+                .iter()
+                .any(|row| { matches!(row.id(), RowId::Section(_, InlineSection::OpenComments)) })
+        );
+    }
+
+    #[test]
+    fn unavailable_pull_request_details_keep_unknown_attention_headers_visible() {
+        let authored = authored("team", "project", 7, "2026-01-01");
+        let identity = authored.identity.clone();
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: identity.repository.clone(),
+            mapped_repository: None,
+            expanded: true,
+            pull_requests: vec![authored],
+        }];
+        let rows = app.visible_rows();
+        assert!(rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline { text, .. } if text == "Checks · unknown · unknown")
+        }));
+        assert!(rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline { text, .. } if text == "Reviewers · ○ unknown")
+        }));
+        app.set_disclosure_expanded(
+            DisclosureKey::Section(
+                BranchId::VirtualPullRequest(identity.clone()),
+                InlineSection::Overview,
+            ),
+            true,
+        );
+        assert!(app.visible_rows().iter().any(|row| {
+            matches!(row, VisibleRow::Inline { text, .. }
+                if text == "attention details: loading or unavailable")
         }));
     }
 
@@ -4532,7 +4822,7 @@ mod tests {
 
         app.selected = Some(RowId::Section(
             BranchId::VirtualPullRequest(parent.identity.clone()),
-            InlineSection::Feedback,
+            InlineSection::OpenComments,
         ));
         let feedback = app.agent_prompt().unwrap();
         assert!(feedback.contains("feedback-1"));
