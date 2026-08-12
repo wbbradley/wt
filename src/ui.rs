@@ -689,11 +689,10 @@ fn render_detail(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             lines.push(field("GitHub", "loading…".to_owned()));
         }
         match app.github.get(&worktree.path) {
-            Some(GitHubState::Loading { previous }) => {
-                if let Some(data) = previous {
-                    append_github_details(&mut lines, data);
-                }
-            }
+            Some(GitHubState::Loading {
+                previous: Some(data),
+            }) => append_github_details(&mut lines, data),
+            Some(GitHubState::Loading { previous: None }) => {}
             Some(GitHubState::Ready(data)) => append_github_details(&mut lines, data),
             Some(GitHubState::Stale {
                 previous: Some(data),
