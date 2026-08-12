@@ -122,19 +122,22 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let mut spans = vec![
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
                     Span::styled(arrow, Style::default().fg(MUTED)),
-                    Span::styled(
-                        if current { "● " } else { "  " },
-                        Style::default().fg(SUCCESS),
-                    ),
-                    Span::styled(
-                        repository.config.display_label(),
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ),
                 ];
+                if current {
+                    spans.push(Span::styled("● ", Style::default().fg(SUCCESS)));
+                }
+                spans.push(Span::styled(
+                    repository.config.display_label(),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
                 if let Some(worktree) = singleton {
                     spans.push(Span::styled(
                         format!(" ({})", worktree_identity(worktree)),
                         Style::default().fg(BRANCH),
+                    ));
+                    spans.extend(local_state_spans(
+                        app.statuses.get(&worktree.path),
+                        worktree,
                     ));
                 }
                 spans.extend(states.into_iter().map(|(state, color)| {
@@ -165,12 +168,6 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         app.github_network_active(&worktree.path),
                         app.github_spinner_frame(),
                     ));
-                    if worktree.locked.is_some() {
-                        spans.push(Span::styled(" · locked", Style::default().fg(WARNING)));
-                    }
-                    if worktree.prunable.is_some() {
-                        spans.push(Span::styled(" · prunable", Style::default().fg(DANGER)));
-                    }
                 }
                 if let Some(error) = &repository.stale_error {
                     spans.push(Span::styled(
@@ -210,11 +207,8 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.github_network_active(&worktree.path),
                     app.github_spinner_frame(),
                 ));
-                suffix.extend(local_state_spans(
-                    app.statuses.get(&worktree.path),
-                    worktree,
-                ));
-                let prefix_width = display_width(&tree_prefix) + 4;
+                let local_state = local_state_spans(app.statuses.get(&worktree.path), worktree);
+                let prefix_width = display_width(&tree_prefix) + 2 + usize::from(current) * 2;
                 let line_width = area.width.saturating_sub(4) as usize;
                 let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
@@ -223,15 +217,15 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         if *expanded { "▾ " } else { "▸ " },
                         Style::default().fg(MUTED),
                     ),
-                    Span::styled(
-                        if current { "● " } else { "  " },
-                        Style::default().fg(SUCCESS),
-                    ),
-                    Span::styled(
-                        truncate_label(&identity, label_width),
-                        Style::default().fg(BRANCH),
-                    ),
                 ];
+                if current {
+                    spans.push(Span::styled("● ", Style::default().fg(SUCCESS)));
+                }
+                spans.push(Span::styled(
+                    truncate_label(&identity, label_width),
+                    Style::default().fg(BRANCH),
+                ));
+                spans.extend(local_state);
                 spans.extend(suffix);
                 if backburnered {
                     for span in &mut spans {
@@ -286,7 +280,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     backburnered,
                 );
                 let line_width = area.width.saturating_sub(4) as usize;
-                let prefix_width = display_width(&tree_prefix) + 4;
+                let prefix_width = display_width(&tree_prefix) + 2;
                 let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
@@ -294,7 +288,6 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         if *expanded { "▾ " } else { "▸ " },
                         Style::default().fg(MUTED),
                     ),
-                    Span::raw("  "),
                     Span::styled(
                         truncate_label(&pull_request.pull_request.head.branch, label_width),
                         Style::default().fg(REMOTE),
@@ -1328,7 +1321,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn renders_grouped_rows_details_and_resizes() {
+    fn renders_compact_repository_status_and_resizes() {
         let repository = RepositoryView {
             config: RepositoryConfig {
                 path: PathBuf::from("/repo"),
@@ -1366,30 +1359,17 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(app.viewport_height, 19);
         let content = buffer_text(terminal.backend().buffer());
-        assert!(content.contains("project (main) [session-only]"));
-        assert!(content.contains("Worktree · [+1 ~2 ?3]"));
+        assert!(!content.contains("Worktree ·"));
         let row = buffer_lines(terminal.backend().buffer())
             .into_iter()
             .find(|line| line.contains("project"))
             .unwrap();
-        assert!(row.contains("project (main) [session-only] · locked · prunable"));
+        assert!(row.contains("project (main) · [+1 ~2 ?3] · locked · prunable [session-only]"));
         assert!(!row.contains("/repo"));
         assert!(!row.contains("12345678"));
         assert!(!content.contains(" Details "));
         assert!(!content.contains("Tab"));
 
-        app.selected = Some(RowId::Section(
-            BranchId::Worktree(PathBuf::from("/repo")),
-            InlineSection::Worktree,
-        ));
-        app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('l'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let expanded = buffer_text(terminal.backend().buffer());
-        assert!(expanded.contains("path: /repo"));
-        assert!(expanded.contains("HEAD: 1234567890"));
         let mut narrow_terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         narrow_terminal
             .draw(|frame| render(frame, &mut app))
@@ -1398,7 +1378,9 @@ mod tests {
             .into_iter()
             .find(|line| line.contains("project"))
             .unwrap();
-        assert!(narrow_row.contains("project (main) [session-only] · locked · prunable"));
+        assert!(
+            narrow_row.contains("project (main) · [+1 ~2 ?3] · locked · prunable [session-only]")
+        );
         assert!(!narrow_row.contains("/repo"));
         assert!(!narrow_row.contains("12345678"));
 
@@ -1497,9 +1479,10 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
-        assert!(content.contains("▾   parent"));
+        assert!(content.contains("▾ parent"));
         assert!(content.contains("Stacked worktrees"));
-        assert!(content.contains("▾   child"));
+        assert!(content.contains("▾ child"));
+        assert!(!content.contains("Worktree ·"));
         assert!(colored_text(buffer, MUTED).contains("Stacked worktrees"));
     }
 
@@ -1648,7 +1631,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
-        assert!(content.contains("└─ ▾   feature/compact-attention"));
+        assert!(content.contains("└─ ▾ feature/compact-attention"));
         assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
         assert!(content.contains("PR #42"));
         assert!(content.contains("virtual feature"));
@@ -2181,19 +2164,8 @@ mod tests {
         let stale = buffer_text(terminal.backend().buffer());
         assert!(!stale.contains("GitHub stale"));
         assert!(!stale.contains("network unavailable"));
-        app.selected = Some(RowId::Section(
-            BranchId::Worktree(PathBuf::from("/repo")),
-            InlineSection::Worktree,
-        ));
-        app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('l'),
-            crossterm::event::KeyModifiers::NONE,
-        ));
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let scrolled = buffer_text(terminal.backend().buffer());
-        assert!(scrolled.contains("GitHub stale: network unavailable"));
-        assert!(scrolled.contains("12 remaining"));
-        assert!(scrolled.contains("warning: partial response"));
+        assert!(!stale.contains("12 remaining"));
+        assert!(!stale.contains("warning: partial response"));
     }
 
     #[test]

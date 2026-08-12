@@ -110,8 +110,7 @@ not a separate PR node. A virtual-only authored PR uses the same branch-node pre
 
 ```text
 ▾ acme/web
-  ├─ ▾ ● feature/login · PR #42 · Fix login race · [~1]
-  │     ├─ ▸ Worktree · clean · tracks origin/feature/login
+  ├─ ▾ ● feature/login · [~1] · PR #42 · Fix login race
   │     ├─ ▸ Overview · open · auto-merge off · conflicts clean
   │     ├─ ▸ Checks ✗ 3/4 required
   │     ├─ ▸ Reviewers [req, ✗ changes]
@@ -119,7 +118,7 @@ not a separate PR node. A virtual-only authored PR uses the same branch-node pre
   │     │  └─ @reviewer Handle cancellation (src/login.rs) [outdated]
   │     └─ ▾ Stacked branches
   │        └─ ▾ feature/login-ui · PR #43 · Polish login UI
-  ├─   chores · clean
+  ├─ chores
   └─ ▸ Backburner
 ```
 
@@ -127,27 +126,25 @@ The exact line is width-aware, but its information order is intentional:
 
 1. connector and outer disclosure;
 2. current-worktree marker and branch/worktree identity;
-3. orange PR number and PR title when a PR exists;
-4. compact attention-only badges and local status.
+3. compact local status when dirty;
+4. orange PR number and PR title when a PR exists;
+5. compact attention-only badges.
 
 Repository, worktree/virtual-PR, Backburner, section, and leaf rows are all selectable. A branch node
 gets an outer disclosure only when it has rendered children. A non-PR worktree remains a compact
-single row unless its Worktree section is expanded.
+single row.
 
 For a non-bare repository with exactly one worktree, the repository row itself represents that
 checkout and renders its branch in parentheses. The local branch row is suppressed, remaining
-sections are promoted one depth, and a known-clean Worktree section is omitted. Enter still selects
-the checkout; `h`/`l` still control any promoted repository children.
+sections are promoted one depth, and dirty local status follows the branch identity. Enter still
+selects the checkout; `h`/`l` still control any promoted repository children.
 
 ### `wt`-specific sections
 
-Rollup can put all useful PR identity on its PR row. `wt` also needs to retain local and
-administrative information currently available only in Details, so it adds two deliberately quiet
-sections:
+Rollup can put all useful PR identity on its PR row. `wt` keeps the same compact treatment for local
+branches: dirty counts, lock, and prunable state stay on the branch row, while redundant local
+metadata does not create a separate subtree. Worktree paths and full HEADs remain searchable.
 
-- **Worktree** starts collapsed. Its header summarizes local state and upstream; expansion exposes
-  path, anchor, full HEAD, upstream, lock reason, and prunable state. It exists only for local
-  worktrees, and is omitted for a known-clean singleton repository.
 - **Overview** starts collapsed. Its header summarizes PR state, auto-merge, and conflict state;
   expansion exposes URL, base/head repositories and branches, full head SHA, update time, stale
   detail errors, and warnings.

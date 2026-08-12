@@ -52,8 +52,7 @@ The initial selection is the worktree containing the current directory. The body
 
 ```text
 ▾ acme/web
-  ├─ ▾ ● feature/login · PR #42 · Fix login race · checks failing · review required · [~1]
-  │     ├─ ▸ Worktree · clean · tracks origin/feature/login
+  ├─ ▾ ● feature/login · [~1] · PR #42 · Fix login race · checks failing · review required
   │     ├─ ▸ Overview · open · auto-merge off · conflicts clean
   │     ├─ ▸ Checks  ✗ 3/4 required
   │     ├─ ▸ Reviewers  [req, ✗ changes]
@@ -61,20 +60,18 @@ The initial selection is the worktree containing the current directory. The body
   │     │  └─ @reviewer Handle cancellation (src/login.rs) [outdated]
   │     └─ ▾ Stacked branches
   │        └─ ▾ feature/login-ui · PR #43 · Polish login UI · virtual-only
-  ├─ ▾   chores
-  │     └─ ▸ Worktree · clean
+  ├─ ▾ chores
   └─ ▸ Backburner
 ```
 
 Tree connectors and disclosures are muted, the current worktree has a green `●`, PR numbers are orange, reviewer names have stable hash-derived colors, and every tree item stays on one display-width-truncated line. Branch rows show title and compact attention status: failed required checks, outstanding or changes-requested reviews, actual conflicts, auto-merge, non-open state, virtual/Backburner state, and local status. Unresolved counts live on the Open comments header instead of being repeated on the branch. `[+N ~N ?N]` means staged, unstaged, and untracked entries; `locked` and `prunable` remain explicit.
 
-A non-bare repository with exactly one worktree omits the separate branch row and renders as `● repository (branch)`. Its PR and exceptional Worktree details become direct children. When local status is known clean, the Worktree child is omitted; a clean non-PR singleton therefore occupies one selectable line. Bare and multi-worktree repositories retain the full repository → branch hierarchy.
+A non-bare repository with exactly one worktree omits the separate branch row and renders as `● repository (branch)`, followed immediately by local status when dirty. Its PR details become direct children; a clean non-PR singleton therefore occupies one selectable line. Bare and multi-worktree repositories retain the full repository → branch hierarchy.
 
 Disclosure defaults match Rollup while retaining `wt`'s local metadata:
 
 - repositories, complete branch subtrees, Open comments, and Stacked worktrees/PRs/branches start expanded;
-- Worktree, Overview, Checks, Pending, Valid Results, Reviewers, and Backburner start collapsed;
-- Worktree expands to repository anchor, path, branch, full HEAD, upstream, lock, prunable, local status, and GitHub warnings;
+- Overview, Checks, Pending, Valid Results, Reviewers, and Backburner start collapsed;
 - Overview expands to URL, base/head, full head SHA, state/update time, auto-merge, conflict, warning, and stale/loading detail state;
 - Checks keeps failure/error and unknown rows direct, Pending/Expected under Pending, and successful/neutral/skipped rows under Valid Results;
 - Reviewers combines requests and latest submitted states without review-body children; Open comments is the only feedback subtree and contains unresolved inline threads only.
@@ -237,7 +234,7 @@ Configured repositories use `<worktree_root>/<sanitized-local-branch>`; otherwis
 - **Authored PR is missing:** confirm the token resolves to the expected viewer and that its host is present in `github_hosts` or a registered remote.
 - **PR materialization is waiting:** another `wt` process holds the catalog sidecar lock; wait or press Ctrl-C to cancel without changing directories.
 - **SSO/SAML or classic PAT error:** authorize the token for the organization or use a token type allowed by its policy.
-- **Rate limited:** expand the affected Worktree section to see the reset value; `wt` suppresses requests until then while retaining stale data.
+- **Rate limited:** `wt` suppresses requests until the reported reset time while retaining stale data.
 - **Removal disabled:** inspect dirtiness, locks, whether the row is the main/bare worktree, and whether it contains the current directory.
 - **Shell does not change directory:** ensure `eval "$(wt shell-init bash)"` runs in the current interactive shell and that `command -v wt` finds the binary. From a development checkout, `source shell/wt.bash` is equivalent.
 - **Terminal looks altered after an external kill:** run `reset`. Normal success, cancellation, errors, Ctrl-C, and panics restore raw mode, cursor visibility, and the alternate screen automatically.

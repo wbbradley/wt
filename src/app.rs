@@ -22,7 +22,6 @@ pub enum BranchId {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum InlineSection {
-    Worktree,
     Overview,
     Checks,
     PendingChecks,
@@ -753,6 +752,8 @@ impl App {
                 let worktree = &repository.worktrees[*worktree_index];
                 let mut parts = vec![
                     worktree.branch.clone().unwrap_or_default(),
+                    worktree.path.display().to_string(),
+                    worktree.head.clone().unwrap_or_default(),
                     worktree.locked.clone().unwrap_or_default(),
                     worktree.prunable.clone().unwrap_or_default(),
                     if contains_path(&worktree.path, &self.current_directory) {
@@ -1190,7 +1191,6 @@ impl App {
                     index,
                     depth,
                     mapped_repository_index,
-                    true,
                     flattened_worktree,
                 );
             } else {
@@ -1227,7 +1227,6 @@ impl App {
                 index,
                 depth,
                 mapped_repository_index,
-                true,
                 flattened_worktree,
             );
             return;
@@ -1275,7 +1274,6 @@ impl App {
             index,
             depth + 1,
             mapped_repository_index,
-            false,
             flattened_worktree,
         );
     }
@@ -1289,7 +1287,6 @@ impl App {
         index: usize,
         depth: usize,
         mapped_repository_index: Option<usize>,
-        flattened_worktree: bool,
         flattened_worktree_index: Option<usize>,
     ) {
         let node = &forest.nodes[index];
@@ -1297,13 +1294,7 @@ impl App {
             BranchSource::Worktree {
                 repository_index,
                 worktree_index,
-            } => self.append_worktree_inline_rows(
-                rows,
-                repository_index,
-                worktree_index,
-                depth,
-                flattened_worktree,
-            ),
+            } => self.append_local_pull_request_rows(rows, repository_index, worktree_index, depth),
             BranchSource::VirtualPullRequest {
                 virtual_repository_index,
                 pull_request_index,
@@ -1515,146 +1506,16 @@ impl App {
         }
     }
 
-    fn append_worktree_inline_rows(
+    fn append_local_pull_request_rows(
         &self,
         rows: &mut Vec<VisibleRow>,
         repository_index: usize,
         worktree_index: usize,
         depth: usize,
-        flattened_worktree: bool,
     ) {
         let repository = &self.repositories[repository_index];
         let worktree = &repository.worktrees[worktree_index];
         let owner = BranchId::Worktree(worktree.path.clone());
-        let local_summary = match self.statuses.get(&worktree.path) {
-            Some(StatusState::Pending) => "loading".to_owned(),
-            Some(StatusState::Ready(status)) => {
-                let mut summary = status.inline_summary();
-                if let Some(upstream) = &status.upstream {
-                    summary.push_str(&format!(" · tracks {upstream}"));
-                }
-                summary
-            }
-            Some(StatusState::Error(error)) => format!("error: {error}"),
-            None => "unknown".to_owned(),
-        };
-        let omit_clean_worktree = flattened_worktree
-            && matches!(
-                self.statuses.get(&worktree.path),
-                Some(StatusState::Ready(status)) if !status.is_dirty()
-            );
-        let worktree_expanded = self.inline_section_expanded(&owner, InlineSection::Worktree);
-        if !omit_clean_worktree {
-            let branch = worktree
-                .branch
-                .as_deref()
-                .unwrap_or("detached")
-                .strip_prefix("refs/heads/")
-                .unwrap_or(worktree.branch.as_deref().unwrap_or("detached"));
-            let text = if flattened_worktree {
-                format!("Worktree · {local_summary}")
-            } else {
-                format!("Worktree · {local_summary} · {branch}")
-            };
-            self.push_inline_row(
-                rows,
-                owner.clone(),
-                InlineSection::Worktree,
-                depth,
-                InlineRowKind::Section,
-                text,
-                None,
-                Some(worktree_expanded),
-                RowId::Section(owner.clone(), InlineSection::Worktree),
-            );
-        }
-        if !omit_clean_worktree && worktree_expanded {
-            let mut metadata = vec![
-                (
-                    "repository".to_owned(),
-                    format!("repository: {}", repository.config.display_label()),
-                ),
-                (
-                    "anchor".to_owned(),
-                    format!("anchor: {}", repository.config.path.display()),
-                ),
-                (
-                    "path".to_owned(),
-                    format!("path: {}", worktree.path.display()),
-                ),
-                (
-                    "branch".to_owned(),
-                    format!(
-                        "branch: {}",
-                        worktree.branch.as_deref().unwrap_or("detached")
-                    ),
-                ),
-                (
-                    "head".to_owned(),
-                    format!("HEAD: {}", worktree.head.as_deref().unwrap_or("-")),
-                ),
-                (
-                    "locked".to_owned(),
-                    format!("locked: {}", worktree.locked.as_deref().unwrap_or("no")),
-                ),
-                (
-                    "prunable".to_owned(),
-                    format!("prunable: {}", worktree.prunable.as_deref().unwrap_or("no")),
-                ),
-            ];
-            match self.statuses.get(&worktree.path) {
-                Some(StatusState::Ready(status)) => {
-                    metadata.push((
-                        "upstream".to_owned(),
-                        format!("upstream: {}", status.upstream.as_deref().unwrap_or("-")),
-                    ));
-                    metadata.push(("local".to_owned(), format!("local: {}", status.summary())));
-                }
-                Some(StatusState::Pending) => {
-                    metadata.push(("local".to_owned(), "local: loading".to_owned()))
-                }
-                Some(StatusState::Error(error)) => {
-                    metadata.push(("local".to_owned(), format!("local status error: {error}")))
-                }
-                None => {}
-            }
-            if let Some(github_state) = self.github.get(&worktree.path) {
-                if let GitHubState::Stale { error, .. } = github_state {
-                    metadata.push(("github-stale".to_owned(), format!("GitHub stale: {error}")));
-                }
-                if let Some(data) = github_state.data() {
-                    for (index, warning) in data.warnings.iter().enumerate() {
-                        metadata.push((
-                            format!("github-warning-{index}"),
-                            format!("warning: {warning}"),
-                        ));
-                    }
-                    if let Some(rate_limit) = &data.rate_limit {
-                        metadata.push((
-                            "github-rate-limit".to_owned(),
-                            format!(
-                                "rate limit: {} remaining · resets {}",
-                                rate_limit.remaining, rate_limit.reset_at
-                            ),
-                        ));
-                    }
-                }
-            }
-            for (key, text) in metadata {
-                self.push_inline_row(
-                    rows,
-                    owner.clone(),
-                    InlineSection::Worktree,
-                    depth + 1,
-                    InlineRowKind::Metadata,
-                    text,
-                    None,
-                    None,
-                    RowId::Metadata(owner.clone(), format!("worktree-{key}")),
-                );
-            }
-        }
-
         let Some(github_state) = self.github.get(&worktree.path) else {
             return;
         };
@@ -3903,13 +3764,8 @@ impl App {
     fn semantic_fallback_ids(&self, selected: &RowId) -> Vec<RowId> {
         let mut candidates = Vec::new();
         match selected {
-            RowId::Metadata(owner, key) => {
-                let section = if key.starts_with("worktree-") {
-                    InlineSection::Worktree
-                } else {
-                    InlineSection::Overview
-                };
-                candidates.push(RowId::Section(owner.clone(), section));
+            RowId::Metadata(owner, _) => {
+                candidates.push(RowId::Section(owner.clone(), InlineSection::Overview));
             }
             RowId::Check(identity, name) => {
                 if let Some(section) = self
@@ -4942,13 +4798,11 @@ mod tests {
     }
 
     #[test]
-    fn branch_and_inner_disclosures_survive_refresh_independently() {
+    fn branch_and_stack_disclosures_survive_refresh_independently() {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         let owner = BranchId::Worktree(PathBuf::from("/repo"));
         app.branch_parents
             .insert(PathBuf::from("/repo-topic"), PathBuf::from("/repo"));
-        app.selected = Some(RowId::Section(owner.clone(), InlineSection::Worktree));
-        app.handle_key(key(KeyCode::Char('l')));
         app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
         app.handle_key(key(KeyCode::Char('h')));
         assert!(!app.visible_rows().iter().any(|row| {
@@ -4961,10 +4815,7 @@ mod tests {
         }));
         app.handle_key(key(KeyCode::Char('l')));
         assert!(app.visible_rows().iter().any(|row| {
-            matches!(row, VisibleRow::Inline {
-                id: RowId::Metadata(found, key),
-                ..
-            } if found == &owner && key == "worktree-path")
+            row.id() == &RowId::Section(owner.clone(), InlineSection::StackedBranches)
         }));
 
         app.selected = Some(RowId::Section(
@@ -5008,10 +4859,6 @@ mod tests {
             vec![
                 RowId::Repository(PathBuf::from("/repo.git")),
                 RowId::Worktree(PathBuf::from("/trees/topic")),
-                RowId::Section(
-                    BranchId::Worktree(PathBuf::from("/trees/topic")),
-                    InlineSection::Worktree,
-                ),
             ]
         );
 
@@ -5055,11 +4902,10 @@ mod tests {
     }
 
     #[test]
-    fn dirty_singleton_repository_keeps_worktree_details_without_branch_row() {
+    fn dirty_singleton_repository_has_no_worktree_subtree() {
         let mut singleton = repository("/repo", true);
         singleton.worktrees.truncate(1);
         let path = singleton.worktrees[0].path.clone();
-        let owner = BranchId::Worktree(path.clone());
         let mut app = App::new(vec![singleton], PathBuf::from("/elsewhere"));
         app.statuses.insert(
             path.clone(),
@@ -5069,21 +4915,13 @@ mod tests {
             }),
         );
 
-        let rows = app.visible_rows();
-        assert!(
-            !rows
-                .iter()
-                .any(|row| matches!(row, VisibleRow::Worktree { .. }))
+        assert_eq!(
+            app.visible_rows()
+                .into_iter()
+                .map(|row| row.id().clone())
+                .collect::<Vec<_>>(),
+            vec![RowId::Repository(path)]
         );
-        assert!(rows.iter().any(|row| {
-            matches!(row, VisibleRow::Inline {
-                owner: found,
-                id: RowId::Section(section_owner, InlineSection::Worktree),
-                depth: 1,
-                text,
-                ..
-            } if found == &owner && section_owner == &owner && text == "Worktree · [~1]")
-        }));
     }
 
     #[test]
@@ -5114,11 +4952,6 @@ mod tests {
             !rows
                 .iter()
                 .any(|row| matches!(row, VisibleRow::Worktree { .. }))
-        );
-        assert!(
-            !rows
-                .iter()
-                .any(|row| { row.id() == &RowId::Section(owner.clone(), InlineSection::Worktree) })
         );
         assert!(rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline {
@@ -5285,10 +5118,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(
             app.selected,
-            Some(RowId::Section(
-                BranchId::Worktree(PathBuf::from("/repo")),
-                InlineSection::Worktree,
-            ))
+            Some(RowId::Worktree(PathBuf::from("/repo-topic")))
         );
         app.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(app.selected, Some(RowId::Repository(_))));
@@ -5297,7 +5127,7 @@ mod tests {
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.visible_rows().len(), 1);
         app.handle_key(key(KeyCode::Char('l')));
-        assert_eq!(app.visible_rows().len(), 5);
+        assert_eq!(app.visible_rows().len(), 3);
         app.handle_key(key(KeyCode::Char('/')));
         app.handle_key(key(KeyCode::Char('t')));
         app.handle_key(key(KeyCode::Char('o')));
@@ -5310,21 +5140,11 @@ mod tests {
                 .any(|row| { row.id() == &RowId::Worktree(PathBuf::from("/repo-topic")) })
         );
         app.handle_key(key(KeyCode::Enter));
-        app.selected = Some(RowId::Section(
-            BranchId::Worktree(PathBuf::from("/repo-topic")),
-            InlineSection::Worktree,
-        ));
-        app.handle_key(key(KeyCode::Char('l')));
-        assert!(app.visible_rows().iter().any(|row| {
-            matches!(row, VisibleRow::Inline { id: RowId::Metadata(_, key), .. } if key == "worktree-path")
-        }));
+        app.selected = Some(RowId::Worktree(PathBuf::from("/repo-topic")));
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(
             app.selected,
-            Some(RowId::Section(
-                BranchId::Worktree(PathBuf::from("/repo-topic")),
-                InlineSection::Worktree,
-            ))
+            Some(RowId::Worktree(PathBuf::from("/repo-topic")))
         );
     }
 
@@ -5342,10 +5162,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('G')));
         assert_eq!(
             app.selected,
-            Some(RowId::Section(
-                BranchId::Worktree(PathBuf::from("/repo-5-topic")),
-                InlineSection::Worktree,
-            ))
+            Some(RowId::Worktree(PathBuf::from("/repo-5-topic")))
         );
         app.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(app.selected, Some(RowId::Repository(_))));
@@ -5376,7 +5193,7 @@ mod tests {
 
         app.set_viewport_height(12);
 
-        assert_eq!(app.scroll, 15);
+        assert_eq!(app.scroll, 6);
     }
 
     #[test]
@@ -6469,24 +6286,11 @@ mod tests {
                 |row| matches!(row, VisibleRow::Worktree { id: RowId::Worktree(found), .. } if found == &path)
             ));
         }
-        for (filter, metadata) in [
-            ("/repo-topic", "worktree-path"),
-            ("1234567890", "worktree-head"),
-        ] {
+        for filter in ["/repo-topic", "1234567890"] {
             app.filter = filter.to_owned();
-            let ids = app
-                .visible_rows()
-                .into_iter()
-                .map(|row| row.id().clone())
-                .collect::<Vec<_>>();
-            assert!(ids.contains(&RowId::Section(
-                BranchId::Worktree(path.clone()),
-                InlineSection::Worktree,
-            )));
-            assert!(ids.contains(&RowId::Metadata(
-                BranchId::Worktree(path.clone()),
-                metadata.to_owned(),
-            )));
+            assert!(app.visible_rows().iter().any(
+                |row| matches!(row, VisibleRow::Worktree { id: RowId::Worktree(found), .. } if found == &path)
+            ));
         }
         app.filter.clear();
         let owner = BranchId::Worktree(path);
