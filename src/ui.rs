@@ -116,16 +116,12 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .collect::<Vec<_>>();
                 let singleton = singleton_worktree_index
                     .map(|worktree_index| &repository.worktrees[worktree_index]);
-                let current = singleton
-                    .is_some_and(|worktree| path_contains(&worktree.path, &app.current_directory));
-                let line_width = area.width.saturating_sub(4) as usize;
+                let line_width = area.width.saturating_sub(3) as usize;
                 let mut spans = vec![
+                    location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
                     Span::styled(arrow, Style::default().fg(MUTED)),
                 ];
-                if current {
-                    spans.push(Span::styled("● ", Style::default().fg(SUCCESS)));
-                }
                 spans.push(Span::styled(
                     repository.config.display_label(),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -185,7 +181,6 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             } => {
                 let repository = &app.repositories[*repository_index];
                 let worktree = &repository.worktrees[*worktree_index];
-                let current = path_contains(&worktree.path, &app.current_directory);
                 let identity = worktree_identity(worktree);
                 let github_state = app.github.get(&worktree.path);
                 let pull_request = github_state
@@ -208,19 +203,17 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.github_spinner_frame(),
                 ));
                 let local_state = local_state_spans(app.statuses.get(&worktree.path), worktree);
-                let prefix_width = display_width(&tree_prefix) + 2 + usize::from(current) * 2;
-                let line_width = area.width.saturating_sub(4) as usize;
+                let prefix_width = 2 + display_width(&tree_prefix) + 2;
+                let line_width = area.width.saturating_sub(3) as usize;
                 let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
+                    location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
                     Span::styled(
                         if *expanded { "▾ " } else { "▸ " },
                         Style::default().fg(MUTED),
                     ),
                 ];
-                if current {
-                    spans.push(Span::styled("● ", Style::default().fg(SUCCESS)));
-                }
                 spans.push(Span::styled(
                     truncate_label(&identity, label_width),
                     Style::default().fg(BRANCH),
@@ -255,6 +248,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         .saturating_sub(display_width(&tree_prefix) + display_width(marker)),
                 );
                 ListItem::new(Line::from(vec![
+                    location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
                     Span::styled(
                         format!("{arrow} {label}"),
@@ -279,10 +273,11 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     true,
                     backburnered,
                 );
-                let line_width = area.width.saturating_sub(4) as usize;
-                let prefix_width = display_width(&tree_prefix) + 2;
+                let line_width = area.width.saturating_sub(3) as usize;
+                let prefix_width = 2 + display_width(&tree_prefix) + 2;
                 let label_width = line_width.saturating_sub(prefix_width).max(4);
                 let mut spans = vec![
+                    location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
                     Span::styled(
                         if *expanded { "▾ " } else { "▸ " },
@@ -302,6 +297,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 single_line_tree_item(spans, line_width)
             }
             VisibleRow::Backburner { expanded, .. } => ListItem::new(Line::from(vec![
+                location_marker_span(app, row),
                 Span::styled(tree_prefix, Style::default().fg(MUTED)),
                 Span::styled(
                     format!("{} Backburner", if *expanded { "▾" } else { "▸" }),
@@ -315,11 +311,17 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 expanded,
                 ..
             } => {
-                let line_width = area.width.saturating_sub(4) as usize;
-                single_line_tree_item(
-                    inline_row_spans(*kind, *section, text, *expanded, tree_prefix, line_width),
-                    line_width,
-                )
+                let line_width = area.width.saturating_sub(3) as usize;
+                let mut spans = inline_row_spans(
+                    *kind,
+                    *section,
+                    text,
+                    *expanded,
+                    tree_prefix,
+                    line_width.saturating_sub(2),
+                );
+                spans.insert(0, location_marker_span(app, row));
+                single_line_tree_item(spans, line_width)
             }
         })
         .collect();
@@ -333,7 +335,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let list = List::new(items)
         .block(list_block(app))
         .highlight_style(Style::default().bg(SELECTION).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ")
+        .highlight_symbol("▶")
         .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(list, area, &mut state);
     app.scroll = state.offset();
@@ -345,6 +347,32 @@ fn tree_prefixes(app: &App, rows: &[VisibleRow]) -> Vec<String> {
         .map(|row| visible_row_depth(app, row))
         .collect::<Vec<_>>();
     tree_prefixes_from_depths(&depths)
+}
+
+fn location_marker_span(app: &App, row: &VisibleRow) -> Span<'static> {
+    let current = match row {
+        VisibleRow::Repository {
+            repository_index,
+            singleton_worktree_index: Some(worktree_index),
+            ..
+        } => path_contains(
+            &app.repositories[*repository_index].worktrees[*worktree_index].path,
+            &app.current_directory,
+        ),
+        VisibleRow::Worktree {
+            repository_index,
+            worktree_index,
+            ..
+        } => path_contains(
+            &app.repositories[*repository_index].worktrees[*worktree_index].path,
+            &app.current_directory,
+        ),
+        _ => false,
+    };
+    Span::styled(
+        if current { "● " } else { "  " },
+        Style::default().fg(SUCCESS),
+    )
 }
 
 fn tree_prefixes_from_depths(depths: &[usize]) -> Vec<String> {
@@ -693,11 +721,14 @@ fn pull_request_tree_spans(
     backburnered: bool,
 ) -> Vec<Span<'static>> {
     let summary = details.map(PullRequestDetails::attention_summary);
-    let mut spans = vec![Span::styled(
-        format!(" · PR #{}", pull_request.number),
-        Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD),
-    )];
-    spans.push(tree_label(&pull_request.title, Color::White));
+    let mut spans = Vec::new();
+    if pull_request.state != PullRequestState::Merged {
+        spans.push(Span::styled(
+            format!(" · PR #{}", pull_request.number),
+            Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(tree_label(&pull_request.title, Color::White));
+    }
     match pull_request.state {
         PullRequestState::Draft => spans.push(tree_label("draft", Color::LightBlue)),
         PullRequestState::Merged => spans.push(tree_label("merged", Color::Green)),
@@ -1428,7 +1459,8 @@ mod tests {
             .find(|line| line.contains("project"))
             .unwrap();
         assert!(repository_line.contains("project (main)"));
-        assert!(repository_line.contains("▶ ● project (main)"));
+        assert!(repository_line.contains("▶● project (main)"));
+        assert!(!repository_line.contains("●project"));
         assert!(repository_line.contains('●'));
         assert!(!repository_line.contains('▾'));
         assert!(!repository_line.contains('▸'));
@@ -2141,7 +2173,10 @@ mod tests {
         );
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let merged_buffer = terminal.backend().buffer();
-        assert!(buffer_text(merged_buffer).contains("PR #42 · merged"));
+        let merged = buffer_text(merged_buffer);
+        assert!(merged.contains("· merged"));
+        assert!(!merged.contains("PR #42"));
+        assert!(!merged.contains("merged change"));
         assert!(colored_text(merged_buffer, Color::Green).contains("merged"));
 
         let previous = GitHubBranchData {

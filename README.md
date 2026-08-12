@@ -51,22 +51,22 @@ An ambiguous qualified selector opens the TUI prefiltered instead of guessing. T
 The initial selection is the worktree containing the current directory. The body is one full-width, selectable tree: repositories own local worktree and virtual pull-request branches, and every branch's metadata and attention details are inline. A local PR appears only on its worktree row, or on the compact repository row when a normal repository has exactly one worktree. Local commit ancestry wins when it disagrees with GitHub stack ancestry; each remaining virtual PR is attached once by an unambiguous base/head relationship.
 
 ```text
-▾ acme/web
-  ├─ ▾ ● feature/login · [~1] · PR #42 · Fix login race · checks failing · review required
-  │     ├─ ▸ Overview · open · auto-merge off · conflicts clean
-  │     ├─ ▸ Checks  ✗ 3/4 required
-  │     ├─ ▸ Reviewers  [req, ✗ changes]
-  │     ├─ ▾ Open comments  2 unresolved
-  │     │  └─ @reviewer Handle cancellation (src/login.rs) [outdated]
-  │     └─ ▾ Stacked branches
-  │        └─ ▾ feature/login-ui · PR #43 · Polish login UI · virtual-only
+  ▾ acme/web
+● ├─ ▾ feature/login · [~1] · PR #42 · Fix login race · checks failing · review required
+  │  ├─ ▸ Overview · open · auto-merge off · conflicts clean
+  │  ├─ ▸ Checks  ✗ 3/4 required
+  │  ├─ ▸ Reviewers  [req, ✗ changes]
+  │  ├─ ▾ Open comments  2 unresolved
+  │  │  └─ @reviewer Handle cancellation (src/login.rs) [outdated]
+  │  └─ ▾ Stacked branches
+  │     └─ ▾ feature/login-ui · PR #43 · Polish login UI · virtual-only
   ├─ ▾ chores
   └─ ▸ Backburner
 ```
 
-Tree connectors and disclosures are muted, the current worktree has a green `●`, PR numbers are orange, reviewer names have stable hash-derived colors, and every tree item stays on one display-width-truncated line. Branch rows show title and compact attention status: failed required checks, outstanding or changes-requested reviews, actual conflicts, auto-merge, non-open state, virtual/Backburner state, and local status. Unresolved counts live on the Open comments header instead of being repeated on the branch. `[+N ~N ?N]` means staged, unstaged, and untracked entries; `locked` and `prunable` remain explicit.
+Every row starts with a fixed two-column location gutter: the containing worktree has a green `●` followed by a space, while every other row has two blanks, keeping tree content aligned. Tree connectors and disclosures are muted, PR numbers are orange, reviewer names have stable hash-derived colors, and every tree item stays on one display-width-truncated line. Branch rows show title and compact attention status: failed required checks, outstanding or changes-requested reviews, actual conflicts, auto-merge, non-open state, virtual/Backburner state, and local status. Merged associations retain only the compact `merged` state, omitting their PR number and title. Unresolved counts live on the Open comments header instead of being repeated on the branch. `[+N ~N ?N]` means staged, unstaged, and untracked entries; `locked` and `prunable` remain explicit.
 
-A non-bare repository with exactly one worktree omits the separate branch row and renders as `● repository (branch)`, followed immediately by local status when dirty. Its PR details become direct children; a clean non-PR singleton therefore occupies one selectable line. Bare and multi-worktree repositories retain the full repository → branch hierarchy.
+A non-bare repository with exactly one worktree omits the separate branch row and renders in the location gutter as `● repository (branch)`, followed immediately by local status when dirty. Its PR details become direct children; a clean non-PR singleton therefore occupies one selectable line. Bare and multi-worktree repositories retain the full repository → branch hierarchy.
 
 Disclosure defaults match Rollup while retaining `wt`'s local metadata:
 
