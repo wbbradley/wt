@@ -1,11 +1,22 @@
 # Changelog
 
+## [0.1.3] - 2026-08-13
+
+### Added
+
+- Add Zsh navigation and local tab completion through `wt shell-init zsh`.
+
+### Fixed
+
+- Preserve authored pull-request stacks when worktrees move, disappear, or point at commits shared by multiple pull requests.
+- Select the pull request represented by a local branch using exact head-branch and head-commit matches before deterministic fallback selection.
+- Prevent stale cache identities and partial GitHub refresh failures from hiding unrepresented authored pull requests.
+
 ## [0.1.2] - 2026-08-13
 
 ### Added
 
 - Show the age of the latest successful GitHub refresh in the TUI header.
-- Add Zsh navigation and local tab completion through `wt shell-init zsh`.
 
 ### Changed
 
