@@ -9,7 +9,7 @@ _Screenshot generated from fictional repositories and pull-request data._
 ## Features
 
 - **See all active development in one place.** Browse worktrees across every registered repository alongside branch dirtiness, pull requests, checks, reviews, unresolved comments, conflicts, and stacked work.
-- **Use it like `cd`.** Load the Bash integration, navigate to a worktree, and press Enter; `wt` changes the current shell to that directory. Unique repository-qualified selectors work directly from the command line too.
+- **Use it like `cd`.** Load the Bash or Zsh integration, navigate to a worktree, and press Enter; `wt` changes the current shell to that directory. Unique repository-qualified selectors work directly from the command line too.
 - **Create worktrees quickly.** Press `n` for the common tracked-worktree flow, materialize an authored pull request that is not local yet, or use scriptable commands for advanced creation.
 - **Hand failures to an agent.** Press `c` on a failed check, review comment, pull request, stack, or repository to copy a scoped, agent-ready follow-up prompt with IDs, URLs, and reusable `gh api` commands.
 - **Keep attention focused.** Search every visible and hidden detail, jump between actionable pull requests, copy review-request links, and move lower-priority work to the Backburner.
@@ -52,21 +52,17 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 ### Shell initialization
 
-Shell initialization is currently available for Bash. It installs the navigation wrapper and local tab completion; the wrapper is what lets a TUI selection change the directory of the current shell.
-
-Add this line to the startup file used by your interactive Bash sessions:
+Add one line to your shell startup file:
 
 ```bash
+# Bash
 eval "$(wt shell-init bash)"
+
+# Zsh
+eval "$(wt shell-init zsh)"
 ```
 
-For most Linux terminals that file is `~/.bashrc`. Bash login shells, including Bash used from the macOS Terminal, normally read `~/.bash_profile` instead; either add the line there or have `~/.bash_profile` source `~/.bashrc`. Then open a new shell, or initialize the current one immediately:
-
-```bash
-eval "$(wt shell-init bash)"
-```
-
-When developing from a checkout, `source shell/wt.bash` loads the same integration directly. Re-running either initialization form is safe.
+Restart your shell to load the navigation wrapper and tab completion.
 
 ### First run
 
@@ -82,9 +78,9 @@ Running `wt` opens the global TUI. Running it inside an unregistered Git reposit
 
 Run `wt -x` from a linked worktree when you are finished with it. `wt` safely removes the containing worktree only when it is clean and unlocked, relocates to the registered repository anchor (or `$HOME` if the anchor is unavailable), and then opens the TUI normally. The main worktree and bare anchors remain protected. If the TUI is cancelled after a successful cleanup, the shell still moves to that fallback directory.
 
-## Bash navigation and completion
+## Shell navigation and completion
 
-The integration is self-contained and compatible with Bash 3.2. With the function loaded, `wt` changes the current shell to the worktree selected in the TUI. Cancellation, an empty selection, and failures leave `$PWD` unchanged. Scriptable `config`, `repo`, and `worktree` commands plus shell initialization, help, and version requests pass directly to the binary.
+The integration supports Bash 3.2 and Zsh. With the function loaded, `wt` changes the current shell to the worktree selected in the TUI. Cancellation, an empty selection, and failures leave `$PWD` unchanged. Scriptable `config`, `repo`, and `worktree` commands plus shell initialization, help, and version requests pass directly to the binary.
 
 Navigate without opening the TUI when a branch, worktree basename, or path is unique:
 
@@ -286,7 +282,7 @@ Configured repositories use `<worktree_root>/<sanitized-local-branch>`; otherwis
 - **SSO/SAML or classic PAT error:** authorize the token for the organization or use a token type allowed by its policy.
 - **Rate limited:** `wt` suppresses requests until the reported reset time while retaining stale data.
 - **Removal disabled:** inspect dirtiness, locks, whether the row is the main/bare worktree, and whether it contains the current directory.
-- **Shell does not change directory:** ensure `eval "$(wt shell-init bash)"` runs in the current interactive shell and that `command -v wt` finds the binary. From a development checkout, `source shell/wt.bash` is equivalent.
+- **Shell does not change directory:** ensure the matching `wt shell-init` command runs in the current interactive shell and that `command -v wt` finds the binary.
 - **Terminal looks altered after an external kill:** run `reset`. Normal success, cancellation, errors, Ctrl-C, and panics restore raw mode, cursor visibility, and the alternate screen automatically.
 
 ## Development checks
@@ -296,6 +292,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 bash -n shell/wt.bash
+zsh -n shell/wt.zsh
 ```
 
 ## License

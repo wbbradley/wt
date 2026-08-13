@@ -79,9 +79,11 @@ enum ConfigSetting {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum SupportedShell {
     Bash,
+    Zsh,
 }
 
 const BASH_SHELL_INIT: &str = include_str!("../shell/wt.bash");
+const ZSH_SHELL_INIT: &str = include_str!("../shell/wt.zsh");
 
 #[derive(Debug, Args)]
 struct CompletionArgs {
@@ -345,6 +347,7 @@ pub fn run(cli: Cli) -> Result<Option<PathBuf>, CliError> {
     if let Some(Command::ShellInit { shell }) = cli.command.as_ref() {
         let script = match shell {
             SupportedShell::Bash => BASH_SHELL_INIT,
+            SupportedShell::Zsh => ZSH_SHELL_INIT,
         };
         io::stdout()
             .lock()
@@ -574,6 +577,7 @@ fn completion_candidates(
         "repo" => complete_repo(catalog, words, &mut candidates),
         "shell-init" => {
             candidates.insert("bash".to_owned());
+            candidates.insert("zsh".to_owned());
         }
         "worktree" => complete_worktree(runner, catalog, words, &mut candidates),
         _ => {

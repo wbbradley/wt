@@ -5,6 +5,7 @@
 ### Added
 
 - Show the age of the latest successful GitHub refresh in the TUI header.
+- Add Zsh navigation and local tab completion through `wt shell-init zsh`.
 
 ### Changed
 
