@@ -9,7 +9,7 @@ use crate::github::{GitHubError, PullRequestMapping};
 use crate::model::{
     AuthoredPullRequest, CanonicalPullRequestId, CheckState, GitHubBranchData,
     GitHubRepositoryIdentity, PullRequest, PullRequestDetails, RepositoryConfig,
-    RequiredCheckReadiness, SubmittedReviewState, Worktree, WorktreeStatus,
+    SubmittedReviewState, Worktree, WorktreeStatus,
 };
 use crate::prompt::{
     PromptPullRequest, concise_comment_text, format_agent_prompt, format_review_request,
@@ -1704,33 +1704,37 @@ impl App {
                 .map(|details| details.checks.clone())
                 .unwrap_or_default();
             checks.sort_by_key(|check| (check_attention_rank(check.state), check.source_order));
-            let checks_expanded = self.inline_section_expanded(&owner, InlineSection::Checks);
-            let check_summary = details.map(PullRequestDetails::required_check_summary);
-            let check_state = check_summary
-                .map(|summary| match summary.readiness {
-                    RequiredCheckReadiness::Ready => "success",
-                    RequiredCheckReadiness::Failure => "failure",
-                    RequiredCheckReadiness::Pending => "pending",
-                    RequiredCheckReadiness::Unknown => "unknown",
-                })
-                .unwrap_or("unknown");
-            let ratio = check_summary
-                .map(|summary| summary.ratio_text())
-                .unwrap_or_else(|| "unknown".to_owned());
-            let mut checks_header = format!("Checks · {check_state} · {ratio}");
-            if let Some(optional_failures) = summary
-                .map(|summary| summary.optional_failures)
-                .filter(|failures| *failures > 0)
-            {
-                checks_header.push_str(&format!(
-                    " · {optional_failures} optional {}",
-                    if optional_failures == 1 {
-                        "failure"
-                    } else {
-                        "failures"
-                    }
-                ));
-            }
+            let has_failures = checks.iter().any(|check| check.state.is_actionable());
+            let checks_expanded = self.disclosure_expanded(
+                &DisclosureKey::Section(owner.clone(), InlineSection::Checks),
+                has_failures,
+            );
+            let checks_header = details.map_or_else(
+                || "Checks · counts:?:?:?".to_owned(),
+                |details| {
+                    let valid = details
+                        .checks
+                        .iter()
+                        .filter(|check| {
+                            matches!(
+                                check.state,
+                                CheckState::Success | CheckState::Neutral | CheckState::Skipped
+                            )
+                        })
+                        .count();
+                    let optional_failing = details
+                        .checks
+                        .iter()
+                        .filter(|check| !check.required && check.state.is_actionable())
+                        .count();
+                    let failing = details
+                        .checks
+                        .iter()
+                        .filter(|check| check.required && check.state.is_actionable())
+                        .count();
+                    format!("Checks · counts:{valid}:{optional_failing}:{failing}")
+                },
+            );
             self.push_inline_row(
                 rows,
                 owner.clone(),
@@ -5461,12 +5465,14 @@ mod tests {
         );
         let owner = BranchId::VirtualPullRequest(identity.clone());
         let initial_rows = app.visible_rows();
-        for section in [InlineSection::Overview, InlineSection::Checks] {
-            assert!(initial_rows.iter().any(|row| {
-                matches!(row, VisibleRow::Inline { id: RowId::Section(found_owner, found_section), expanded: Some(false), .. }
-                    if found_owner == &owner && found_section == &section)
-            }));
-        }
+        assert!(initial_rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline { id: RowId::Section(found_owner, InlineSection::Overview), expanded: Some(false), .. }
+                if found_owner == &owner)
+        }));
+        assert!(initial_rows.iter().any(|row| {
+            matches!(row, VisibleRow::Inline { id: RowId::Section(found_owner, InlineSection::Checks), expanded: Some(true), .. }
+                if found_owner == &owner)
+        }));
         assert!(initial_rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline { id: RowId::Section(found_owner, InlineSection::OpenComments), expanded: Some(true), .. }
                 if found_owner == &owner)
@@ -5490,9 +5496,9 @@ mod tests {
             Some(RowId::Section(owner.clone(), InlineSection::Overview))
         );
         assert!(
-            !app.visible_rows()
+            app.visible_rows()
                 .iter()
-                .any(|row| matches!(row.id(), RowId::Check(_, _)))
+                .any(|row| matches!(row.id(), RowId::Check(_, name) if name == "failure"))
         );
         app.selected = Some(RowId::Section(owner.clone(), InlineSection::Checks));
         app.handle_key(key(KeyCode::Char('l')));
@@ -5576,7 +5582,7 @@ mod tests {
         );
         assert!(app.visible_rows().iter().any(|row| {
             matches!(row, VisibleRow::Inline { id: RowId::Section(_, InlineSection::Checks), text, .. }
-                if text.contains("no required checks"))
+                if text == "Checks · counts:0:0:0")
         }));
     }
 
@@ -5731,8 +5737,8 @@ mod tests {
         let rows = app.visible_rows();
         assert!(rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline {
-                id: RowId::Section(found, InlineSection::Checks), text, expanded: Some(false), ..
-            } if found == &owner && text == "Checks · unknown · unknown")
+                id: RowId::Section(found, InlineSection::Checks), text, expanded: Some(true), ..
+            } if found == &owner && text == "Checks · counts:1:0:1")
         }));
         assert!(rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline {
@@ -5849,7 +5855,7 @@ mod tests {
         }];
         let rows = app.visible_rows();
         assert!(rows.iter().any(|row| {
-            matches!(row, VisibleRow::Inline { text, .. } if text == "Checks · unknown · unknown")
+            matches!(row, VisibleRow::Inline { text, .. } if text == "Checks · counts:?:?:?")
         }));
         assert!(rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline { text, .. } if text == "Reviewers · ○ unknown")
@@ -6647,7 +6653,6 @@ mod tests {
                     RowId::Check(identity.clone(), "failure-needle".to_owned()),
                 ],
             ),
-            ("checks failing", vec![repository.clone(), branch.clone()]),
             ("review required", vec![repository.clone(), branch.clone()]),
         ] {
             app.filter = query.to_owned();
@@ -6694,20 +6699,11 @@ mod tests {
 
     #[test]
     fn search_does_not_match_required_metadata_hidden_by_the_check_renderer() {
-        let (mut app, identity) = filter_test_app();
-        app.filter = "required".to_owned();
+        let (mut app, _) = filter_test_app();
+        app.filter = "^required$".to_owned();
         app.filter_active = true;
 
-        let rows = app.visible_rows();
-        assert!(
-            rows.iter()
-                .any(|row| { matches!(row.id(), RowId::Section(_, InlineSection::Checks)) })
-        );
-        assert!(
-            !rows
-                .iter()
-                .any(|row| matches!(row.id(), RowId::Check(found, _) if found == &identity))
-        );
+        assert!(app.visible_rows().is_empty());
     }
 
     #[test]

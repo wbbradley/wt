@@ -271,26 +271,6 @@ pub struct PullRequestAttentionSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RequiredCheckSummary {
-    pub readiness: RequiredCheckReadiness,
-    pub passed: usize,
-    pub total: usize,
-    pub complete: bool,
-}
-
-impl RequiredCheckSummary {
-    pub fn ratio_text(self) -> String {
-        if !self.complete || self.readiness == RequiredCheckReadiness::Unknown {
-            "unknown".to_owned()
-        } else if self.total == 0 {
-            "no required checks".to_owned()
-        } else {
-            format!("{}/{} required", self.passed, self.total)
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewerSummaryToken {
     Requested,
     Approved,
@@ -433,28 +413,6 @@ impl PullRequestDetails {
                 0
             },
             merge_conflict: self.merge_conflict,
-        }
-    }
-
-    pub fn required_check_summary(&self) -> RequiredCheckSummary {
-        let required = self
-            .checks
-            .iter()
-            .filter(|check| check.required)
-            .collect::<Vec<_>>();
-        RequiredCheckSummary {
-            readiness: self.required_check_readiness(),
-            passed: required
-                .iter()
-                .filter(|check| {
-                    matches!(
-                        check.state,
-                        CheckState::Success | CheckState::Neutral | CheckState::Skipped
-                    )
-                })
-                .count(),
-            total: required.len(),
-            complete: self.check_contexts_complete,
         }
     }
 
@@ -900,12 +858,7 @@ mod tests {
             ..PullRequestDetails::default()
         };
 
-        assert_eq!(details.required_check_summary().ratio_text(), "unknown");
         details.check_contexts_complete = true;
-        assert_eq!(
-            details.required_check_summary().ratio_text(),
-            "1/1 required"
-        );
         let reviewers = details.reviewers();
         assert_eq!(reviewers.len(), 1);
         assert!(reviewers[0].requested);

@@ -12,10 +12,7 @@ use regex::{Regex, RegexBuilder};
 use crate::app::{App, GitHubState, InlineRowKind, InlineSection, Modal, StatusState, VisibleRow};
 #[cfg(test)]
 use crate::model::CheckRollup;
-use crate::model::{
-    MergeConflictState, PullRequestDetails, PullRequestState, RequiredCheckReadiness,
-    ReviewReadiness,
-};
+use crate::model::{MergeConflictState, PullRequestDetails, PullRequestState, ReviewReadiness};
 
 const ACCENT: Color = Color::Cyan;
 const BRANCH: Color = Color::LightBlue;
@@ -708,18 +705,43 @@ fn inline_row_spans(
 }
 
 fn append_checks_header_spans(spans: &mut Vec<Span<'static>>, summary: &str) {
-    let mut parts = summary.split(" · ");
-    let state = parts.next().unwrap_or("unknown");
-    let ratio = parts.next().unwrap_or("unknown");
-    let (glyph, style) = readiness_glyph_style(state);
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(glyph, style));
+    let counts = summary.strip_prefix("counts:").map(|counts| {
+        let mut counts = counts.split(':');
+        (
+            counts.next().unwrap_or("?"),
+            counts.next().unwrap_or("?"),
+            counts.next().unwrap_or("?"),
+        )
+    });
+    let Some((valid, optional_failing, failing)) = counts else {
+        return;
+    };
+    spans.push(Span::styled("  [", Style::default().fg(MUTED)));
+    spans.push(Span::styled(
+        valid.to_owned(),
+        Style::default().fg(if valid == "?" { MUTED } else { SUCCESS }),
+    ));
     spans.push(Span::raw(" "));
-    spans.push(Span::styled(ratio.to_owned(), Style::default().fg(MUTED)));
-    for extra in parts {
-        spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
-        spans.push(Span::styled(extra.to_owned(), status_text_style(extra)));
-    }
+    spans.push(Span::styled(
+        optional_failing.to_owned(),
+        Style::default().fg(if optional_failing == "?" {
+            MUTED
+        } else {
+            WARNING
+        }),
+    ));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        failing.to_owned(),
+        Style::default()
+            .fg(if failing == "?" { MUTED } else { DANGER })
+            .add_modifier(if failing == "?" {
+                Modifier::empty()
+            } else {
+                Modifier::BOLD
+            }),
+    ));
+    spans.push(Span::styled("]", Style::default().fg(MUTED)));
 }
 
 fn append_reviewer_header_spans(spans: &mut Vec<Span<'static>>, summary: &str) {
@@ -789,7 +811,10 @@ fn append_check_spans(spans: &mut Vec<Span<'static>>, text: &str) {
         },
     ));
     if !required {
-        spans.push(Span::styled(" (not required)", Style::default().fg(MUTED)));
+        spans.push(Span::styled(
+            " (not required)",
+            Style::default().fg(WARNING),
+        ));
     }
 }
 
@@ -946,12 +971,6 @@ fn pull_request_tree_spans(
         if pull_request.auto_merge {
             spans.push(tree_label("[auto-merge]", SUCCESS));
         }
-        let required_checks = summary
-            .map(|summary| summary.required_checks)
-            .unwrap_or(RequiredCheckReadiness::Unknown);
-        if required_checks == RequiredCheckReadiness::Failure {
-            spans.push(tree_label("checks failing", DANGER));
-        }
         let review = summary
             .map(|summary| summary.review)
             .unwrap_or(ReviewReadiness::Unknown);
@@ -959,7 +978,7 @@ fn pull_request_tree_spans(
             ReviewReadiness::ChangesRequested => {
                 spans.push(tree_label("changes requested", DANGER));
             }
-            ReviewReadiness::Waiting => spans.push(tree_label("review required", WARNING)),
+            ReviewReadiness::Waiting => spans.push(tree_label("review required", DANGER)),
             ReviewReadiness::Approved | ReviewReadiness::Unknown => {}
         }
         match summary.map(|summary| summary.merge_conflict) {
@@ -1892,7 +1911,7 @@ mod tests {
                 checks: vec![
                     PullRequestCheck {
                         name: "required".to_owned(),
-                        state: CheckState::Success,
+                        state: CheckState::Failure,
                         target_url: None,
                         required: true,
                         source_order: 0,
@@ -1961,13 +1980,14 @@ mod tests {
         let red = colored_text(buffer, Color::Red);
         assert!(red.contains("changes requested"));
         assert!(red.contains("conflicts present"));
+        assert!(!content.contains("checks failing"));
         assert!(content.contains("head: viewer/fork:"));
         assert!(content.contains("head SHA: head-sha"));
         assert!(content.contains("changes requested"));
         assert!(content.contains("auto-merge: enabled"));
         assert!(content.contains("h/l collapse/expand · Enter/w opens"));
         assert!(content.contains("Overview · draft · auto-merge enabled · conflicts conflicting"));
-        assert!(content.contains("Checks  ✓ 1/1 required · 1 optional failure"));
+        assert!(content.contains("Checks  [0 1 1]"));
         assert!(content.contains("Reviewers  [✗ changes]"));
         assert!(content.contains("Open comments  1 unresolved"));
         assert!(!content.contains("unresolved comment"));
@@ -2034,7 +2054,7 @@ mod tests {
         let checks = inline_row_spans(
             InlineRowKind::Section,
             InlineSection::Checks,
-            "Checks · failure · 1/2 required",
+            "Checks · counts:7:2:3",
             Some(false),
             String::new(),
             80,
@@ -2044,9 +2064,27 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "▸ Checks  ✗ 1/2 required"
+            "▸ Checks  [7 2 3]"
         );
-        let failure = checks.iter().find(|span| span.content == "✗").unwrap();
+        assert_eq!(
+            checks
+                .iter()
+                .find(|span| span.content == "7")
+                .unwrap()
+                .style
+                .fg,
+            Some(SUCCESS)
+        );
+        assert_eq!(
+            checks
+                .iter()
+                .find(|span| span.content == "2")
+                .unwrap()
+                .style
+                .fg,
+            Some(WARNING)
+        );
+        let failure = checks.iter().find(|span| span.content == "3").unwrap();
         assert_eq!(failure.style.fg, Some(DANGER));
         assert!(failure.style.add_modifier.contains(Modifier::BOLD));
 
@@ -2115,7 +2153,15 @@ mod tests {
             );
             let glyph_span = spans.iter().find(|span| span.content == glyph).unwrap();
             assert_eq!(glyph_span.style.fg, Some(color));
-            assert!(spans.iter().any(|span| span.content == " (not required)"));
+            assert_eq!(
+                spans
+                    .iter()
+                    .find(|span| span.content == " (not required)")
+                    .unwrap()
+                    .style
+                    .fg,
+                Some(WARNING)
+            );
             if state == "skipped" {
                 assert!(
                     glyph_span
@@ -2521,6 +2567,20 @@ mod tests {
         .map(|span| span.content.into_owned())
         .collect::<String>();
         assert_eq!(merged_labels, " · merged");
+
+        let mut active_pull_request = merged_pull_request.clone();
+        active_pull_request.state = PullRequestState::Open;
+        let review_required = pull_request_tree_spans(
+            &active_pull_request,
+            Some(&stale_active_details),
+            false,
+            false,
+            false,
+        )
+        .into_iter()
+        .find(|span| span.content.contains("review required"))
+        .unwrap();
+        assert_eq!(review_required.style.fg, Some(DANGER));
 
         let previous = GitHubBranchData {
             pull_request: None,
