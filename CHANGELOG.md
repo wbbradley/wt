@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.4] - 2026-08-13
+
+### Added
+
+- Show context-sensitive `Enter` and `w` action hints for the selected repository, worktree, pull request, section, check, or comment.
+
+### Changed
+
+- Use a shorter list heading and describe horizontal navigation as folding.
+
+### Fixed
+
+- Open a pull request's Checks page when activating its Checks section with `Enter` or `w`, instead of opening the pull request overview.
+
 ## [0.1.3] - 2026-08-13
 
 ### Added
