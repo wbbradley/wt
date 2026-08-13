@@ -93,7 +93,15 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
         }
 
         if !pull_request.checks.is_empty() {
-            output.push_str("\nChecks:\n");
+            if pull_request
+                .checks
+                .iter()
+                .all(|check| check.state.is_actionable())
+            {
+                output.push_str("\nChecks (all failed):\n");
+            } else {
+                output.push_str("\nChecks:\n");
+            }
             for check in &pull_request.checks {
                 let url = check
                     .target_url
@@ -309,7 +317,7 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "In feature (#42 Fix feedback):\n\nComment IDs:\n  - 91 - Summary • split this line • follow up\n\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/comments/$comment_id --jq '{id,path,line,body,created_at,updated_at}'\n```\n\nReview IDs:\n  - 92 - Please add coverage\n\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/42/reviews/$review_id --jq '{id,body,state,submitted_at}'\n```\n\nChecks:\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nUse a worktree if the relevant branches are not already active in the current worktree."
+            "In feature (#42 Fix feedback):\n\nComment IDs:\n  - 91 - Summary • split this line • follow up\n\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/comments/$comment_id --jq '{id,path,line,body,created_at,updated_at}'\n```\n\nReview IDs:\n  - 92 - Please add coverage\n\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/42/reviews/$review_id --jq '{id,body,state,submitted_at}'\n```\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nUse a worktree if the relevant branches are not already active in the current worktree."
         );
         assert!(!actual.contains("https://git.example.com/comment/91"));
         assert!(!actual.contains("not merge-required"));

@@ -5963,6 +5963,7 @@ mod tests {
 
         app.selected = Some(RowId::Check(parent.identity.clone(), "check-1".to_owned()));
         let single = app.agent_prompt().unwrap();
+        assert!(single.contains("Checks (all failed):"));
         assert!(single.contains("check-1"));
         assert!(!single.contains("feedback-1"));
         assert!(!single.contains("PR #2"));
@@ -5975,7 +5976,7 @@ mod tests {
         assert!(feedback.contains("feedback-1"));
         assert!(!feedback.contains("check-1"));
         assert!(!feedback.contains("(#2 "));
-        assert!(!feedback.contains("Checks:"));
+        assert!(!feedback.contains("Checks"));
         assert!(!feedback.contains("failing checks"));
 
         app.selected = Some(RowId::Reviewer(
