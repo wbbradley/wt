@@ -278,12 +278,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ..
             } => {
                 let repository = &app.repositories[*repository_index];
-                let arrow = if !has_children {
-                    ""
-                } else if *expanded {
-                    "▾ "
+                let tree_prefix = if *has_children {
+                    disclosure_tree_prefix(tree_prefix, *expanded)
                 } else {
-                    "▸ "
+                    tree_prefix
                 };
                 let states = [
                     repository.is_bare().then_some(("bare", BRANCH)),
@@ -306,7 +304,6 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 let mut spans = vec![
                     location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
-                    Span::styled(arrow, Style::default().fg(MUTED)),
                 ];
                 spans.push(Span::styled(
                     repository.config.display_label(),
@@ -404,16 +401,20 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.github_spinner_frame(),
                 ));
                 let local_state = local_state_spans(app.statuses.get(&worktree.path), worktree);
-                let prefix_width = 2 + display_width(&tree_prefix) + 2;
+                let tree_prefix = disclosure_tree_prefix(tree_prefix, *expanded);
+                let prefix_width = 2 + display_width(&tree_prefix);
                 let line_width = area.width.saturating_sub(3) as usize;
-                let label_width = line_width.saturating_sub(prefix_width).max(4);
+                let priority_suffix_width = local_state
+                    .iter()
+                    .chain(suffix.first())
+                    .map(|span| span.width())
+                    .sum::<usize>();
+                let label_width = line_width
+                    .saturating_sub(prefix_width + priority_suffix_width + 1)
+                    .max(4);
                 let mut spans = vec![
                     location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
-                    Span::styled(
-                        if *expanded { "▾ " } else { "▸ " },
-                        Style::default().fg(MUTED),
-                    ),
                 ];
                 spans.push(Span::styled(
                     truncate_label(&identity, label_width),
@@ -436,11 +437,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ..
             } => {
                 let repository = &app.virtual_repositories[*virtual_repository_index];
-                let arrow = if app.virtual_repository_expanded(*virtual_repository_index) {
-                    "▾"
-                } else {
-                    "▸"
-                };
+                let tree_prefix = disclosure_tree_prefix(
+                    tree_prefix,
+                    app.virtual_repository_expanded(*virtual_repository_index),
+                );
                 let marker = if repository.mapped_repository.is_none() {
                     " [no local repo]"
                 } else {
@@ -456,7 +456,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         location_marker_span(app, row),
                         Span::styled(tree_prefix, Style::default().fg(MUTED)),
                         Span::styled(
-                            format!("{arrow} {label}"),
+                            label,
                             Style::default().fg(REMOTE).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(marker, Style::default().fg(WARNING)),
@@ -481,16 +481,17 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     backburnered,
                     false,
                 );
+                let tree_prefix = disclosure_tree_prefix(tree_prefix, *expanded);
                 let line_width = area.width.saturating_sub(3) as usize;
-                let prefix_width = 2 + display_width(&tree_prefix) + 2;
-                let label_width = line_width.saturating_sub(prefix_width).max(4);
+                let prefix_width = 2 + display_width(&tree_prefix);
+                let priority_suffix_width =
+                    suffix.first().map(|span| span.width()).unwrap_or_default();
+                let label_width = line_width
+                    .saturating_sub(prefix_width + priority_suffix_width + 1)
+                    .max(4);
                 let mut spans = vec![
                     location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
-                    Span::styled(
-                        if *expanded { "▾ " } else { "▸ " },
-                        Style::default().fg(MUTED),
-                    ),
                     Span::styled(
                         truncate_label(&pull_request.pull_request.head.branch, label_width),
                         Style::default().fg(REMOTE),
@@ -508,12 +509,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 )
             }
             VisibleRow::Backburner { expanded, .. } => {
+                let tree_prefix = disclosure_tree_prefix(tree_prefix, *expanded);
                 ListItem::new(Line::from(highlight_search_matches(
                     vec![
                         location_marker_span(app, row),
                         Span::styled(tree_prefix, Style::default().fg(MUTED)),
                         Span::styled(
-                            format!("{} Backburner", if *expanded { "▾" } else { "▸" }),
+                            "Backburner",
                             Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
                         ),
                     ],
@@ -605,10 +607,15 @@ fn tree_prefixes_from_depths(depths: &[usize]) -> Vec<String> {
         .enumerate()
         .map(|(index, depth)| {
             if *depth == 0 {
-                return String::new();
+                let has_earlier_root = depths[..index].contains(&0);
+                return match (has_earlier_root, has_later_sibling(depths, index, 0)) {
+                    (false, true) => "┌─ ".to_owned(),
+                    (true, true) => "├─ ".to_owned(),
+                    (_, false) => "└─ ".to_owned(),
+                };
             }
             let mut prefix = String::new();
-            for ancestor_depth in 1..*depth {
+            for ancestor_depth in 0..*depth {
                 let ancestor = (0..index)
                     .rev()
                     .find(|candidate| depths[*candidate] == ancestor_depth)
@@ -627,6 +634,13 @@ fn tree_prefixes_from_depths(depths: &[usize]) -> Vec<String> {
             prefix
         })
         .collect()
+}
+
+fn disclosure_tree_prefix(prefix: String, expanded: bool) -> String {
+    let stem = prefix
+        .strip_suffix(' ')
+        .expect("tree row prefix must end in spacing");
+    format!("{stem}{}", if expanded { '▾' } else { '▸' })
 }
 
 fn has_later_sibling(depths: &[usize], index: usize, depth: usize) -> bool {
@@ -670,13 +684,12 @@ fn inline_row_spans(
     tree_prefix: String,
     line_width: usize,
 ) -> Vec<Span<'static>> {
+    let tree_prefix = match expanded {
+        Some(expanded) if tree_prefix.is_empty() => (if expanded { '▾' } else { '▸' }).to_string(),
+        Some(expanded) => disclosure_tree_prefix(tree_prefix, expanded),
+        None => tree_prefix,
+    };
     let mut spans = vec![Span::styled(tree_prefix, Style::default().fg(MUTED))];
-    if let Some(expanded) = expanded {
-        spans.push(Span::styled(
-            if expanded { "▾ " } else { "▸ " },
-            Style::default().fg(MUTED),
-        ));
-    }
     if kind == InlineRowKind::Section {
         let (label, summary) = text.split_once(" · ").unwrap_or((text, ""));
         spans.push(Span::styled(
@@ -1334,7 +1347,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         shortcut_line(&[
             ("j/k", "move"),
-            ("[/]", "issues"),
+            ("]", "next issue"),
             ("h/l", "fold"),
             ("/", "search"),
             ("r", "refresh"),
@@ -1785,7 +1798,7 @@ mod tests {
             .find(|line| line.contains("project"))
             .unwrap();
         assert!(repository_line.contains("project (main)"));
-        assert!(repository_line.contains("▶● project (main)"));
+        assert!(repository_line.contains("▶● └─ project (main)"));
         assert!(!repository_line.contains("●project"));
         assert!(repository_line.contains('●'));
         assert!(!repository_line.contains('▾'));
@@ -1837,9 +1850,10 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
-        assert!(content.contains("▾ parent"));
+        assert!(content.contains("└─▾project"));
+        assert!(content.contains("└─▾parent"));
         assert!(content.contains("Stacked worktrees"));
-        assert!(content.contains("▾ child"));
+        assert!(content.contains("└─▾child"));
         assert!(!content.contains("Worktree ·"));
         assert!(colored_text(buffer, MUTED).contains("Stacked worktrees"));
     }
@@ -1989,7 +2003,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
-        assert!(content.contains("└─ ▾ feature/compact-attention"));
+        assert!(content.contains("└─▾feature/compact-attention"));
         assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
         assert!(content.contains("PR #42"));
         assert!(content.contains("virtual feature"));
@@ -2088,7 +2102,7 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "▸ Checks  [7 2 3]"
+            "▸Checks  [7 2 3]"
         );
         assert_eq!(
             checks
@@ -2260,7 +2274,7 @@ mod tests {
         let branch_style = Style::default().fg(BRANCH);
         let pr_style = Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD);
         let spans = vec![
-            Span::styled("└─ ▾ ", connector_style),
+            Span::styled("└─▾", connector_style),
             Span::styled("界界-branch", branch_style),
             Span::styled(" · PR #42", pr_style),
             Span::styled(" · 長い Unicode title", Style::default()),
@@ -2274,7 +2288,7 @@ mod tests {
         assert!(line.width() <= 26);
         assert!(
             visible.iter().any(|span| {
-                span.content.contains("└─ ▾") && span.style == connector_style
+                span.content.contains("└─▾") && span.style == connector_style
             })
         );
         assert!(
@@ -2323,8 +2337,11 @@ mod tests {
     fn tree_prefixes_render_siblings_ancestry_and_roots() {
         assert_eq!(
             tree_prefixes_from_depths(&[0, 1, 2, 1, 0, 1]),
-            ["", "├─ ", "│  └─ ", "└─ ", "", "└─ "]
+            ["┌─ ", "│  ├─ ", "│  │  └─ ", "│  └─ ", "└─ ", "   └─ ",]
         );
+        assert_eq!(tree_prefixes_from_depths(&[0, 0, 0]), ["┌─ ", "├─ ", "└─ "]);
+        assert_eq!(disclosure_tree_prefix("├─ ".to_owned(), true), "├─▾");
+        assert_eq!(disclosure_tree_prefix("└─ ".to_owned(), false), "└─▸");
     }
 
     #[test]
@@ -2390,7 +2407,7 @@ mod tests {
         for expected in ["c prompt", "p review", "n create", "P prune"] {
             assert!(shortcut_content.contains(expected), "missing {expected}");
         }
-        assert!(shortcut_content.contains("[/] issues"));
+        assert!(shortcut_content.contains("] next issue"));
         assert!(shortcut_content.contains("/ search"));
         assert!(!shortcut_content.contains("a register"));
 

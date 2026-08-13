@@ -109,17 +109,17 @@ not a separate PR node. A virtual-only authored PR uses the same branch-node pre
 `virtual-only` marker and keeps Enter-to-materialize behavior.
 
 ```text
-  ▾ acme/web
-● ├─ ▾ feature/login · [~1] · PR #42 · Fix login race
-  │  ├─ ▸ Overview · open · auto-merge off · conflicts clean
-  │  ├─ ▸ Checks ✗ 3/4 required
-  │  ├─ ▸ Reviewers [req, ✗ changes]
-  │  ├─ ▾ Open comments
-  │  │  └─ @reviewer Handle cancellation (src/login.rs) [outdated]
-  │  └─ ▾ Stacked branches
-  │     └─ ▾ feature/login-ui · PR #43 · Polish login UI
-  ├─ chores
-  └─ ▸ Backburner
+  └─▾acme/web
+●    ├─▾feature/login · [~1] · PR #42 · Fix login race
+     │  ├─▸Overview · open · auto-merge off · conflicts clean
+     │  ├─▸Checks ✗ 3/4 required
+     │  ├─▸Reviewers [req, ✗ changes]
+     │  ├─▾Open comments
+     │  │  └─ @reviewer Handle cancellation (src/login.rs) [outdated]
+     │  └─▾Stacked branches
+     │     └─▾feature/login-ui · PR #43 · Polish login UI
+     ├─ chores
+     └─▸Backburner
 ```
 
 The exact line is width-aware, but its information order is intentional:
