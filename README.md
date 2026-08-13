@@ -1,6 +1,19 @@
 # wt
 
-`wt` is a global Git worktree manager. It keeps a catalog of repositories, presents all of their worktrees in one terminal UI, performs guarded worktree operations, and optionally enriches branches with GitHub pull-request status. It also discovers your open authored pull requests and can safely turn a virtual PR row into a persistent local repository and linked worktree.
+`wt` is a global Git worktree manager for seeing active development at a glance and jumping straight into the branch that needs attention. It combines worktree navigation, creation, cleanup, and GitHub pull-request status in one terminal UI.
+
+![The wt terminal UI showing sanitized example repositories, worktrees, pull requests, checks, and review comments](docs/assets/wt-overview.png)
+
+_Screenshot generated from fictional repositories and pull-request data._
+
+## Features
+
+- **See all active development in one place.** Browse worktrees across every registered repository alongside branch dirtiness, pull requests, checks, reviews, unresolved comments, conflicts, and stacked work.
+- **Use it like `cd`.** Load the Bash integration, navigate to a worktree, and press Enter; `wt` changes the current shell to that directory. Unique repository-qualified selectors work directly from the command line too.
+- **Create worktrees quickly.** Press `n` for the common tracked-worktree flow, materialize an authored pull request that is not local yet, or use scriptable commands for advanced creation.
+- **Hand failures to an agent.** Press `c` on a failed check, review comment, pull request, stack, or repository to copy a scoped, agent-ready follow-up prompt with IDs, URLs, and reusable `gh api` commands.
+- **Keep attention focused.** Search every visible and hidden detail, jump between actionable pull requests, copy review-request links, and move lower-priority work to the Backburner.
+- **Operate safely.** Preview and confirm mutations, refuse unsafe removal by default, and clean up merged worktrees only after live GitHub and local-state revalidation.
 
 Local repository and worktree data renders first. The most recent GitHub snapshot is loaded from a machine-local cache for the first frame, then status and GitHub requests run in the background. Unavailable repositories, missing credentials, network failures, and rate limits do not block navigation or local operations.
 

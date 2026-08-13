@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.2] - 2026-08-13
+
+### Added
+
+- Show the age of the latest successful GitHub refresh in the TUI header.
+
+### Changed
+
+- Render clearer, continuous tree connectors across repositories and nested rows.
+- Preserve priority and local-status details when truncating long branch labels.
+
+### Fixed
+
+- Label copied actionable check selections as `Checks (all failed)` to make their status explicit.
+- Describe `]` accurately as the next-issue shortcut in the footer; `[` still navigates to the previous issue.
+
 ## [0.1.1] - 2026-08-12
 
 ### Added
