@@ -1599,6 +1599,7 @@ impl App {
         mut context: Vec<(String, String)>,
     ) {
         let pr_url = pull_request.url.clone();
+        let checks_url = format!("{}/checks", pr_url.trim_end_matches('/'));
         if pull_request.state != crate::model::PullRequestState::Merged {
             context.extend([
                 ("url".to_owned(), format!("URL: {}", pull_request.url)),
@@ -1750,7 +1751,7 @@ impl App {
                 depth,
                 InlineRowKind::Section,
                 checks_header,
-                Some(pr_url.clone()),
+                Some(checks_url),
                 Some(checks_expanded),
                 RowId::Section(owner.clone(), InlineSection::Checks),
             );
@@ -5539,6 +5540,14 @@ mod tests {
                 }
             )
         }));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Intent::OpenUrl(format!("{}/checks", authored.pull_request.url))
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('w'))),
+            Intent::OpenUrl(format!("{}/checks", authored.pull_request.url))
+        );
 
         app.selected = Some(RowId::Check(identity.clone(), "failure".to_owned()));
         app.handle_key(key(KeyCode::Char('h')));

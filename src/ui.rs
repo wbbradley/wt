@@ -669,11 +669,54 @@ fn visible_row_depth(app: &App, row: &VisibleRow) -> usize {
 }
 
 fn list_block(app: &App) -> Block<'static> {
-    let _ = app;
     Block::default()
-        .title(" Repositories / Worktrees / Authored PRs · h/l collapse/expand · Enter/w opens ")
+        .title(format!(
+            " Repos / Worktrees / PRs · h/l fold · {} ",
+            list_selection_hint(app)
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
+}
+
+fn list_selection_hint(app: &App) -> &'static str {
+    let Some(row) = app.selected_row() else {
+        return "Enter selects";
+    };
+    match row {
+        VisibleRow::Repository {
+            singleton_worktree_index,
+            ..
+        } => match (
+            singleton_worktree_index.is_some(),
+            app.selected_pull_request_url().is_some(),
+        ) {
+            (true, true) => "Enter selects · w opens PR",
+            (true, false) => "Enter selects",
+            (false, _) => "Enter toggles",
+        },
+        VisibleRow::Worktree { .. } => {
+            if app.selected_pull_request_url().is_some() {
+                "Enter selects · w opens PR"
+            } else {
+                "Enter selects"
+            }
+        }
+        VisibleRow::VirtualPullRequest { .. } => "Enter creates · w opens PR",
+        VisibleRow::VirtualRepository { .. } | VisibleRow::Backburner { .. } => "Enter toggles",
+        VisibleRow::Inline {
+            kind, section, url, ..
+        } => {
+            let opens_item_url = url
+                .as_ref()
+                .is_some_and(|url| app.selected_pull_request_url().as_ref() != Some(url));
+            match (kind, section, opens_item_url) {
+                (InlineRowKind::Section, InlineSection::Checks, _) => "Enter/w opens Checks",
+                (InlineRowKind::Check, _, true) => "Enter/w opens Check",
+                (InlineRowKind::OpenComment, _, true) => "Enter/w opens Comment",
+                _ => "Enter/w opens PR",
+            }
+        }
+    }
 }
 
 fn inline_row_spans(
@@ -1950,7 +1993,7 @@ mod tests {
                     PullRequestCheck {
                         name: "required".to_owned(),
                         state: CheckState::Failure,
-                        target_url: None,
+                        target_url: Some("https://ci.example/check/required".to_owned()),
                         required: true,
                         source_order: 0,
                         completed_at: None,
@@ -1981,7 +2024,7 @@ mod tests {
                     author: "reviewer".to_owned(),
                     body: "fix this".to_owned(),
                     path: Some("src/lib.rs".to_owned()),
-                    permalink: None,
+                    permalink: Some("https://github.com/base/project/pull/42#comment".to_owned()),
                     outdated: false,
                 }],
                 feedback_complete: true,
@@ -1990,6 +2033,25 @@ mod tests {
                 ..PullRequestDetails::default()
             },
         );
+        app.selected = Some(RowId::Section(
+            BranchId::VirtualPullRequest(pull_request_id.clone()),
+            InlineSection::Overview,
+        ));
+        assert_eq!(list_selection_hint(&app), "Enter/w opens PR");
+        app.selected = Some(RowId::Section(
+            BranchId::VirtualPullRequest(pull_request_id.clone()),
+            InlineSection::Checks,
+        ));
+        assert_eq!(list_selection_hint(&app), "Enter/w opens Checks");
+        app.selected = Some(RowId::Check(pull_request_id.clone(), "required".to_owned()));
+        assert_eq!(list_selection_hint(&app), "Enter/w opens Check");
+        app.selected = Some(RowId::OpenComment(
+            pull_request_id.clone(),
+            "comment".to_owned(),
+        ));
+        assert_eq!(list_selection_hint(&app), "Enter/w opens Comment");
+        app.selected = Some(RowId::VirtualPullRequest(pull_request_id.clone()));
+        assert_eq!(list_selection_hint(&app), "Enter creates · w opens PR");
         app.selected = Some(RowId::Section(
             BranchId::VirtualPullRequest(pull_request_id.clone()),
             InlineSection::Overview,
@@ -2023,7 +2085,7 @@ mod tests {
         assert!(content.contains("head SHA: head-sha"));
         assert!(content.contains("changes requested"));
         assert!(content.contains("auto-merge: enabled"));
-        assert!(content.contains("h/l collapse/expand · Enter/w opens"));
+        assert!(content.contains("h/l fold · Enter/w opens PR"));
         assert!(content.contains("Overview · draft · auto-merge enabled · conflicts conflicting"));
         assert!(content.contains("Checks  [0 1 1]"));
         assert!(content.contains("Reviewers  [✗ changes]"));
