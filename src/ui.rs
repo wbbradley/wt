@@ -1524,12 +1524,7 @@ fn header_progress(app: &App) -> String {
             app.authored_pull_requests
                 .current_host
                 .as_ref()
-                .map(|host| {
-                    format!(
-                        "loading authored PRs: {host} page {}",
-                        app.authored_pull_requests.current_page
-                    )
-                })
+                .map(|host| format!("loading authored PRs: {host}"))
                 .unwrap_or_else(|| "loading authored PRs".to_owned()),
         );
     } else if app.authored_pull_requests.stale_error.is_some() {
@@ -2578,6 +2573,20 @@ mod tests {
         let status = buffer_text(terminal.backend().buffer());
         assert!(status.contains("·  performing operation…"));
         assert!(status.contains("error: clipboard unavailable"));
+
+        app.progress = None;
+        let generation = app.authored_pull_requests.begin();
+        app.authored_pull_requests.apply_page(
+            generation,
+            "github.com".to_owned(),
+            1,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            header_progress(&app),
+            "  ·  loading authored PRs: github.com"
+        );
 
         app.inline_error = None;
         app.modal = Some(Modal::Confirm {
