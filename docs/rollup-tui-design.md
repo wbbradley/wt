@@ -85,8 +85,10 @@ The remaining differences are deliberate:
   status and PR sections remain direct children. Bare and multi-worktree repositories keep explicit
   branch rows.
 - Local commit ancestry wins in `wt`; GitHub base/head ancestry attaches only otherwise-unrepresented
-  virtual PRs. This permits one mixed local/virtual tree without duplicating a PR. Rollup's Authored
-  tree is PR-only and uses merge-target ancestry.
+  virtual PRs. Commit associations are candidates rather than proof that every associated PR is
+  locally represented: an exact head branch wins, then an exact head SHA, and one local row suppresses
+  only its selected PR. Other authored associations remain virtual, preserving mixed stacks when
+  worktrees move. Rollup's Authored tree is PR-only and uses merge-target ancestry.
 - Enter can select a local worktree or materialize a virtual PR after a live head-SHA check. Rollup
   opens the selected GitHub item and has no worktree-materialization lifecycle.
 - `wt` keeps its orange PR numbers and green current-worktree marker. Its branch row begins with the
@@ -222,15 +224,18 @@ Defaults are computed only when a key has no explicit value. Refresh reconciles 
 Building rows and resolving actions must share the same semantic branch topology:
 
 1. create one node for every non-bare local worktree;
-2. attach its active PR details when available;
+2. select at most one associated PR for it, preferring an exact head branch and then exact head SHA,
+   and attach that PR's details when available;
 3. create one node for every remaining virtual-only authored PR;
 4. choose local worktree ancestry first;
 5. attach remaining virtual nodes by unambiguous PR head/base ancestry;
 6. break cycles and ambiguous parentage into repository roots, as today;
 7. apply filtering, Backburner visibility, and disclosure while flattening.
 
-This prevents a local PR from reappearing as a virtual row and lets a mixed local/virtual stack have
-one selection and one subtree scope.
+Only the selected local PR is removed from the authored virtual set. This prevents that PR from
+reappearing as a virtual row while leaving every other commit association available for GitHub
+base/head attachment, so a mixed local/virtual stack keeps one selection and one subtree scope even
+when its worktrees are repointed or removed.
 
 ## Interaction behavior
 

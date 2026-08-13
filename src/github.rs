@@ -1055,8 +1055,6 @@ impl GitHubService {
                 header_reset_epoch(response.headers()),
             );
         }
-        let active_pull_requests =
-            canonical_associated_pull_requests(&data, targets.len(), &remote.host);
         let (outcomes, associations) = parse_batch_data(
             &data,
             targets,
@@ -1065,6 +1063,12 @@ impl GitHubService {
             rate,
             &remote.host,
         )?;
+        let active_pull_requests = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().ok())
+            .filter_map(|data| data.pull_request.as_ref())
+            .filter_map(|pull_request| canonical_pull_request_id(&remote.host, pull_request))
+            .collect();
         Ok(BranchBatchRefresh {
             branches: outcomes,
             associations,
@@ -1540,25 +1544,6 @@ fn parse_authored_page(
     })
 }
 
-fn canonical_associated_pull_requests(
-    data: &Value,
-    target_count: usize,
-    host: &str,
-) -> HashSet<CanonicalPullRequestId> {
-    (0..target_count)
-        .flat_map(|index| {
-            data.pointer(&format!(
-                "/repository/branch{index}/associatedPullRequests/nodes"
-            ))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        })
-        .filter_map(|node| normalize_pull_request(node).ok())
-        .filter_map(|pull_request| canonical_pull_request_id(host, &pull_request))
-        .collect()
-}
-
 impl Default for GitHubService {
     fn default() -> Self {
         Self::new()
@@ -1960,7 +1945,7 @@ fn parse_batch_data(
                 })
                 .collect()
         };
-        let pull_request = prefer_pull_request(pull_requests);
+        let pull_request = prefer_pull_request(pull_requests, target);
         let mut branch_warnings = warnings.to_vec();
         branch_warnings.extend(malformed);
         outcomes.push(Ok(GitHubBranchData {
@@ -2055,9 +2040,25 @@ fn check_rollup(state: &str) -> CheckRollup {
     }
 }
 
-fn prefer_pull_request(mut pull_requests: Vec<PullRequest>) -> Option<PullRequest> {
+fn prefer_pull_request(
+    mut pull_requests: Vec<PullRequest>,
+    target: &BranchTarget,
+) -> Option<PullRequest> {
     pull_requests.sort_by(|left, right| {
-        let priority = |pull_request: &PullRequest| {
+        let match_priority = |pull_request: &PullRequest| {
+            if pull_request.head.branch == target.branch {
+                0
+            } else if target
+                .head
+                .as_deref()
+                .is_some_and(|head| pull_request.head.oid.as_deref() == Some(head))
+            {
+                1
+            } else {
+                2
+            }
+        };
+        let state_priority = |pull_request: &PullRequest| {
             if matches!(
                 pull_request.state,
                 PullRequestState::Open | PullRequestState::Draft
@@ -2067,9 +2068,13 @@ fn prefer_pull_request(mut pull_requests: Vec<PullRequest>) -> Option<PullReques
                 1
             }
         };
-        priority(left)
-            .cmp(&priority(right))
+        match_priority(left)
+            .cmp(&match_priority(right))
+            .then_with(|| state_priority(left).cmp(&state_priority(right)))
             .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.base.repository.cmp(&right.base.repository))
+            .then_with(|| left.number.cmp(&right.number))
+            .then_with(|| left.url.cmp(&right.url))
     });
     pull_requests.into_iter().next()
 }
@@ -3152,45 +3157,160 @@ mod tests {
     }
 
     #[test]
-    fn every_associated_pr_identity_marks_an_active_worktree() {
-        let pull_request = |number: u64, owner: &str| {
-            serde_json::json!({
-                "number": number,
-                "title": "change",
-                "url": format!("https://github.com/{owner}/project/pull/{number}"),
-                "state": "OPEN",
-                "isDraft": false,
-                "mergedAt": null,
-                "updatedAt": "2026-01-01T00:00:00Z",
-                "reviewDecision": null,
-                "baseRefName": "main",
-                "baseRefOid": "base",
-                "baseRepository": {"nameWithOwner": format!("{owner}/project")},
-                "headRefName": "topic",
-                "headRefOid": "head",
-                "headRepository": {"nameWithOwner": "contributor/fork"},
-                "commits": {"nodes": []}
-            })
+    fn only_the_selected_associated_pr_marks_a_worktree_active() {
+        let mut exact_branch = authored_node(1, "viewer", false);
+        exact_branch["headRefName"] = Value::String("topic-0".to_owned());
+        exact_branch["headRefOid"] = Value::String("branch-head".to_owned());
+        exact_branch["updatedAt"] = Value::String("2026-01-01T00:00:00Z".to_owned());
+        let mut newer_descendant = authored_node(2, "viewer", false);
+        newer_descendant["headRefName"] = Value::String("descendant".to_owned());
+        newer_descendant["headRefOid"] = Value::String("descendant-head".to_owned());
+        newer_descendant["updatedAt"] = Value::String("2026-02-01T00:00:00Z".to_owned());
+        let body = serde_json::json!({
+            "data": {
+                "repository": {
+                    "branch0": {
+                        "associatedPullRequests": {
+                            "nodes": [exact_branch, newer_descendant]
+                        }
+                    }
+                },
+                "rateLimit": {"remaining": 10, "resetAt": "2026-07-30T12:00:00Z"}
+            }
+        })
+        .to_string();
+        let (base, requests, server) = fake_server(vec![FakeResponse {
+            status: "200 OK",
+            headers: Vec::new(),
+            body,
+        }]);
+        let git = FakeGit {
+            upstream: None,
+            remotes: HashMap::from([("origin".to_owned(), format!("{base}/base/project.git"))]),
         };
+        let mut credentials = FakeCredentials::default();
+        credentials
+            .environment
+            .insert("GITHUB_ENTERPRISE_TOKEN".to_owned(), "token".to_owned());
+
+        let refresh = GitHubService::new().fetch_catalog_with(&git, &credentials, &[input(1)]);
+
+        requests.recv().unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            refresh.branches[Path::new("/tree-0")]
+                .as_ref()
+                .unwrap()
+                .pull_request
+                .as_ref()
+                .map(|pull_request| pull_request.number),
+            Some(1)
+        );
+        assert_eq!(
+            refresh
+                .active_pull_requests
+                .iter()
+                .map(|identity| identity.number)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn exact_head_oid_selects_the_parent_pr_for_a_repointed_branch() {
+        let target = BranchTarget {
+            worktree: PathBuf::from("/tree"),
+            branch: "different-local-branch".to_owned(),
+            head: Some("shared-parent-head".to_owned()),
+        };
+        let mut parent = authored_node(33580, "viewer", false);
+        parent["headRefName"] =
+            Value::String("wbbradley/context-hub-fleet-path-validation".to_owned());
+        parent["headRefOid"] = Value::String("shared-parent-head".to_owned());
+        parent["updatedAt"] = Value::String("2026-01-01T00:00:00Z".to_owned());
+        let mut child = authored_node(33902, "viewer", false);
+        child["baseRefName"] =
+            Value::String("wbbradley/context-hub-fleet-path-validation".to_owned());
+        child["headRefName"] = Value::String("context-hub-materialization-hardening".to_owned());
+        child["headRefOid"] = Value::String("child-head".to_owned());
+        child["updatedAt"] = Value::String("2026-02-01T00:00:00Z".to_owned());
         let data = serde_json::json!({
             "repository": {
-                "branch0": {
-                    "associatedPullRequests": {
-                        "nodes": [pull_request(1, "base"), pull_request(2, "other")]
-                    }
-                }
+                "branch0": {"associatedPullRequests": {"nodes": [parent, child]}}
             }
         });
-        let identities = canonical_associated_pull_requests(&data, 1, "github.com");
-        assert_eq!(identities.len(), 2);
-        assert!(identities.contains(&CanonicalPullRequestId {
-            repository: identity("github.com", "base", "project"),
-            number: 1,
-        }));
-        assert!(identities.contains(&CanonicalPullRequestId {
-            repository: identity("github.com", "other", "project"),
-            number: 2,
-        }));
+
+        let (display, associations) =
+            parse_batch_data(&data, &[target], &[], &[], None, "github.com").unwrap();
+
+        assert_eq!(
+            display[0]
+                .as_ref()
+                .unwrap()
+                .pull_request
+                .as_ref()
+                .map(|pull_request| pull_request.number),
+            Some(33580)
+        );
+        assert_eq!(associations[0].as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn exact_branch_match_can_select_a_merged_pr_over_an_open_sha_match() {
+        let target = BranchTarget {
+            worktree: PathBuf::from("/tree"),
+            branch: "topic".to_owned(),
+            head: Some("shared-head".to_owned()),
+        };
+        let mut exact_branch = authored_node(4, "viewer", false);
+        exact_branch["state"] = Value::String("CLOSED".to_owned());
+        exact_branch["mergedAt"] = Value::String("2026-01-03T00:00:00Z".to_owned());
+        exact_branch["headRefOid"] = Value::String("old-head".to_owned());
+        let mut exact_sha = authored_node(5, "viewer", false);
+        exact_sha["headRefName"] = Value::String("renamed-topic".to_owned());
+        exact_sha["headRefOid"] = Value::String("shared-head".to_owned());
+        let data = serde_json::json!({
+            "repository": {
+                "branch0": {"associatedPullRequests": {"nodes": [exact_sha, exact_branch]}}
+            }
+        });
+
+        let (display, _) =
+            parse_batch_data(&data, &[target], &[], &[], None, "github.com").unwrap();
+
+        assert_eq!(
+            display[0]
+                .as_ref()
+                .unwrap()
+                .pull_request
+                .as_ref()
+                .map(|pull_request| pull_request.number),
+            Some(4)
+        );
+
+        let mut higher_number = authored_node(8, "viewer", false);
+        higher_number["headRefName"] = Value::String("topic".to_owned());
+        let mut lower_number = higher_number.clone();
+        lower_number["number"] = Value::from(7);
+        lower_number["url"] = Value::String("https://example/pull/7".to_owned());
+        let candidates = vec![
+            normalize_pull_request(&higher_number).unwrap(),
+            normalize_pull_request(&lower_number).unwrap(),
+        ];
+        assert_eq!(
+            prefer_pull_request(
+                candidates,
+                &BranchTarget {
+                    worktree: PathBuf::from("/tree"),
+                    branch: "topic".to_owned(),
+                    head: Some("unmatched".to_owned()),
+                }
+            )
+            .unwrap()
+            .number,
+            7,
+            "equal-priority candidates use a stable canonical ordering"
+        );
     }
 
     #[test]
@@ -3658,7 +3778,17 @@ mod tests {
         merged.number = 5;
         merged.state = PullRequestState::Merged;
         merged.updated_at = "2026-12-01T00:00:00Z".to_owned();
-        assert_eq!(prefer_pull_request(vec![merged, draft]).unwrap().number, 4);
+        let target = BranchTarget {
+            worktree: PathBuf::from("/tree"),
+            branch: "unmatched".to_owned(),
+            head: Some("unmatched".to_owned()),
+        };
+        assert_eq!(
+            prefer_pull_request(vec![merged, draft], &target)
+                .unwrap()
+                .number,
+            4
+        );
     }
 
     #[test]

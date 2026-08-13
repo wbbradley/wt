@@ -433,36 +433,6 @@ impl Controller {
                     .map(|branch| (worktree.path.clone(), branch.to_owned()))
             })
             .collect();
-        let cached_branches: std::collections::BTreeSet<(PathBuf, String)> = remote_cache
-            .branches
-            .iter()
-            .map(|cached| (cached.worktree.clone(), cached.branch.clone()))
-            .collect();
-        let cache_topology_matches = current_branches == cached_branches;
-        let active_from_matching_branches: std::collections::HashSet<_> = remote_cache
-            .authored_pull_requests
-            .iter()
-            .filter(|authored| {
-                remote_cache.branches.iter().any(|cached| {
-                    current_branches.contains(&(cached.worktree.clone(), cached.branch.clone()))
-                        && cached
-                            .data
-                            .pull_request
-                            .as_ref()
-                            .is_some_and(|pull_request| {
-                                pull_request.number == authored.identity.number
-                                    && pull_request.base.repository.as_deref().is_some_and(
-                                        |repository| {
-                                            repository.eq_ignore_ascii_case(
-                                                &authored.identity.repository.full_name(),
-                                            )
-                                        },
-                                    )
-                            })
-                })
-            })
-            .map(|authored| authored.identity.clone())
-            .collect();
         self.app.github_hosts = crate::github::inferred_github_hosts(&self.catalog);
         self.app.pull_request_details = remote_cache
             .pull_request_details
@@ -492,15 +462,6 @@ impl Controller {
                 })
                 .collect(),
         );
-        self.app.active_pull_requests = if cache_topology_matches {
-            remote_cache
-                .active_pull_requests
-                .into_iter()
-                .chain(active_from_matching_branches)
-                .collect()
-        } else {
-            active_from_matching_branches
-        };
         self.refresh_authored_mappings();
     }
 
@@ -1485,16 +1446,10 @@ impl Controller {
                         changed = true;
                     }
                     self.app.github_hosts = crate::github::inferred_github_hosts(&self.catalog);
-                    self.app.active_pull_requests = refresh.active_pull_requests;
-                    self.app.authored_mappings = crate::github::map_pull_request_identities(
-                        &self.catalog,
-                        self.app.authored_pull_requests.identities(),
-                        &self.app.active_pull_requests,
-                        |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
-                    );
                     changed |= self
                         .app
                         .apply_github_refresh(generation, &paths, refresh.branches);
+                    self.refresh_authored_mappings();
                 }
                 GitHubMessage::Authored { generation, event } => match event {
                     AuthoredRefreshEvent::Page {
@@ -1620,6 +1575,22 @@ impl Controller {
     }
 
     fn refresh_authored_mappings(&mut self) {
+        self.app.active_pull_requests = self
+            .app
+            .repositories
+            .iter()
+            .flat_map(|repository| {
+                repository.worktrees.iter().filter_map(|worktree| {
+                    let pull_request = self
+                        .app
+                        .github
+                        .get(&worktree.path)
+                        .and_then(crate::app::GitHubState::data)
+                        .and_then(|data| data.pull_request.as_ref())?;
+                    self.app.pull_request_identity(repository, pull_request)
+                })
+            })
+            .collect();
         self.app.authored_mappings = crate::github::map_pull_request_identities(
             &self.catalog,
             self.app.authored_pull_requests.identities(),
@@ -2355,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_cache_hydrates_branch_and_authored_prs_before_refresh() {
+    fn remote_cache_preserves_selected_local_pr_and_virtual_stack() {
         use crate::app::{GitHubState, RepositoryView};
         use crate::model::{
             AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, GitHubBranchData,
@@ -2364,6 +2335,8 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let worktree_path = directory.path().join("project");
+        std::fs::create_dir(&worktree_path).unwrap();
+        run_git_command(&worktree_path, &["init", "--quiet"]);
         let identity = GitHubRepositoryIdentity::canonical("github.com", "team", "project");
         let pull_request = |number: u64, branch: &str| {
             let pull_request = PullRequest {
@@ -2395,8 +2368,9 @@ mod tests {
                 pull_request,
             }
         };
-        let local = pull_request(1, "topic");
-        let virtual_pr = pull_request(2, "other");
+        let local = pull_request(33580, "topic");
+        let mut virtual_pr = pull_request(33902, "other");
+        virtual_pr.pull_request.base.branch = "topic".to_owned();
         let repository = RepositoryConfig {
             path: worktree_path.clone(),
             label: Some("project".to_owned()),
@@ -2440,7 +2414,7 @@ mod tests {
                 },
             }];
             cache.authored_pull_requests = vec![local.clone(), virtual_pr.clone()];
-            cache.active_pull_requests = vec![local.identity.clone()];
+            cache.active_pull_requests = vec![local.identity.clone(), virtual_pr.identity.clone()];
             cache.pull_request_details = vec![crate::cache::CachedPullRequestDetails {
                 identity: local.identity.clone(),
                 details: crate::model::PullRequestDetails {
@@ -2455,7 +2429,7 @@ mod tests {
 
         assert!(matches!(
             controller.app.github.get(&worktree_path),
-            Some(GitHubState::Ready(data)) if data.pull_request.as_ref().is_some_and(|pull_request| pull_request.number == 1)
+            Some(GitHubState::Ready(data)) if data.pull_request.as_ref().is_some_and(|pull_request| pull_request.number == 33580)
         ));
         assert_eq!(controller.app.authored_pull_requests.visible().len(), 2);
         assert_eq!(controller.app.pull_request_details.len(), 1);
@@ -2471,6 +2445,60 @@ mod tests {
                 .identity
                 .number,
             virtual_pr.identity.number
+        );
+        assert_eq!(
+            controller.app.active_pull_requests,
+            std::collections::HashSet::from([local.identity.clone()])
+        );
+        let mixed_virtual_rows = controller
+            .app
+            .visible_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                crate::app::VisibleRow::VirtualPullRequest {
+                    pull_request_index,
+                    stack_depth,
+                    ..
+                } => Some((
+                    controller.app.virtual_repositories[0].pull_requests[pull_request_index]
+                        .identity
+                        .number,
+                    stack_depth,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(mixed_virtual_rows, vec![(33902, 1)]);
+        let mixed_rows = controller.app.visible_rows();
+        assert!(mixed_rows.iter().any(|row| {
+            matches!(
+                row,
+                crate::app::VisibleRow::Inline {
+                    id: crate::app::RowId::Section(
+                        crate::app::BranchId::Worktree(path),
+                        crate::app::InlineSection::StackedBranches
+                    ),
+                    ..
+                } if path == &worktree_path
+            )
+        }));
+
+        let generation = controller
+            .app
+            .begin_github_refresh(std::slice::from_ref(&worktree_path));
+        assert!(controller.app.apply_github_refresh(
+            generation,
+            std::slice::from_ref(&worktree_path),
+            std::collections::HashMap::from([(
+                worktree_path.clone(),
+                Err(crate::github::GitHubError::Network("offline".to_owned())),
+            )]),
+        ));
+        controller.refresh_authored_mappings();
+        assert_eq!(
+            controller.app.active_pull_requests,
+            std::collections::HashSet::from([local.identity.clone()]),
+            "a failed refresh retains the selected PR for an unchanged worktree"
         );
 
         controller.app.repositories[0].worktrees.push(Worktree {
@@ -2495,6 +2523,31 @@ mod tests {
                 .iter()
                 .all(|mapping| mapping.identity != local.identity)
         );
+
+        controller.app.repositories[0].worktrees.clear();
+        controller.app.github.clear();
+        controller.load_remote_cache();
+
+        assert!(controller.app.active_pull_requests.is_empty());
+        let all_virtual_rows = controller
+            .app
+            .visible_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                crate::app::VisibleRow::VirtualPullRequest {
+                    pull_request_index,
+                    stack_depth,
+                    ..
+                } => Some((
+                    controller.app.virtual_repositories[0].pull_requests[pull_request_index]
+                        .identity
+                        .number,
+                    stack_depth,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(all_virtual_rows, vec![(33580, 0), (33902, 2)]);
     }
 
     #[test]

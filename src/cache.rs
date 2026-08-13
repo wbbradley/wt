@@ -62,6 +62,16 @@ impl Default for RemoteCache {
 }
 
 impl RemoteCache {
+    fn reconcile_active_pull_requests(
+        &mut self,
+        refreshed: impl IntoIterator<Item = CanonicalPullRequestId>,
+    ) {
+        let candidates = self.active_pull_requests.drain(..).chain(refreshed);
+        self.active_pull_requests = represented_pull_request_identities(&self.branches, candidates)
+            .into_iter()
+            .collect();
+    }
+
     pub fn merge_branch_refresh(
         &mut self,
         inputs: &[RepositoryGitHubInput],
@@ -83,11 +93,6 @@ impl RemoteCache {
                     .map(|branch| (worktree.path.clone(), branch.clone()))
             })
             .collect();
-        let topology_changed = self.branches.iter().any(|cached| {
-            current_branches
-                .get(&cached.worktree)
-                .is_none_or(|branch| branch != &cached.branch)
-        });
         self.branches.retain(|cached| {
             current_branches
                 .get(&cached.worktree)
@@ -113,14 +118,7 @@ impl RemoteCache {
             (&left.worktree, &left.branch).cmp(&(&right.worktree, &right.branch))
         });
 
-        let mut active: BTreeSet<CanonicalPullRequestId> =
-            if topology_changed || refresh.branches.values().all(Result::is_ok) {
-                BTreeSet::new()
-            } else {
-                self.active_pull_requests.iter().cloned().collect()
-            };
-        active.extend(refresh.active_pull_requests.iter().cloned());
-        self.active_pull_requests = active.into_iter().collect();
+        self.reconcile_active_pull_requests(refresh.active_pull_requests.iter().cloned());
         self.updated_at_epoch_seconds = epoch_seconds();
     }
 
@@ -185,9 +183,7 @@ impl RemoteCache {
         self.authored_pull_requests
             .sort_by(|left, right| left.identity.cmp(&right.identity));
 
-        self.active_pull_requests.push(identity);
-        self.active_pull_requests.sort();
-        self.active_pull_requests.dedup();
+        self.reconcile_active_pull_requests([identity]);
         self.updated_at_epoch_seconds = epoch_seconds();
     }
 
@@ -206,8 +202,37 @@ impl RemoteCache {
         self.branches.sort_by(|left, right| {
             (&left.worktree, &left.branch).cmp(&(&right.worktree, &right.branch))
         });
+        self.reconcile_active_pull_requests(std::iter::empty());
         self.updated_at_epoch_seconds = epoch_seconds();
     }
+}
+
+fn represented_pull_request_identities(
+    branches: &[CachedBranch],
+    candidates: impl IntoIterator<Item = CanonicalPullRequestId>,
+) -> BTreeSet<CanonicalPullRequestId> {
+    candidates
+        .into_iter()
+        .filter(|identity| {
+            branches.iter().any(|cached| {
+                cached
+                    .data
+                    .pull_request
+                    .as_ref()
+                    .is_some_and(|pull_request| {
+                        pull_request.number == identity.number
+                            && pull_request
+                                .base
+                                .repository
+                                .as_deref()
+                                .is_some_and(|repository| {
+                                    repository
+                                        .eq_ignore_ascii_case(&identity.repository.full_name())
+                                })
+                    })
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Error)]
@@ -542,6 +567,51 @@ mod tests {
     }
 
     #[test]
+    fn branch_refresh_prunes_legacy_active_identities_and_pr_less_success() {
+        let path = PathBuf::from("/repo");
+        let selected = authored(1);
+        let hidden_by_legacy_cache = authored(2);
+        let mut cache = RemoteCache {
+            branches: vec![CachedBranch {
+                worktree: path.clone(),
+                branch: "refs/heads/topic".to_owned(),
+                data: GitHubBranchData {
+                    pull_request: Some(selected.pull_request.clone()),
+                    warnings: Vec::new(),
+                    rate_limit: None,
+                },
+            }],
+            active_pull_requests: vec![
+                selected.identity.clone(),
+                hidden_by_legacy_cache.identity.clone(),
+            ],
+            ..RemoteCache::default()
+        };
+        let mut failed = GitHubRefresh::default();
+        failed.branches.insert(
+            path.clone(),
+            Err(crate::github::GitHubError::Network("offline".to_owned())),
+        );
+
+        cache.merge_branch_refresh(&[input(&path, "topic")], &failed);
+
+        assert_eq!(cache.active_pull_requests, vec![selected.identity]);
+
+        let mut no_pull_request = GitHubRefresh::default();
+        no_pull_request.branches.insert(
+            path.clone(),
+            Ok(GitHubBranchData {
+                pull_request: None,
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+        cache.merge_branch_refresh(&[input(&path, "topic")], &no_pull_request);
+
+        assert!(cache.active_pull_requests.is_empty());
+    }
+
+    #[test]
     fn trunk_worktrees_are_removed_from_the_branch_cache() {
         let path = PathBuf::from("/repo");
         let mut input = input(&path, "main");
@@ -611,7 +681,7 @@ mod tests {
                 .iter()
                 .map(|identity| identity.number)
                 .collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![2]
         );
         assert!(cache.updated_at_epoch_seconds > 0);
     }
