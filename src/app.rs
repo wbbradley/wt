@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::{Regex, RegexBuilder};
@@ -453,6 +454,7 @@ pub struct App {
     pub github: HashMap<PathBuf, GitHubState>,
     pub github_generation: u64,
     pub github_loading: bool,
+    pub last_refresh: Option<Instant>,
     github_network_paths: HashSet<PathBuf>,
     github_spinner_frame: usize,
     pub github_hosts: BTreeSet<String>,
@@ -490,6 +492,7 @@ impl App {
             github: HashMap::new(),
             github_generation: 0,
             github_loading: false,
+            last_refresh: None,
             github_network_paths: HashSet::new(),
             github_spinner_frame: 0,
             github_hosts: BTreeSet::new(),
@@ -506,6 +509,11 @@ impl App {
         };
         app.select_initial();
         app
+    }
+
+    pub fn minutes_since_last_refresh(&self) -> Option<u64> {
+        self.last_refresh
+            .map(|refreshed| refreshed.elapsed().as_secs() / 60)
     }
 
     pub fn visible_rows(&self) -> Vec<VisibleRow> {

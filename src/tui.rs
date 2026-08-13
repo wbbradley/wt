@@ -332,6 +332,7 @@ struct Controller {
     github_refresh_queued: bool,
     github_refresh_interval: Duration,
     next_github_refresh: Instant,
+    displayed_refresh_age_minutes: Option<u64>,
     discover_authored_pull_requests: bool,
     pending_action: Option<PendingAction>,
     materialization_job: Option<BackgroundJob<MaterializationOutcome>>,
@@ -370,6 +371,7 @@ impl Controller {
             github_refresh_queued: false,
             github_refresh_interval,
             next_github_refresh: Instant::now(),
+            displayed_refresh_age_minutes: None,
             discover_authored_pull_requests: true,
             pending_action: None,
             materialization_job: None,
@@ -1515,10 +1517,14 @@ impl Controller {
                         warnings,
                         error,
                     } => {
-                        changed |= self
+                        let applied = self
                             .app
                             .authored_pull_requests
                             .finish(generation, complete, warnings, error);
+                        changed |= applied;
+                        if applied && complete {
+                            self.app.last_refresh = Some(Instant::now());
+                        }
                         self.refresh_authored_mappings();
                         self.github_in_flight = false;
                         self.app.progress = None;
@@ -1534,6 +1540,11 @@ impl Controller {
                     changed |= self.app.apply_pull_request_details(generation, results);
                 }
             }
+        }
+        let refresh_age_minutes = self.app.minutes_since_last_refresh();
+        if refresh_age_minutes != self.displayed_refresh_age_minutes {
+            self.displayed_refresh_age_minutes = refresh_age_minutes;
+            changed = true;
         }
         changed |= self.pump_materialization();
         if !self.github_in_flight && Instant::now() >= self.next_github_refresh {
@@ -2303,6 +2314,32 @@ mod tests {
         assert_eq!(github_refresh_interval(&catalog), Duration::from_secs(30));
         catalog.github_refresh_interval_secs = 450;
         assert_eq!(github_refresh_interval(&catalog), Duration::from_secs(450));
+    }
+
+    #[test]
+    fn successful_github_refresh_starts_the_header_age_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = App::new(Vec::new(), directory.path().to_owned());
+        let mut controller =
+            Controller::new(directory.path().join("wt.json"), Catalog::default(), app);
+        controller.next_github_refresh = Instant::now() + Duration::from_secs(60);
+        controller.github_in_flight = true;
+        let generation = controller.app.authored_pull_requests.begin();
+        controller
+            .github_sender
+            .send(GitHubMessage::Authored {
+                generation,
+                event: AuthoredRefreshEvent::Finished {
+                    complete: true,
+                    warnings: Vec::new(),
+                    error: None,
+                },
+            })
+            .unwrap();
+
+        assert!(controller.pump_background_results());
+        assert_eq!(controller.app.minutes_since_last_refresh(), Some(0));
+        assert_eq!(controller.displayed_refresh_age_minutes, Some(0));
     }
 
     #[test]

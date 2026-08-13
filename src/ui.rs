@@ -1,7 +1,7 @@
 use std::hash::{Hash, Hasher};
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -37,6 +37,22 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(2),
         ])
         .split(area);
+    let refresh_age = app
+        .minutes_since_last_refresh()
+        .map(|minutes| format!("refreshed {minutes}m ago"));
+    let header = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(
+                refresh_age
+                    .as_deref()
+                    .map(display_width)
+                    .unwrap_or_default()
+                    .min(area.width as usize) as u16,
+            ),
+        ])
+        .split(vertical[0]);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" wt ", Style::default().fg(Color::Black).bg(ACCENT)),
@@ -48,8 +64,16 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
             ),
             Span::styled(header_progress(app), Style::default().fg(WARNING)),
         ])),
-        vertical[0],
+        header[0],
     );
+    if let Some(refresh_age) = refresh_age {
+        frame.render_widget(
+            Paragraph::new(refresh_age)
+                .style(Style::default().fg(MUTED))
+                .alignment(Alignment::Right),
+            header[1],
+        );
+    }
 
     render_list(frame, app, vertical[1]);
     render_footer(frame, app, vertical[2]);
@@ -2626,12 +2650,14 @@ mod tests {
     #[test]
     fn renders_header_progress_footer_error_and_confirmation() {
         let mut app = App::new(Vec::new(), PathBuf::from("/outside"));
+        app.last_refresh = Some(std::time::Instant::now() - std::time::Duration::from_secs(185));
         app.progress = Some("performing operation…".to_owned());
         app.inline_error = Some("clipboard unavailable".to_owned());
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let status = buffer_text(terminal.backend().buffer());
         assert!(status.contains("·  performing operation…"));
+        assert!(buffer_lines(terminal.backend().buffer())[0].ends_with("refreshed 3m ago"));
         assert!(status.contains("error: clipboard unavailable"));
 
         app.progress = None;
