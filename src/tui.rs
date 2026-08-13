@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -414,12 +414,15 @@ impl Controller {
                 return;
             }
         };
-        let current_branches: std::collections::BTreeSet<(PathBuf, String)> = self
-            .app
-            .repositories
+        let inputs = self.github_inputs();
+        let current_branches: std::collections::BTreeSet<(PathBuf, String)> = inputs
             .iter()
-            .flat_map(|repository| repository.worktrees.iter())
-            .filter(|worktree| worktree.navigable())
+            .flat_map(|input| {
+                input
+                    .worktrees
+                    .iter()
+                    .filter(|worktree| input.refreshes_worktree(worktree))
+            })
             .filter_map(|worktree| {
                 worktree
                     .branch
@@ -497,6 +500,21 @@ impl Controller {
             active_from_matching_branches
         };
         self.refresh_authored_mappings();
+    }
+
+    fn github_inputs(&self) -> Vec<RepositoryGitHubInput> {
+        self.app
+            .repositories
+            .iter()
+            .filter(|repository| repository.stale_error.is_none())
+            .map(|repository| RepositoryGitHubInput {
+                trunk_branch: crate::github::remote_trunk_branch(&SystemGit, &repository.config)
+                    .ok()
+                    .flatten(),
+                repository: repository.config.clone(),
+                worktrees: repository.worktrees.clone(),
+            })
+            .collect()
     }
 
     fn handle_intent(&mut self, intent: Intent) -> Result<ControlFlow, TuiError> {
@@ -1227,28 +1245,21 @@ impl Controller {
             return;
         }
 
-        let inputs: Vec<RepositoryGitHubInput> = self
-            .app
-            .repositories
-            .iter()
-            .filter(|repository| repository.stale_error.is_none())
-            .map(|repository| RepositoryGitHubInput {
-                repository: repository.config.clone(),
-                worktrees: repository.worktrees.clone(),
-            })
-            .collect();
+        let inputs = self.github_inputs();
         let paths: Vec<PathBuf> = inputs
             .iter()
-            .flat_map(|input| input.worktrees.iter())
-            .filter(|worktree| {
-                !worktree.bare
-                    && worktree
-                        .branch
-                        .as_deref()
-                        .is_some_and(|branch| branch.starts_with("refs/heads/"))
+            .flat_map(|input| {
+                input
+                    .worktrees
+                    .iter()
+                    .filter(|worktree| input.refreshes_worktree(worktree))
             })
             .map(|worktree| worktree.path.clone())
             .collect();
+        let refreshable_paths = paths.iter().cloned().collect::<HashSet<_>>();
+        self.app
+            .github
+            .retain(|path, _| refreshable_paths.contains(path));
         let generation = self.app.begin_github_refresh(&paths);
         let authored_generation = self.app.authored_pull_requests.begin();
         self.next_github_refresh = Instant::now() + self.github_refresh_interval;

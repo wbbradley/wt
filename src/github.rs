@@ -388,6 +388,21 @@ pub enum GitHubError {
 pub struct RepositoryGitHubInput {
     pub repository: RepositoryConfig,
     pub worktrees: Vec<Worktree>,
+    pub trunk_branch: Option<String>,
+}
+
+impl RepositoryGitHubInput {
+    pub fn refreshes_worktree(&self, worktree: &Worktree) -> bool {
+        !worktree.bare
+            && !worktree.detached
+            && worktree
+                .branch
+                .as_deref()
+                .and_then(|branch| branch.strip_prefix("refs/heads/"))
+                .is_some_and(|branch| {
+                    !branch.is_empty() && self.trunk_branch.as_deref() != Some(branch)
+                })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -465,10 +480,11 @@ impl GitHubService {
         let mut refresh = GitHubRefresh::default();
         let mut groups: HashMap<FetchGroupKey, Vec<BranchTarget>> = HashMap::new();
         for input in inputs {
-            for worktree in &input.worktrees {
-                if worktree.bare || worktree.detached {
-                    continue;
-                }
+            for worktree in input
+                .worktrees
+                .iter()
+                .filter(|worktree| input.refreshes_worktree(worktree))
+            {
                 let Some(branch) = worktree
                     .branch
                     .as_deref()
@@ -1717,6 +1733,53 @@ fn resolve_branch_remote(
     parse_remote_url(&url)
 }
 
+pub fn remote_trunk_branch(
+    runner: &dyn GitRunner,
+    repository: &RepositoryConfig,
+) -> Result<Option<String>, GitHubError> {
+    let remotes = required_git_value(runner, &repository.path, &["remote"])?
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let Some(remote) = [
+        repository.github_remote.as_ref(),
+        repository.github_preferred_remote.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|remote| remotes.contains(remote))
+    .cloned()
+    .or_else(|| remotes.iter().find(|remote| *remote == "origin").cloned())
+    .or_else(|| remotes.first().cloned()) else {
+        return Ok(None);
+    };
+    let symbolic = format!("refs/remotes/{remote}/HEAD");
+    if let Some(head) = optional_git_value(
+        runner,
+        &repository.path,
+        &["symbolic-ref", "--quiet", "--short", &symbolic],
+    )? && let Some(branch) = head.trim().strip_prefix(&format!("{remote}/"))
+        && !branch.is_empty()
+    {
+        return Ok(Some(branch.to_owned()));
+    }
+    for branch in ["main", "master"] {
+        let reference = format!("refs/remotes/{remote}/{branch}^{{commit}}");
+        if optional_git_value(
+            runner,
+            &repository.path,
+            &["rev-parse", "--verify", "--quiet", &reference],
+        )?
+        .is_some()
+        {
+            return Ok(Some(branch.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
 fn optional_git_value(
     runner: &dyn GitRunner,
     anchor: &Path,
@@ -2449,6 +2512,7 @@ mod tests {
                     prunable: None,
                 })
                 .collect(),
+            trunk_branch: None,
         }
     }
 
@@ -3298,6 +3362,47 @@ mod tests {
     }
 
     #[test]
+    fn remote_symbolic_head_identifies_trunk_and_excludes_only_that_worktree() {
+        struct TrunkGit;
+
+        impl GitRunner for TrunkGit {
+            fn run(
+                &self,
+                _directory: &Path,
+                arguments: &[OsString],
+            ) -> Result<CommandOutput, GitError> {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| argument.to_string_lossy())
+                    .collect::<Vec<_>>();
+                let value = match arguments.as_slice() {
+                    [remote] if remote == "remote" => Some("origin"),
+                    [command, _, _, reference]
+                        if command == "symbolic-ref" && reference == "refs/remotes/origin/HEAD" =>
+                    {
+                        Some("origin/develop")
+                    }
+                    _ => None,
+                };
+                Ok(CommandOutput {
+                    stdout: value.map_or_else(Vec::new, |value| format!("{value}\n").into_bytes()),
+                    stderr: Vec::new(),
+                    success: value.is_some(),
+                })
+            }
+        }
+
+        let mut input = input(2);
+        input.worktrees[0].branch = Some("refs/heads/develop".to_owned());
+        input.worktrees[1].branch = Some("refs/heads/topic".to_owned());
+        input.trunk_branch = remote_trunk_branch(&TrunkGit, &input.repository).unwrap();
+
+        assert_eq!(input.trunk_branch.as_deref(), Some("develop"));
+        assert!(!input.refreshes_worktree(&input.worktrees[0]));
+        assert!(input.refreshes_worktree(&input.worktrees[1]));
+    }
+
+    #[test]
     fn fetch_uses_required_headers_variables_and_bounded_batches() {
         let (base, requests, server) = fake_server(vec![
             FakeResponse {
@@ -3557,10 +3662,11 @@ mod tests {
     }
 
     #[test]
-    fn detached_and_bare_worktrees_never_request_github_data() {
-        let mut catalog_input = input(2);
+    fn trunk_detached_and_bare_worktrees_never_request_github_data() {
+        let mut catalog_input = input(3);
         catalog_input.worktrees[0].bare = true;
         catalog_input.worktrees[1].detached = true;
+        catalog_input.trunk_branch = Some("topic-2".to_owned());
         let refresh = GitHubService::new().fetch_catalog_with(
             &FakeGit {
                 upstream: None,

@@ -69,8 +69,12 @@ impl RemoteCache {
     ) {
         let current_branches: BTreeMap<PathBuf, String> = inputs
             .iter()
-            .flat_map(|input| input.worktrees.iter())
-            .filter(|worktree| worktree.navigable())
+            .flat_map(|input| {
+                input
+                    .worktrees
+                    .iter()
+                    .filter(|worktree| input.refreshes_worktree(worktree))
+            })
             .filter_map(|worktree| {
                 worktree
                     .branch
@@ -429,6 +433,7 @@ mod tests {
                 locked: None,
                 prunable: None,
             }],
+            trunk_branch: None,
         }
     }
 
@@ -534,6 +539,30 @@ mod tests {
         cache.merge_branch_refresh(&[input(&path, "other")], &failed);
         assert!(cache.branches.is_empty());
         assert!(cache.active_pull_requests.is_empty());
+    }
+
+    #[test]
+    fn trunk_worktrees_are_removed_from_the_branch_cache() {
+        let path = PathBuf::from("/repo");
+        let mut input = input(&path, "main");
+        let data = GitHubBranchData {
+            pull_request: Some(authored(1).pull_request),
+            warnings: Vec::new(),
+            rate_limit: None,
+        };
+        let mut cache = RemoteCache {
+            branches: vec![CachedBranch {
+                worktree: path.clone(),
+                branch: "refs/heads/main".to_owned(),
+                data,
+            }],
+            ..RemoteCache::default()
+        };
+        input.trunk_branch = Some("main".to_owned());
+
+        cache.merge_branch_refresh(&[input], &GitHubRefresh::default());
+
+        assert!(cache.branches.is_empty());
     }
 
     #[test]
