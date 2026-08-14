@@ -1159,6 +1159,7 @@ impl Controller {
         let repositories = load_repository_views(&self.catalog, &self.app.current_directory);
         self.app.replace_repositories(repositories);
         self.refresh_branch_parents();
+        self.refresh_authored_mappings();
         Ok(())
     }
 
@@ -1609,12 +1610,22 @@ impl Controller {
             .authored_mappings
             .iter()
             .find(|mapping| mapping.identity == identity)
-            .and_then(|mapping| mapping.repository_index);
-        let mapped_path = mapping
-            .and_then(|index| self.catalog.repositories.get(index))
-            .map(|repository| repository.path.clone());
+            .and_then(|mapping| mapping.mapped_repository.clone());
         let credential_anchor = mapping
-            .and_then(|index| self.catalog.repositories.get(index))
+            .as_ref()
+            .and_then(|path| {
+                self.catalog
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.path == *path)
+            })
+            .filter(|repository| {
+                repository
+                    .github_remotes
+                    .values()
+                    .any(|candidate| candidate == &identity.repository)
+                    && git::resolve_repository(&SystemGit, &repository.path).is_ok()
+            })
             .map(|repository| repository.path.clone())
             .unwrap_or_else(|| {
                 self.catalog_path
@@ -1648,12 +1659,6 @@ impl Controller {
             )
             .map_err(|error| error.to_string())?;
             let mut catalog = config::load(&catalog_path).map_err(|error| error.to_string())?;
-            let fresh_mapping = mapped_path.as_ref().and_then(|path| {
-                catalog
-                    .repositories
-                    .iter()
-                    .position(|repository| &repository.path == path)
-            });
             let repository_root =
                 config::repository_root(&catalog).map_err(|error| error.to_string())?;
             let runner = context.git_runner();
@@ -1666,7 +1671,7 @@ impl Controller {
                 bootstrap::BootstrapOptions {
                     base_branch: &refreshed.pull_request.base.branch,
                     https_token: Some(&token),
-                    mapped_repository_index: fresh_mapping,
+                    mapped_repository_path: mapping.as_deref(),
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -2191,6 +2196,57 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn repository_reload_reconciles_authored_mappings_with_session_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let registered = directory.path().join("registered");
+        let current = directory.path().join("current");
+        run_git_command(directory.path(), &["init", registered.to_str().unwrap()]);
+        run_git_command(directory.path(), &["init", current.to_str().unwrap()]);
+        let registered = std::fs::canonicalize(registered).unwrap();
+        let current = std::fs::canonicalize(current).unwrap();
+        let identity = GitHubRepositoryIdentity::canonical("github.com", "team", "project");
+        let catalog = Catalog {
+            repositories: vec![RepositoryConfig {
+                path: registered.clone(),
+                label: Some("registered".to_owned()),
+                worktree_root: None,
+                github_remote: Some("origin".to_owned()),
+                github_remotes: [("origin".to_owned(), identity)].into_iter().collect(),
+                github_preferred_remote: Some("origin".to_owned()),
+            }],
+            ..Catalog::default()
+        };
+        let catalog_path = directory.path().join("config/wt.json");
+        config::save(&catalog_path, &catalog).unwrap();
+        let mut app = App::new(load_repository_views(&catalog, &current), current.clone());
+        let authored = test_authored_pull_request("viewer");
+        app.authored_pull_requests.hydrate(vec![authored.clone()]);
+        app.authored_mappings = vec![crate::github::PullRequestMapping {
+            identity: authored.identity,
+            mapped_repository: Some(current),
+        }];
+        app.rebuild_virtual_repositories();
+        let mut controller = Controller::new(catalog_path, catalog, app);
+
+        controller.reload_catalog_and_worktrees().unwrap();
+
+        assert!(controller.app.repositories[0].session_only);
+        assert_eq!(
+            controller.app.virtual_repositories[0]
+                .mapped_repository
+                .as_deref(),
+            Some(registered.as_path())
+        );
+        assert!(controller.app.visible_rows().iter().any(|row| matches!(
+            row,
+            crate::app::VisibleRow::VirtualPullRequest {
+                mapped_repository_index: Some(1),
+                ..
+            }
+        )));
     }
 
     #[test]

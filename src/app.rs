@@ -2807,20 +2807,25 @@ impl App {
             .iter()
             .map(|repository| (repository.identity.clone(), repository.expanded))
             .collect();
-        let mappings: HashMap<CanonicalPullRequestId, Option<usize>> = self
+        let mappings: HashMap<CanonicalPullRequestId, Option<PathBuf>> = self
             .authored_mappings
             .iter()
-            .map(|mapping| (mapping.identity.clone(), mapping.repository_index))
+            .map(|mapping| (mapping.identity.clone(), mapping.mapped_repository.clone()))
             .collect();
         let mut grouped: BTreeMap<GitHubRepositoryIdentity, VirtualRepositoryView> =
             BTreeMap::new();
         for pull_request in self.authored_pull_requests.visible() {
-            let Some(repository_index) = mappings.get(&pull_request.identity) else {
+            let Some(mapped_path) = mappings.get(&pull_request.identity) else {
                 continue;
             };
-            let mapped_repository = repository_index
-                .and_then(|index| self.repositories.get(index))
-                .map(|repository| repository.config.path.clone());
+            let mapped_repository = mapped_path
+                .as_ref()
+                .filter(|path| {
+                    self.repositories
+                        .iter()
+                        .any(|repository| repository.config.path == **path)
+                })
+                .cloned();
             let identity = pull_request.identity.repository.clone();
             grouped
                 .entry(identity.clone())
@@ -4616,9 +4621,14 @@ mod tests {
             .finish(generation, true, Vec::new(), None);
         app.authored_mappings = mappings
             .into_iter()
-            .map(|(identity, repository_index)| PullRequestMapping {
-                identity,
-                repository_index,
+            .map(|(identity, repository_index)| {
+                let mapped_repository = repository_index
+                    .and_then(|index| app.repositories.get(index))
+                    .map(|repository| repository.config.path.clone());
+                PullRequestMapping {
+                    identity,
+                    mapped_repository,
+                }
             })
             .collect();
         app.rebuild_virtual_repositories();
@@ -5404,6 +5414,54 @@ mod tests {
             app.visible_rows().iter().any(|row| {
                 row.id() == &RowId::VirtualPullRequest(pull_request.identity.clone())
             })
+        );
+    }
+
+    #[test]
+    fn stable_repository_mapping_survives_shifted_app_indexes_and_missing_paths() {
+        let mut app = App::new(
+            vec![repository("/session", true), repository("/mapped", true)],
+            PathBuf::from("/session"),
+        );
+        app.repositories[0].session_only = true;
+        let pull_request = authored("team", "project", 10, "2026-01-01T00:00:00Z");
+        let generation = app.authored_pull_requests.begin();
+        app.authored_pull_requests.apply_page(
+            generation,
+            "github.com".to_owned(),
+            1,
+            vec![pull_request.clone()],
+            Vec::new(),
+        );
+        app.authored_pull_requests
+            .finish(generation, true, Vec::new(), None);
+        app.authored_mappings = vec![PullRequestMapping {
+            identity: pull_request.identity.clone(),
+            mapped_repository: Some(PathBuf::from("/mapped")),
+        }];
+
+        app.rebuild_virtual_repositories();
+
+        assert_eq!(
+            app.virtual_repositories[0].mapped_repository.as_deref(),
+            Some(Path::new("/mapped"))
+        );
+        assert!(app.visible_rows().iter().any(|row| matches!(
+            row,
+            VisibleRow::VirtualPullRequest {
+                mapped_repository_index: Some(1),
+                ..
+            }
+        )));
+
+        app.authored_mappings[0].mapped_repository = Some(PathBuf::from("/gone"));
+        app.rebuild_virtual_repositories();
+
+        assert!(app.virtual_repositories[0].mapped_repository.is_none());
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|row| matches!(row, VisibleRow::VirtualRepository { .. }))
         );
     }
 

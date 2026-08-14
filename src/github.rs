@@ -75,7 +75,7 @@ pub struct RemoteIdentityRefresh {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullRequestMapping {
     pub identity: CanonicalPullRequestId,
-    pub repository_index: Option<usize>,
+    pub mapped_repository: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,7 +264,10 @@ pub fn map_pull_request_identities(
             }
             PullRequestMapping {
                 identity,
-                repository_index: configured.or(origin).or(earliest),
+                mapped_repository: configured
+                    .or(origin)
+                    .or(earliest)
+                    .map(|index| catalog.repositories[index].path.clone()),
             }
         })
         .collect()
@@ -3147,7 +3150,10 @@ mod tests {
             |_| true,
         );
         assert_eq!(mappings.len(), 1, "a PR is displayed only once");
-        assert_eq!(mappings[0].repository_index, Some(2));
+        assert_eq!(
+            mappings[0].mapped_repository.as_deref(),
+            Some(Path::new("/configured"))
+        );
 
         let active = HashSet::from([canonical.clone()]);
         assert!(
@@ -3377,7 +3383,7 @@ mod tests {
         };
         let mappings =
             map_pull_request_identities(&catalog, [pull_request], &HashSet::new(), |_| false);
-        assert_eq!(mappings[0].repository_index, None);
+        assert_eq!(mappings[0].mapped_repository, None);
     }
 
     #[test]

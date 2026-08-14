@@ -54,7 +54,7 @@ pub struct BootstrapResult {
 pub struct BootstrapOptions<'a> {
     pub base_branch: &'a str,
     pub https_token: Option<&'a ResolvedToken>,
-    pub mapped_repository_index: Option<usize>,
+    pub mapped_repository_path: Option<&'a Path>,
 }
 
 #[derive(Debug, Error)]
@@ -86,8 +86,12 @@ pub fn bootstrap_repository(
     identity: &GitHubRepositoryIdentity,
     options: BootstrapOptions<'_>,
 ) -> Result<BootstrapResult, BootstrapError> {
-    if let Some(index) = options.mapped_repository_index
-        && let Some(repository) = catalog.repositories.get(index)
+    if let Some(path) = options.mapped_repository_path
+        && let Some((index, repository)) = catalog
+            .repositories
+            .iter()
+            .enumerate()
+            .find(|(_, repository)| repository.path == path)
         && repository_matches(git_runner, &repository.path, identity)
     {
         return Ok(BootstrapResult {
@@ -540,6 +544,82 @@ mod tests {
     }
 
     #[test]
+    fn mapped_repository_path_is_resolved_and_validated_against_fresh_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let unrelated = directory.path().join("unrelated.git");
+        let mapped = directory.path().join("mapped.git");
+        for (path, remote) in [
+            (&unrelated, "git@github.com:team/unrelated.git"),
+            (&mapped, "git@github.com:team/project.git"),
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(["init", "--bare"])
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(["remote", "add", "origin", remote])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let repository = |path: PathBuf| RepositoryConfig {
+            path,
+            label: None,
+            worktree_root: None,
+            github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
+        };
+        let mut catalog = Catalog {
+            repositories: vec![repository(unrelated.clone()), repository(mapped.clone())],
+            ..Catalog::default()
+        };
+
+        let result = bootstrap_repository(
+            &SystemGit,
+            &FixtureCloneRunner::new(Vec::new()),
+            &mut catalog,
+            &directory.path().join("repositories"),
+            &identity(),
+            BootstrapOptions {
+                base_branch: "main",
+                https_token: None,
+                mapped_repository_path: Some(&mapped),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.repository_index, 1);
+        assert_eq!(result.repository.path, mapped);
+
+        let clone_runner = FixtureCloneRunner::new(vec![success()]);
+        let result = bootstrap_repository(
+            &SystemGit,
+            &clone_runner,
+            &mut catalog,
+            &directory.path().join("repositories"),
+            &identity(),
+            BootstrapOptions {
+                base_branch: "main",
+                https_token: None,
+                mapped_repository_path: Some(&unrelated),
+            },
+        )
+        .unwrap();
+
+        assert_ne!(result.repository.path, unrelated);
+        assert_eq!(clone_runner.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn unrelated_candidates_are_never_adopted_or_overwritten() {
         let directory = tempfile::tempdir().unwrap();
         for candidate in repository_candidates(directory.path(), &identity()) {
@@ -555,7 +635,7 @@ mod tests {
             BootstrapOptions {
                 base_branch: "main",
                 https_token: None,
-                mapped_repository_index: None,
+                mapped_repository_path: None,
             },
         );
         assert!(matches!(result, Err(BootstrapError::CandidateCollision)));
@@ -582,7 +662,7 @@ mod tests {
             BootstrapOptions {
                 base_branch: "main",
                 https_token: None,
-                mapped_repository_index: None,
+                mapped_repository_path: None,
             },
         )
         .unwrap();
@@ -608,7 +688,7 @@ mod tests {
             BootstrapOptions {
                 base_branch: "main",
                 https_token: Some(&token),
-                mapped_repository_index: None,
+                mapped_repository_path: None,
             },
         )
         .unwrap();
@@ -686,7 +766,7 @@ mod tests {
             BootstrapOptions {
                 base_branch: "main",
                 https_token: Some(&token),
-                mapped_repository_index: None,
+                mapped_repository_path: None,
             },
         );
         let message = result.unwrap_err().to_string();
@@ -731,7 +811,7 @@ mod tests {
             BootstrapOptions {
                 base_branch: "main",
                 https_token: None,
-                mapped_repository_index: None,
+                mapped_repository_path: None,
             },
         )
         .unwrap();
@@ -800,7 +880,7 @@ mod tests {
             BootstrapOptions {
                 base_branch: "main",
                 https_token: None,
-                mapped_repository_index: None,
+                mapped_repository_path: None,
             },
         )
         .unwrap();
