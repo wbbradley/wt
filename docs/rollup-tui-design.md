@@ -303,6 +303,10 @@ the existing progress/error line rather than a modal.
   width. URLs and IDs stay available to actions/filtering rather than crowding the visible line.
 - Loading retains the animated yellow spinner and prior snapshot behavior. A failed refresh does not
   add noisy badges when usable prior data remains.
+- Local Git topology/status and remote GitHub data are independent snapshots. Local data refreshes
+  every minute without network traffic; branch enrichment survives reconstruction only while its
+  repository identity, worktree path, and full branch ref remain unchanged. Remote results captured
+  for an obsolete local binding are discarded before rebuilding active mappings and visible rows.
 - The footer becomes two compact lines describing tree navigation and the remapped direct actions;
   pane terminology disappears.
 

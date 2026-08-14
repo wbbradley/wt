@@ -235,7 +235,7 @@ Example:
 }
 ```
 
-`label`, `worktree_root`, `github_remote`, `repository_root`, and `github_hosts` are optional. `repository_root` defaults to `~/src` and is where unmapped authored-PR repositories are bootstrapped. Its leading `~`, `$VAR`, or `${VAR}` is expanded without evaluating shell syntax; relative paths, undefined variables, command substitutions, and existing non-directory roots are rejected. A configured `worktree_root` supplies the suggested destination for `wt worktree create` and is created on first use if it does not exist yet. The GitHub refresh interval defaults to 300 seconds and is clamped to a minimum of 30 seconds.
+`label`, `worktree_root`, `github_remote`, `repository_root`, and `github_hosts` are optional. `repository_root` defaults to `~/src` and is where unmapped authored-PR repositories are bootstrapped. Its leading `~`, `$VAR`, or `${VAR}` is expanded without evaluating shell syntax; relative paths, undefined variables, command substitutions, and existing non-directory roots are rejected. A configured `worktree_root` supplies the suggested destination for `wt worktree create` and is created on first use if it does not exist yet. Local catalog, worktree, ancestry, and status data refresh independently every 60 seconds. The GitHub refresh interval defaults to 300 seconds and is clamped to a minimum of 30 seconds.
 
 Catalog mutations use a sidecar lock next to the JSON file. PR materialization holds that lock continuously from repository bootstrap through registration, fetch, branch preparation, and linked-worktree creation. The TUI remains responsive and shows `waiting for catalog lock` while another process owns it.
 
@@ -245,7 +245,9 @@ For each local branch, `wt` prefers its configured upstream remote, then the cat
 
 At startup and on refresh, `wt` searches each configured or inferred host for open pull requests authored by the authenticated viewer, including drafts. Results arrive progressively in the background, are deduplicated by base repository and PR number, and retain the last complete snapshot if a host/page fails. `github.com` is always included; Enterprise hosts can be listed in `github_hosts` and are also inferred from cached local remotes. Enterprise GraphQL uses `https://<host>/api/graphql`.
 
-Successful authored-PR and local-branch enrichment snapshots are cached in `$XDG_CACHE_HOME/wt/github.json` (or `~/.cache/wt/github.json`) with mode `0600`. Set `WT_CACHE_PATH` to override the location. Cache entries are matched to both worktree path and full branch ref, so changing a checkout cannot display another branch's cached PR. Cache corruption or an unsupported future schema never prevents startup; `wt` falls back to the asynchronous network refresh.
+Successful authored-PR and local-branch enrichment snapshots are cached in `$XDG_CACHE_HOME/wt/github.json` (or `~/.cache/wt/github.json`) with mode `0600`. Set `WT_CACHE_PATH` to override the location. Cache entries are matched to the configured repository identity, worktree path, and full branch ref, so changing a checkout or its repository mapping cannot display stale PR data. Cache corruption or an unsupported future schema never prevents startup; `wt` falls back to the asynchronous network refresh.
+
+Periodic local refreshes do not generate GitHub traffic. They preserve branch-specific GitHub data only while the configured repository identity, worktree path, and full local branch ref still match the lookup that produced it. New, removed, detached, bare, trunk, or branch-switched worktrees remain free of stale PR associations until the next compatible GitHub result arrives. Pressing `r` still performs an ordered local refresh followed by a GitHub refresh.
 
 Tokens are resolved per host in this order:
 

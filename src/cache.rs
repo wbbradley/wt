@@ -13,8 +13,28 @@ use thiserror::Error;
 
 use crate::github::{GitHubRefresh, RepositoryGitHubInput};
 use crate::model::{
-    AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, PullRequestDetails,
+    AuthoredPullRequest, CanonicalPullRequestId, GitHubBranchData, GitHubRepositoryIdentity,
+    PullRequestDetails, RepositoryConfig,
 };
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CachedRepositoryBinding {
+    pub repository_path: PathBuf,
+    pub github_remote: Option<String>,
+    pub github_preferred_remote: Option<String>,
+    pub github_remotes: BTreeMap<String, GitHubRepositoryIdentity>,
+}
+
+impl From<&RepositoryConfig> for CachedRepositoryBinding {
+    fn from(repository: &RepositoryConfig) -> Self {
+        Self {
+            repository_path: repository.path.clone(),
+            github_remote: repository.github_remote.clone(),
+            github_preferred_remote: repository.github_preferred_remote.clone(),
+            github_remotes: repository.github_remotes.clone(),
+        }
+    }
+}
 
 #[cfg(not(test))]
 pub const CACHE_PATH_ENV: &str = "WT_CACHE_PATH";
@@ -24,6 +44,8 @@ const CACHE_VERSION: u32 = 1;
 pub struct CachedBranch {
     pub worktree: PathBuf,
     pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_binding: Option<CachedRepositoryBinding>,
     pub data: GitHubBranchData,
 }
 
@@ -77,30 +99,38 @@ impl RemoteCache {
         inputs: &[RepositoryGitHubInput],
         refresh: &GitHubRefresh,
     ) {
-        let current_branches: BTreeMap<PathBuf, String> = inputs
+        let current_branches: BTreeMap<PathBuf, (String, CachedRepositoryBinding)> = inputs
             .iter()
             .flat_map(|input| {
                 input
                     .worktrees
                     .iter()
                     .filter(|worktree| input.refreshes_worktree(worktree))
-            })
-            .filter_map(|worktree| {
-                worktree
-                    .branch
-                    .as_ref()
-                    .filter(|branch| branch.starts_with("refs/heads/"))
-                    .map(|branch| (worktree.path.clone(), branch.clone()))
+                    .filter_map(|worktree| {
+                        let branch = worktree
+                            .branch
+                            .as_ref()
+                            .filter(|branch| branch.starts_with("refs/heads/"))?;
+                        Some((
+                            worktree.path.clone(),
+                            (
+                                branch.clone(),
+                                CachedRepositoryBinding::from(&input.repository),
+                            ),
+                        ))
+                    })
             })
             .collect();
         self.branches.retain(|cached| {
             current_branches
                 .get(&cached.worktree)
-                .is_some_and(|branch| branch == &cached.branch)
+                .is_some_and(|(branch, binding)| {
+                    branch == &cached.branch && cached.repository_binding.as_ref() == Some(binding)
+                })
         });
 
         for (worktree, result) in &refresh.branches {
-            let Some(branch) = current_branches.get(worktree) else {
+            let Some((branch, binding)) = current_branches.get(worktree) else {
                 continue;
             };
             let Ok(data) = result else {
@@ -111,6 +141,7 @@ impl RemoteCache {
             self.branches.push(CachedBranch {
                 worktree: worktree.clone(),
                 branch: branch.clone(),
+                repository_binding: Some(binding.clone()),
                 data: data.clone(),
             });
         }
@@ -157,6 +188,7 @@ impl RemoteCache {
 
     pub fn record_materialized_pull_request(
         &mut self,
+        repository: &RepositoryConfig,
         worktree: &Path,
         branch: &str,
         pull_request: AuthoredPullRequest,
@@ -166,6 +198,7 @@ impl RemoteCache {
         self.branches.push(CachedBranch {
             worktree: worktree.to_owned(),
             branch,
+            repository_binding: Some(CachedRepositoryBinding::from(repository)),
             data: GitHubBranchData {
                 pull_request: Some(pull_request.pull_request.clone()),
                 warnings: Vec::new(),
@@ -187,12 +220,18 @@ impl RemoteCache {
         self.updated_at_epoch_seconds = epoch_seconds();
     }
 
-    pub fn record_created_worktree(&mut self, worktree: &Path, branch: &str) {
+    pub fn record_created_worktree(
+        &mut self,
+        repository: &RepositoryConfig,
+        worktree: &Path,
+        branch: &str,
+    ) {
         let branch = format!("refs/heads/{branch}");
         self.branches.retain(|cached| cached.worktree != worktree);
         self.branches.push(CachedBranch {
             worktree: worktree.to_owned(),
             branch,
+            repository_binding: Some(CachedRepositoryBinding::from(repository)),
             data: GitHubBranchData {
                 pull_request: None,
                 warnings: Vec::new(),
@@ -537,6 +576,37 @@ mod tests {
     }
 
     #[test]
+    fn legacy_branch_binding_is_pruned_without_discarding_independent_remote_data() {
+        let path = PathBuf::from("/repo");
+        let authored = authored(1);
+        let details = CachedPullRequestDetails {
+            identity: authored.identity.clone(),
+            details: PullRequestDetails::default(),
+        };
+        let mut cache = RemoteCache {
+            branches: vec![CachedBranch {
+                worktree: path.clone(),
+                branch: "refs/heads/topic".to_owned(),
+                repository_binding: None,
+                data: GitHubBranchData {
+                    pull_request: Some(authored.pull_request.clone()),
+                    warnings: Vec::new(),
+                    rate_limit: None,
+                },
+            }],
+            authored_pull_requests: vec![authored.clone()],
+            pull_request_details: vec![details.clone()],
+            ..RemoteCache::default()
+        };
+
+        cache.merge_branch_refresh(&[input(&path, "topic")], &GitHubRefresh::default());
+
+        assert!(cache.branches.is_empty());
+        assert_eq!(cache.authored_pull_requests, vec![authored]);
+        assert_eq!(cache.pull_request_details, vec![details]);
+    }
+
+    #[test]
     fn branch_updates_reject_changed_branches_and_retain_success_on_failure() {
         let path = PathBuf::from("/repo");
         let mut cache = RemoteCache::default();
@@ -575,6 +645,9 @@ mod tests {
             branches: vec![CachedBranch {
                 worktree: path.clone(),
                 branch: "refs/heads/topic".to_owned(),
+                repository_binding: Some(CachedRepositoryBinding::from(
+                    &input(&path, "topic").repository,
+                )),
                 data: GitHubBranchData {
                     pull_request: Some(selected.pull_request.clone()),
                     warnings: Vec::new(),
@@ -624,6 +697,7 @@ mod tests {
             branches: vec![CachedBranch {
                 worktree: path.clone(),
                 branch: "refs/heads/main".to_owned(),
+                repository_binding: Some(CachedRepositoryBinding::from(&input.repository)),
                 data,
             }],
             ..RemoteCache::default()
@@ -642,6 +716,7 @@ mod tests {
             branches: vec![CachedBranch {
                 worktree: path.clone(),
                 branch: "refs/heads/old".to_owned(),
+                repository_binding: None,
                 data: GitHubBranchData {
                     pull_request: None,
                     warnings: vec!["stale".to_owned()],
@@ -653,8 +728,9 @@ mod tests {
             ..RemoteCache::default()
         };
         let refreshed = authored(2);
+        let repository = input(Path::new("/repo"), "topic-2").repository;
 
-        cache.record_materialized_pull_request(&path, "topic-2", refreshed.clone());
+        cache.record_materialized_pull_request(&repository, &path, "topic-2", refreshed.clone());
 
         assert_eq!(cache.branches.len(), 1);
         assert_eq!(cache.branches[0].worktree, path);
