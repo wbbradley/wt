@@ -29,6 +29,7 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
     }
 
     let mut output = String::new();
+    let mut has_thread_comments = false;
     for pull_request in actionable {
         let repository = &pull_request.identity.repository;
         if pull_request.pull_request.head.branch.is_empty() {
@@ -55,12 +56,13 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
             .filter_map(|feedback| feedback.database_id.map(|id| (feedback, id)))
             .collect::<Vec<_>>();
         if !thread_comments.is_empty() {
+            has_thread_comments = true;
             output.push_str("\nComment IDs:\n");
             for (feedback, id) in thread_comments {
                 output.push_str(&format!("  - {id} - {}\n", excerpt(&feedback.body)));
             }
             output.push_str(
-                "\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\n",
+                "\nPlease use the following command to investigate each review comment.\n```\n",
             );
             output.push_str(&format!(
                 "gh api --hostname {} repos/{}/{}/pulls/comments/$comment_id --jq '{{id,path,line,body,created_at,updated_at}}'\n```\n",
@@ -125,6 +127,9 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
         output.push('\n');
     }
     output.truncate(output.trim_end_matches('\n').len());
+    if has_thread_comments {
+        output.push_str("\n\nFix, reply to the comments, and mark as resolved as appropriate.");
+    }
     Some(output)
 }
 
@@ -389,7 +394,7 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "In feature (#42 Fix feedback):\n\nUse this existing checkout:\n```bash\ncd -- '/worktrees/feature'\n```\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nComment IDs:\n  - 91 - Summary • split this line • follow up\n\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/comments/$comment_id --jq '{id,path,line,body,created_at,updated_at}'\n```\n\nReview IDs:\n  - 92 - Please add coverage\n\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/42/reviews/$review_id --jq '{id,body,state,submitted_at}'\n```\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)"
+            "In feature (#42 Fix feedback):\n\nUse this existing checkout:\n```bash\ncd -- '/worktrees/feature'\n```\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nComment IDs:\n  - 91 - Summary • split this line • follow up\n\nPlease use the following command to investigate each review comment.\n```\ngh api --hostname git.example.com repos/base/project/pulls/comments/$comment_id --jq '{id,path,line,body,created_at,updated_at}'\n```\n\nReview IDs:\n  - 92 - Please add coverage\n\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/42/reviews/$review_id --jq '{id,body,state,submitted_at}'\n```\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nFix, reply to the comments, and mark as resolved as appropriate."
         );
         assert!(!actual.contains("https://git.example.com/comment/91"));
         assert!(!actual.contains("not merge-required"));
