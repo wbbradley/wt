@@ -428,7 +428,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 spans.extend(local_state);
                 spans.extend(suffix);
                 if backburnered {
-                    for span in &mut spans {
+                    for span in spans.iter_mut().skip(2) {
                         span.style = span.style.add_modifier(Modifier::DIM);
                     }
                 }
@@ -509,7 +509,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ];
                 spans.extend(suffix);
                 if backburnered {
-                    for span in &mut spans {
+                    for span in spans.iter_mut().skip(2) {
                         span.style = span.style.add_modifier(Modifier::DIM);
                     }
                 }
@@ -2149,6 +2149,21 @@ mod tests {
         assert!(expanded.contains("PR #42"));
         assert!(expanded.contains("virtual feature"));
         assert!(expanded.contains("backburner"));
+        let expanded_buffer = terminal.backend().buffer();
+        let backburnered_row = buffer_lines(expanded_buffer)
+            .iter()
+            .position(|line| line.contains("virtual feature"))
+            .unwrap() as u16;
+        let connectors = (1..expanded_buffer.area.width.saturating_sub(1))
+            .map(|x| &expanded_buffer[(x, backburnered_row)])
+            .filter(|cell| matches!(cell.symbol(), "│" | "├" | "└" | "─" | "▾" | "▸"))
+            .collect::<Vec<_>>();
+        assert!(!connectors.is_empty());
+        assert!(
+            connectors
+                .iter()
+                .all(|cell| cell.fg == MUTED && !cell.modifier.contains(Modifier::DIM))
+        );
     }
 
     #[test]
