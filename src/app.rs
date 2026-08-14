@@ -13,7 +13,8 @@ use crate::model::{
     SubmittedReviewState, Worktree, WorktreeStatus,
 };
 use crate::prompt::{
-    PromptPullRequest, concise_comment_text, format_agent_prompt, format_review_request,
+    PromptPullRequest, PromptWorktree, concise_comment_text, format_agent_prompt,
+    format_review_request,
 };
 
 const LIST_SCROLL_MARGIN: usize = 5;
@@ -2934,6 +2935,7 @@ impl App {
                         .cloned()
                         .collect(),
                     feedback: Vec::new(),
+                    worktree: pull_request.worktree.clone(),
                 })
                 .into_iter()
                 .collect(),
@@ -2948,6 +2950,7 @@ impl App {
                         .into_iter()
                         .filter(|feedback| feedback.id == *id)
                         .collect(),
+                    worktree: pull_request.worktree.clone(),
                 })
                 .into_iter()
                 .collect(),
@@ -2966,6 +2969,7 @@ impl App {
                         })
                         .cloned()
                         .collect(),
+                    worktree: pull_request.worktree.clone(),
                 })
                 .into_iter()
                 .collect(),
@@ -3007,6 +3011,7 @@ impl App {
                     } else {
                         Vec::new()
                     },
+                    worktree: pull_request.worktree.clone(),
                 })
                 .into_iter()
                 .collect(),
@@ -3343,7 +3348,64 @@ impl App {
                 .flat_map(|details| &details.feedback)
                 .cloned()
                 .collect(),
+            worktree: self.prompt_worktree(identity, pull_request),
         }
+    }
+
+    fn prompt_worktree(
+        &self,
+        identity: &CanonicalPullRequestId,
+        pull_request: &PullRequest,
+    ) -> Option<PromptWorktree> {
+        let associated = self.repositories.iter().flat_map(|repository| {
+            repository.worktrees.iter().filter_map(|worktree| {
+                let candidate = self
+                    .github
+                    .get(&worktree.path)
+                    .and_then(GitHubState::data)
+                    .and_then(|data| data.pull_request.as_ref())?;
+                (self.pull_request_identity(repository, candidate).as_ref() == Some(identity))
+                    .then_some(worktree)
+            })
+        });
+
+        let matching_repository = |repository: &&RepositoryView| {
+            repository
+                .config
+                .github_remotes
+                .values()
+                .any(|candidate| candidate == &identity.repository)
+        };
+        let fallback = self
+            .repositories
+            .iter()
+            .filter(matching_repository)
+            .flat_map(|repository| &repository.worktrees)
+            .filter(|worktree| !worktree.bare)
+            .filter(|worktree| {
+                worktree.head.as_deref() == pull_request.head.oid.as_deref()
+                    || worktree.branch.as_deref().is_some_and(|branch| {
+                        branch.strip_prefix("refs/heads/").unwrap_or(branch)
+                            == pull_request.head.branch
+                    })
+            });
+
+        associated
+            .chain(fallback)
+            .max_by_key(|worktree| {
+                (
+                    worktree.head.as_deref() == pull_request.head.oid.as_deref(),
+                    worktree.branch.as_deref().is_some_and(|branch| {
+                        branch.strip_prefix("refs/heads/").unwrap_or(branch)
+                            == pull_request.head.branch
+                    }),
+                )
+            })
+            .map(|worktree| PromptWorktree {
+                path: worktree.path.clone(),
+                branch: worktree.branch.clone(),
+                head: worktree.head.clone(),
+            })
     }
 
     fn pull_request_stack_identities(
@@ -4396,6 +4458,29 @@ mod tests {
             locked: None,
             prunable: None,
         }
+    }
+
+    #[test]
+    fn prompt_worktree_uses_mapped_repository_branch_and_reports_local_head() {
+        let authored = authored("team", "project", 42, "2026-01-01T00:00:00Z");
+        let identity = authored.identity.clone();
+        let mut repository = repository("/repo", true);
+        repository.config.github_remotes.insert(
+            "origin".to_owned(),
+            GitHubRepositoryIdentity::canonical("github.com", "team", "project"),
+        );
+        repository.worktrees[1].branch = Some("refs/heads/topic-42".to_owned());
+        repository.worktrees[1].head = Some("local-head".to_owned());
+        let app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+
+        assert_eq!(
+            app.prompt_worktree(&identity, &authored.pull_request),
+            Some(PromptWorktree {
+                path: PathBuf::from("/repo-topic"),
+                branch: Some("refs/heads/topic-42".to_owned()),
+                head: Some("local-head".to_owned()),
+            })
+        );
     }
 
     fn authored(

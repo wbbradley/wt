@@ -145,17 +145,21 @@ Direct actions:
 
 All actions remain in the palette, disabled entries explain why, and mutating forms show exact inputs before a separate confirmation. `n` pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk. A successful tracked-worktree creation exits so the shell wrapper can enter it.
 
-For `c`, a check or comment row is exact, including an individually selected passing check. Checks selects failing checks only, Open comments selects unresolved inline comments only, Reviewers selects review summaries, and a reviewer selects that reviewer's summaries. Container scopes include failing checks and unresolved inline comments, never historical review summaries: a branch includes itself and descendants; Stacked branches excludes the parent; a repository excludes Backburner; and Backburner selects its represented subtrees. Scope ignores current folds and filters, deduplicates canonical identities, and retains tree pre-order. The copied prompt follows Rollup's grouped `In branch (#PR title)` format, lists stored comment/review IDs with reusable `gh api` commands, includes check URLs, and asks for a worktree when necessary. Empty scopes report `c: nothing to address here` without changing the clipboard.
+For `c`, a check or comment row is exact, including an individually selected passing check. Checks selects failing checks only, Open comments selects unresolved inline comments only, Reviewers selects review summaries, and a reviewer selects that reviewer's summaries. Container scopes include failing checks and unresolved inline comments, never historical review summaries: a branch includes itself and descendants; Stacked branches excludes the parent; a repository excludes Backburner; and Backburner selects its represented subtrees. Scope ignores current folds and filters, deduplicates canonical identities, and retains tree pre-order. The copied prompt follows Rollup's grouped `In branch (#PR title)` format, provides a shell-safe `cd` command for the mapped worktree, reports its checked-out branch and local HEAD relative to the PR head, lists stored comment/review IDs with reusable `gh api` commands, and includes check URLs. Empty scopes report `c: nothing to address here` without changing the clipboard.
 
 For `p`, a leaf or non-stacking section selects its owning PR and container scopes mirror `c`. Leading conventional-commit prefixes are removed and drafts end in ` - DRAFT`. A truly empty scope reports `p: no PR under selection` without changing the clipboard.
 
 ```text
 In feature/login (#42 Fix login race):
 
+Use this existing checkout:
+```bash
+cd -- '/Users/me/src/web-login'
+```
+Branch `feature/login` is checked out there. Local HEAD `98c549d2` matches the PR head.
+
 Checks:
   - integration (https://github.com/acme/web/actions/runs/123)
-
-Use a worktree if the relevant branches are not already active in the current worktree.
 ```
 
 Authored PRs are grouped under their canonical base `owner/repository`. `[no local repo]` means the base repository is not registered; `virtual-only` means no local worktree represents that PR. Enter materializes a virtual row after a live SHA recheck. Ordinary worktree actions and direct selectors never materialize implicitly.

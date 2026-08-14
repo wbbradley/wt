@@ -1,6 +1,14 @@
 use crate::model::{
     CanonicalPullRequestId, FeedbackKind, PullRequest, PullRequestCheck, PullRequestFeedback,
 };
+use std::path::PathBuf;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptWorktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptPullRequest {
@@ -8,6 +16,7 @@ pub struct PromptPullRequest {
     pub pull_request: PullRequest,
     pub checks: Vec<PullRequestCheck>,
     pub feedback: Vec<PullRequestFeedback>,
+    pub worktree: Option<PromptWorktree>,
 }
 
 pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String> {
@@ -35,6 +44,9 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
                 pull_request.pull_request.title,
             ));
         }
+
+        output.push('\n');
+        format_worktree_guidance(&mut output, pull_request);
 
         let thread_comments = pull_request
             .feedback
@@ -112,10 +124,65 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
         }
         output.push('\n');
     }
-    output.push_str(
-        "Use a worktree if the relevant branches are not already active in the current worktree.",
-    );
+    output.truncate(output.trim_end_matches('\n').len());
     Some(output)
+}
+
+fn format_worktree_guidance(output: &mut String, pull_request: &PromptPullRequest) {
+    let Some(worktree) = &pull_request.worktree else {
+        output.push_str("No existing worktree is mapped to this pull request.\n");
+        return;
+    };
+
+    let branch = worktree
+        .branch
+        .as_deref()
+        .and_then(|branch| branch.strip_prefix("refs/heads/").or(Some(branch)));
+    output.push_str("Use this existing checkout:\n```bash\ncd -- ");
+    output.push_str(&shell_quote(&worktree.path.to_string_lossy()));
+    output.push_str("\n```\n");
+    if let Some(branch) = branch {
+        output.push_str("Branch `");
+        output.push_str(branch);
+        output.push_str("` is checked out there. ");
+    }
+
+    match (
+        worktree.head.as_deref(),
+        pull_request.pull_request.head.oid.as_deref(),
+    ) {
+        (Some(local), Some(remote)) if local == remote => {
+            output.push_str("Local HEAD `");
+            output.push_str(&short_commit(local));
+            output.push_str("` matches the PR head.\n");
+        }
+        (Some(local), Some(remote)) => {
+            output.push_str("Local HEAD `");
+            output.push_str(&short_commit(local));
+            output.push_str("` does not match PR head `");
+            output.push_str(&short_commit(remote));
+            output.push_str("`; synchronize it before addressing this feedback.\n");
+        }
+        (Some(local), None) => {
+            output.push_str("Local HEAD is `");
+            output.push_str(&short_commit(local));
+            output.push_str("`; the PR head commit is unavailable.\n");
+        }
+        (None, Some(remote)) => {
+            output.push_str("Local HEAD is unavailable; confirm it matches PR head `");
+            output.push_str(&short_commit(remote));
+            output.push_str("` before making changes.\n");
+        }
+        (None, None) => output.push('\n'),
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn short_commit(commit: &str) -> String {
+    commit.chars().take(8).collect()
 }
 
 pub fn format_review_request(pull_requests: &[PromptPullRequest]) -> Option<String> {
@@ -257,7 +324,7 @@ mod tests {
                 head: PullRequestIdentity {
                     repository: Some("fork/project".to_owned()),
                     branch: "feature".to_owned(),
-                    oid: None,
+                    oid: Some("98c549d29609856a5f29851fbea2a0a5607c65e0".to_owned()),
                 },
                 checks: CheckRollup::Failure,
             },
@@ -309,6 +376,11 @@ mod tests {
                     outdated: true,
                 },
             ],
+            worktree: Some(PromptWorktree {
+                path: PathBuf::from("/worktrees/feature"),
+                branch: Some("refs/heads/feature".to_owned()),
+                head: Some("98c549d29609856a5f29851fbea2a0a5607c65e0".to_owned()),
+            }),
         }
     }
 
@@ -317,7 +389,7 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "In feature (#42 Fix feedback):\n\nComment IDs:\n  - 91 - Summary • split this line • follow up\n\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/comments/$comment_id --jq '{id,path,line,body,created_at,updated_at}'\n```\n\nReview IDs:\n  - 92 - Please add coverage\n\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/42/reviews/$review_id --jq '{id,body,state,submitted_at}'\n```\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nUse a worktree if the relevant branches are not already active in the current worktree."
+            "In feature (#42 Fix feedback):\n\nUse this existing checkout:\n```bash\ncd -- '/worktrees/feature'\n```\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nComment IDs:\n  - 91 - Summary • split this line • follow up\n\nPlease use the following command to investigate each review comment. Fix, reply to the comments, and mark as resolved as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/comments/$comment_id --jq '{id,path,line,body,created_at,updated_at}'\n```\n\nReview IDs:\n  - 92 - Please add coverage\n\nPlease use the following command to investigate each review summary and respond as appropriate.\n```\ngh api --hostname git.example.com repos/base/project/pulls/42/reviews/$review_id --jq '{id,body,state,submitted_at}'\n```\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)"
         );
         assert!(!actual.contains("https://git.example.com/comment/91"));
         assert!(!actual.contains("not merge-required"));
@@ -330,6 +402,33 @@ mod tests {
         pull_request.feedback.clear();
         assert_eq!(format_agent_prompt(&[pull_request]), None);
         assert_eq!(format_agent_prompt(&[]), None);
+    }
+
+    #[test]
+    fn reports_stale_and_missing_worktree_state_without_guessing() {
+        let mut stale = pull_request();
+        stale.worktree.as_mut().unwrap().head =
+            Some("0123456789abcdef0123456789abcdef01234567".to_owned());
+        let stale_prompt = format_agent_prompt(&[stale]).unwrap();
+        assert!(stale_prompt.contains(
+            "Local HEAD `01234567` does not match PR head `98c549d2`; \
+             synchronize it before addressing this feedback."
+        ));
+
+        let mut missing = pull_request();
+        missing.worktree = None;
+        let missing_prompt = format_agent_prompt(&[missing]).unwrap();
+        assert!(missing_prompt.contains("No existing worktree is mapped to this pull request."));
+        assert!(!missing_prompt.contains("Use a worktree if"));
+    }
+
+    #[test]
+    fn checkout_command_shell_quotes_the_worktree_path() {
+        let mut pull_request = pull_request();
+        pull_request.worktree.as_mut().unwrap().path = PathBuf::from("/work trees/reviewer's");
+
+        let prompt = format_agent_prompt(&[pull_request]).unwrap();
+        assert!(prompt.contains("cd -- '/work trees/reviewer'\\''s'"));
     }
 
     #[test]
@@ -366,7 +465,7 @@ mod tests {
             "Comments:\n  - https://git.example.com/comment/fallback - {}\n",
             "x".repeat(100)
         )));
-        assert!(actual.contains("  - node-only - review • summary\n"));
+        assert!(actual.contains("  - node-only - review • summary"));
         assert!(!actual.contains("Comment IDs:"));
         assert!(!actual.contains("Review IDs:"));
     }
