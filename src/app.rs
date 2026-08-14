@@ -1045,6 +1045,35 @@ impl App {
         for index in cyclic {
             nodes[index].parent = None;
         }
+        let mut backburner_lineage = nodes
+            .iter()
+            .map(|node| {
+                node.identity
+                    .as_ref()
+                    .is_some_and(|identity| self.backburner.contains(identity))
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..nodes.len() {
+            let mut changed = false;
+            for index in 0..nodes.len() {
+                if !backburner_lineage[index]
+                    && nodes[index]
+                        .parent
+                        .is_some_and(|parent| backburner_lineage[parent])
+                {
+                    backburner_lineage[index] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (index, node) in nodes.iter_mut().enumerate() {
+            if matches!(node.source, BranchSource::VirtualPullRequest { .. }) {
+                node.virtual_backburnered = backburner_lineage[index];
+            }
+        }
         for child in 0..nodes.len() {
             if let Some(parent) = nodes[child].parent {
                 nodes[parent].children.push(child);
@@ -6208,6 +6237,57 @@ mod tests {
             app.backburner, membership,
             "incomplete refreshes never prune state"
         );
+    }
+
+    #[test]
+    fn virtual_descendants_follow_a_backburnered_parent_into_the_backburner_tree() {
+        let mut parent = authored("team", "project", 1, "2026-01-01");
+        parent.pull_request.head.branch = "stack-parent".to_owned();
+        let mut child = authored("team", "project", 2, "2026-01-02");
+        child.pull_request.base = parent.pull_request.head.clone();
+        child.pull_request.head.branch = "stack-child".to_owned();
+        let unrelated = authored("team", "project", 3, "2026-01-03");
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: parent.identity.repository.clone(),
+            mapped_repository: None,
+            expanded: true,
+            pull_requests: vec![child.clone(), unrelated.clone(), parent.clone()],
+        }];
+        app.backburner.insert(parent.identity.clone());
+
+        let collapsed = app.visible_rows();
+        assert!(
+            collapsed
+                .iter()
+                .any(|row| row.id() == &RowId::VirtualPullRequest(unrelated.identity.clone()))
+        );
+        for identity in [&parent.identity, &child.identity] {
+            assert!(
+                !collapsed
+                    .iter()
+                    .any(|row| row.id() == &RowId::VirtualPullRequest(identity.clone()))
+            );
+        }
+
+        app.set_disclosure_expanded(
+            DisclosureKey::Backburner(parent.identity.repository.clone()),
+            true,
+        );
+        let expanded = app.visible_rows();
+        let backburner = expanded
+            .iter()
+            .position(|row| row.id() == &RowId::Backburner(parent.identity.repository.clone()))
+            .unwrap();
+        let parent_row = expanded
+            .iter()
+            .position(|row| row.id() == &RowId::VirtualPullRequest(parent.identity.clone()))
+            .unwrap();
+        let child_row = expanded
+            .iter()
+            .position(|row| row.id() == &RowId::VirtualPullRequest(child.identity.clone()))
+            .unwrap();
+        assert!(backburner < parent_row && parent_row < child_row);
     }
 
     #[test]
