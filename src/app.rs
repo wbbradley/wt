@@ -236,6 +236,7 @@ pub enum VisibleRow {
         worktree_index: usize,
         stack_depth: usize,
         expanded: bool,
+        has_children: bool,
         id: RowId,
     },
     VirtualRepository {
@@ -248,6 +249,7 @@ pub enum VisibleRow {
         mapped_repository_index: Option<usize>,
         stack_depth: usize,
         expanded: bool,
+        has_children: bool,
         id: RowId,
     },
     Backburner {
@@ -867,7 +869,11 @@ impl App {
             } => Some(DisclosureKey::Repository(
                 self.repositories[*repository_index].config.path.clone(),
             )),
-            VisibleRow::Worktree { id, .. } => {
+            VisibleRow::Worktree {
+                id,
+                has_children: true,
+                ..
+            } => {
                 let RowId::Worktree(path) = id else {
                     return None;
                 };
@@ -881,7 +887,11 @@ impl App {
                     .identity
                     .clone(),
             )),
-            VisibleRow::VirtualPullRequest { id, .. } => {
+            VisibleRow::VirtualPullRequest {
+                id,
+                has_children: true,
+                ..
+            } => {
                 let RowId::VirtualPullRequest(identity) = id else {
                     return None;
                 };
@@ -903,7 +913,15 @@ impl App {
                 expanded: Some(_),
                 ..
             } => Some(DisclosureKey::Section(owner.clone(), *section)),
-            VisibleRow::Inline { .. } => None,
+            VisibleRow::Worktree {
+                has_children: false,
+                ..
+            }
+            | VisibleRow::VirtualPullRequest {
+                has_children: false,
+                ..
+            }
+            | VisibleRow::Inline { .. } => None,
         }
     }
 
@@ -1197,6 +1215,17 @@ impl App {
             return;
         }
         let expanded = self.disclosure_expanded(&DisclosureKey::Branch(node.id.clone()), true);
+        let mut children = Vec::new();
+        self.append_branch_contents(
+            &mut children,
+            forest,
+            included,
+            index,
+            depth + 1,
+            mapped_repository_index,
+            flattened_worktree,
+        );
+        let has_children = !children.is_empty();
         match node.source {
             BranchSource::Worktree {
                 repository_index,
@@ -1206,6 +1235,7 @@ impl App {
                 worktree_index,
                 stack_depth: depth.saturating_sub(1),
                 expanded,
+                has_children,
                 id: RowId::Worktree(
                     self.repositories[repository_index].worktrees[worktree_index]
                         .path
@@ -1221,6 +1251,7 @@ impl App {
                 mapped_repository_index,
                 stack_depth: depth.saturating_sub(1),
                 expanded,
+                has_children,
                 id: RowId::VirtualPullRequest(
                     self.virtual_repositories[virtual_repository_index].pull_requests
                         [pull_request_index]
@@ -1229,18 +1260,9 @@ impl App {
                 ),
             }),
         }
-        if !expanded {
-            return;
+        if expanded {
+            rows.extend(children);
         }
-        self.append_branch_contents(
-            rows,
-            forest,
-            included,
-            index,
-            depth + 1,
-            mapped_repository_index,
-            flattened_worktree,
-        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3825,13 +3847,21 @@ impl App {
                 kind: InlineRowKind::Section,
                 ..
             }) => self.set_disclosure_expanded(DisclosureKey::Section(owner, section), true),
-            Some(VisibleRow::Worktree { id, .. }) => {
+            Some(VisibleRow::Worktree {
+                id,
+                has_children: true,
+                ..
+            }) => {
                 let RowId::Worktree(path) = id else {
                     return;
                 };
                 self.set_disclosure_expanded(DisclosureKey::Branch(BranchId::Worktree(path)), true);
             }
-            Some(VisibleRow::VirtualPullRequest { id, .. }) => {
+            Some(VisibleRow::VirtualPullRequest {
+                id,
+                has_children: true,
+                ..
+            }) => {
                 let RowId::VirtualPullRequest(identity) = id else {
                     return;
                 };
@@ -3864,7 +3894,16 @@ impl App {
                     .clone();
                 self.set_disclosure_expanded(DisclosureKey::Backburner(identity), true);
             }
-            Some(VisibleRow::Inline { .. }) | None => return,
+            Some(VisibleRow::Worktree {
+                has_children: false,
+                ..
+            })
+            | Some(VisibleRow::VirtualPullRequest {
+                has_children: false,
+                ..
+            })
+            | Some(VisibleRow::Inline { .. })
+            | None => return,
         }
         self.ensure_selected_in_view();
     }
@@ -5922,6 +5961,26 @@ mod tests {
                 id: RowId::OpenComment(found, _), text, ..
             } if found == &identity && text == "@reviewer still relevant • after merge")
         }));
+        assert!(rows.iter().any(|row| {
+            matches!(row, VisibleRow::VirtualPullRequest {
+                id: RowId::VirtualPullRequest(found), has_children: true, ..
+            } if found == &identity)
+        }));
+
+        app.pull_request_details
+            .get_mut(&identity)
+            .unwrap()
+            .feedback
+            .clear();
+        assert!(app.visible_rows().iter().any(|row| {
+            matches!(row, VisibleRow::VirtualPullRequest {
+                id: RowId::VirtualPullRequest(found), has_children: false, ..
+            } if found == &identity)
+        }));
+        app.selected = Some(RowId::VirtualPullRequest(identity));
+        let disclosures = app.disclosure_expanded.clone();
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.disclosure_expanded, disclosures);
     }
 
     #[test]

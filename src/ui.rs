@@ -369,6 +369,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 repository_index,
                 worktree_index,
                 expanded,
+                has_children,
                 ..
             } => {
                 let repository = &app.repositories[*repository_index];
@@ -401,7 +402,11 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     app.github_spinner_frame(),
                 ));
                 let local_state = local_state_spans(app.statuses.get(&worktree.path), worktree);
-                let tree_prefix = disclosure_tree_prefix(tree_prefix, *expanded);
+                let tree_prefix = if *has_children {
+                    disclosure_tree_prefix(tree_prefix, *expanded)
+                } else {
+                    tree_prefix
+                };
                 let prefix_width = 2 + display_width(&tree_prefix);
                 let line_width = area.width.saturating_sub(3) as usize;
                 let priority_suffix_width = local_state
@@ -468,6 +473,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 virtual_repository_index,
                 pull_request_index,
                 expanded,
+                has_children,
                 ..
             } => {
                 let pull_request = &app.virtual_repositories[*virtual_repository_index]
@@ -481,7 +487,11 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     backburnered,
                     false,
                 );
-                let tree_prefix = disclosure_tree_prefix(tree_prefix, *expanded);
+                let tree_prefix = if *has_children {
+                    disclosure_tree_prefix(tree_prefix, *expanded)
+                } else {
+                    tree_prefix
+                };
                 let line_width = area.width.saturating_sub(3) as usize;
                 let prefix_width = 2 + display_width(&tree_prefix);
                 let priority_suffix_width =
@@ -1896,7 +1906,7 @@ mod tests {
         assert!(content.contains("└─▾project"));
         assert!(content.contains("└─▾parent"));
         assert!(content.contains("Stacked worktrees"));
-        assert!(content.contains("└─▾child"));
+        assert!(content.contains("└─ child"));
         assert!(!content.contains("Worktree ·"));
         assert!(colored_text(buffer, MUTED).contains("Stacked worktrees"));
     }
