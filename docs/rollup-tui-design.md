@@ -97,10 +97,9 @@ The remaining differences are deliberate:
 - `wt` truncates every tree item to one terminal-display-width line and retains attention-only PR
   state alongside compact local dirtiness, lock, and prunable badges. Rollup's PR row has no
   corresponding local state.
-- Backburnered local worktrees remain in ordinary local ancestry, dimmed and marked, while virtual
-  members move under Backburner. Rollup can move every represented PR because none owns a local
-  worktree. Both implementations exclude Backburner from repository copy scopes and normal
-  attention traversal unless it is explicitly selected.
+- Backburnered branches move under Backburner as complete represented subtrees, including local
+  worktrees and virtual descendants. Both implementations exclude Backburner from repository copy
+  scopes and normal attention traversal unless it is explicitly selected.
 - `wt` retains its action palette and confirmed worktree/repository mutations. Those operations do
   not exist in Rollup and are intentionally layered around the shared tree behavior.
 

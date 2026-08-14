@@ -578,19 +578,24 @@ impl App {
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         let forest = self.branch_forest(Some(repository_index), &virtual_repository_indexes);
-        let normal = self.included_branch_nodes(&forest, |node| !node.virtual_backburnered);
-        let backburner = self.included_branch_nodes(&forest, |node| node.virtual_backburnered);
-        let singleton_worktree_index = repository
+        let normal = self.included_branch_nodes(&forest, |node| !node.backburnered);
+        let backburner = self.included_branch_nodes(&forest, |node| node.backburnered);
+        let candidate_singleton_worktree_index = repository
             .singleton_worktree()
             .map(|(worktree_index, _)| worktree_index);
-        let singleton_node = singleton_worktree_index.and_then(|worktree_index| {
-            forest.nodes.iter().position(|node| {
-                node.source
-                    == BranchSource::Worktree {
-                        repository_index,
-                        worktree_index,
-                    }
-            })
+        let candidate_singleton_node =
+            candidate_singleton_worktree_index.and_then(|worktree_index| {
+                forest.nodes.iter().position(|node| {
+                    node.source
+                        == BranchSource::Worktree {
+                            repository_index,
+                            worktree_index,
+                        }
+                })
+            });
+        let singleton_node = candidate_singleton_node.filter(|index| normal.contains(index));
+        let singleton_worktree_index = singleton_node.map(|_| {
+            candidate_singleton_worktree_index.expect("singleton node has a worktree index")
         });
         let mut children = Vec::new();
         self.append_repository_branch_roots(
@@ -609,7 +614,8 @@ impl App {
                 .iter()
                 .copied()
                 .filter(|index| {
-                    forest.nodes[*index]
+                    let root = backburner_root_index(&forest, *index);
+                    forest.nodes[root]
                         .identity
                         .as_ref()
                         .is_some_and(|candidate| candidate.repository == identity)
@@ -649,8 +655,8 @@ impl App {
     ) {
         let repository = &self.virtual_repositories[virtual_repository_index];
         let forest = self.branch_forest(None, &[virtual_repository_index]);
-        let normal = self.included_branch_nodes(&forest, |node| !node.virtual_backburnered);
-        let backburner = self.included_branch_nodes(&forest, |node| node.virtual_backburnered);
+        let normal = self.included_branch_nodes(&forest, |node| !node.backburnered);
+        let backburner = self.included_branch_nodes(&forest, |node| node.backburnered);
         rows.push(VisibleRow::VirtualRepository {
             virtual_repository_index,
             id: repository.id(),
@@ -957,7 +963,7 @@ impl App {
                     pull_request,
                     parent: None,
                     children: Vec::new(),
-                    virtual_backburnered: false,
+                    backburnered: false,
                 });
             }
         }
@@ -981,7 +987,7 @@ impl App {
                     pull_request: Some(authored.pull_request.clone()),
                     parent: None,
                     children: Vec::new(),
-                    virtual_backburnered: self.backburner.contains(&authored.identity),
+                    backburnered: self.backburner.contains(&authored.identity),
                 });
             }
         }
@@ -1070,9 +1076,7 @@ impl App {
             }
         }
         for (index, node) in nodes.iter_mut().enumerate() {
-            if matches!(node.source, BranchSource::VirtualPullRequest { .. }) {
-                node.virtual_backburnered = backburner_lineage[index];
-            }
+            node.backburnered = backburner_lineage[index];
         }
         for child in 0..nodes.len() {
             if let Some(parent) = nodes[child].parent {
@@ -3508,7 +3512,13 @@ impl App {
         let forest = self.branch_forest(Some(repository_index), &virtual_indexes);
         forest_identity_order(&forest)
             .into_iter()
-            .filter(|identity| !self.backburner.contains(identity))
+            .filter(|identity| {
+                forest
+                    .nodes
+                    .iter()
+                    .find(|node| node.identity.as_ref() == Some(identity))
+                    .is_some_and(|node| !node.backburnered)
+            })
             .collect()
     }
 
@@ -3544,8 +3554,22 @@ impl App {
         forest_identity_order(&forest)
             .into_iter()
             .filter(|identity| {
-                identity.repository == *repository
-                    && self.backburner.contains(identity) == backburner_only
+                let Some(index) = forest
+                    .nodes
+                    .iter()
+                    .position(|node| node.identity.as_ref() == Some(identity))
+                else {
+                    return false;
+                };
+                if backburner_only {
+                    forest.nodes[index].backburnered
+                        && forest.nodes[backburner_root_index(&forest, index)]
+                            .identity
+                            .as_ref()
+                            .is_some_and(|root| root.repository == *repository)
+                } else {
+                    identity.repository == *repository && !forest.nodes[index].backburnered
+                }
             })
             .collect()
     }
@@ -3987,7 +4011,7 @@ impl App {
             let forest = self.branch_forest(Some(repository_index), &virtual_indexes);
             if let Some(index) = forest.nodes.iter().position(|node| node.id == *branch) {
                 let mut candidates = branch_parent_row_ids(&forest, index);
-                if forest.nodes[index].virtual_backburnered
+                if forest.nodes[index].backburnered
                     && let Some(identity) = &forest.nodes[index].identity
                 {
                     candidates.push(RowId::Backburner(identity.repository.clone()));
@@ -4003,7 +4027,7 @@ impl App {
             let forest = self.branch_forest(None, &[virtual_index]);
             if let Some(index) = forest.nodes.iter().position(|node| node.id == *branch) {
                 let mut candidates = branch_parent_row_ids(&forest, index);
-                if forest.nodes[index].virtual_backburnered {
+                if forest.nodes[index].backburnered {
                     candidates.push(RowId::Backburner(repository.identity.clone()));
                 }
                 candidates.push(repository.id());
@@ -4123,7 +4147,7 @@ struct BranchNode {
     pull_request: Option<PullRequest>,
     parent: Option<usize>,
     children: Vec<usize>,
-    virtual_backburnered: bool,
+    backburnered: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4187,11 +4211,11 @@ fn row_id_for_branch(branch: &BranchId) -> RowId {
 }
 
 fn branch_parent_row_ids(forest: &BranchForest, mut index: usize) -> Vec<RowId> {
-    let partition = forest.nodes[index].virtual_backburnered;
+    let partition = forest.nodes[index].backburnered;
     let mut candidates = Vec::new();
     while let Some(parent) = forest.nodes[index]
         .parent
-        .filter(|parent| forest.nodes[*parent].virtual_backburnered == partition)
+        .filter(|parent| forest.nodes[*parent].backburnered == partition)
     {
         let parent_id = forest.nodes[parent].id.clone();
         candidates.push(RowId::Section(
@@ -4202,6 +4226,16 @@ fn branch_parent_row_ids(forest: &BranchForest, mut index: usize) -> Vec<RowId> 
         index = parent;
     }
     candidates
+}
+
+fn backburner_root_index(forest: &BranchForest, mut index: usize) -> usize {
+    while let Some(parent) = forest.nodes[index]
+        .parent
+        .filter(|parent| forest.nodes[*parent].backburnered)
+    {
+        index = parent;
+    }
+    index
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5324,6 +5358,54 @@ mod tests {
     }
 
     #[test]
+    fn backburner_keeps_cross_repository_stack_descendants_under_their_root() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let mut parent = authored("alpha", "project", 10, "2026-01-01T00:00:00Z");
+        parent.pull_request.head.branch = "stack-parent".to_owned();
+        let mut child = authored("beta", "project", 11, "2026-01-02T00:00:00Z");
+        child.pull_request.base = parent.pull_request.head.clone();
+        child.pull_request.head.branch = "stack-child".to_owned();
+        replace_authored(
+            &mut app,
+            vec![parent.clone(), child.clone()],
+            vec![
+                (parent.identity.clone(), Some(0)),
+                (child.identity.clone(), Some(0)),
+            ],
+        );
+        app.backburner.insert(parent.identity.clone());
+        app.set_disclosure_expanded(
+            DisclosureKey::Backburner(parent.identity.repository.clone()),
+            true,
+        );
+
+        let rows = app.visible_rows();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, VisibleRow::Backburner { .. }))
+                .count(),
+            1
+        );
+        let backburner = rows
+            .iter()
+            .position(|row| row.id() == &RowId::Backburner(parent.identity.repository.clone()))
+            .unwrap();
+        let parent_row = rows
+            .iter()
+            .position(|row| row.id() == &RowId::VirtualPullRequest(parent.identity.clone()))
+            .unwrap();
+        let child_row = rows
+            .iter()
+            .position(|row| row.id() == &RowId::VirtualPullRequest(child.identity.clone()))
+            .unwrap();
+        assert!(backburner < parent_row && parent_row < child_row);
+        app.selected = Some(RowId::Backburner(parent.identity.repository.clone()));
+        let review_request = app.review_request().unwrap();
+        assert!(review_request.contains(&parent.pull_request.url));
+        assert!(review_request.contains(&child.pull_request.url));
+    }
+
+    #[test]
     fn navigation_filter_and_inline_collapse_are_reducer_driven() {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         assert_eq!(app.selected, Some(RowId::Worktree(PathBuf::from("/repo"))));
@@ -6291,7 +6373,7 @@ mod tests {
     }
 
     #[test]
-    fn backburnering_a_mixed_stack_keeps_the_local_worktree_and_moves_only_virtual_rows() {
+    fn backburnering_a_mixed_stack_moves_the_local_base_and_virtual_children_together() {
         let mut parent = authored("team", "project", 10, "2026-01-01");
         parent.pull_request.head.branch = "stack-parent".to_owned();
         let mut child = authored("team", "project", 11, "2026-01-02");
@@ -6328,7 +6410,8 @@ mod tests {
         assert!(app.backburner.contains(&child.identity));
         let rows = app.visible_rows();
         assert!(
-            rows.iter()
+            !rows
+                .iter()
                 .any(|row| row.id() == &RowId::Worktree(local_path.clone()))
         );
         assert!(
@@ -6340,6 +6423,31 @@ mod tests {
                 .iter()
                 .any(|row| { row.id() == &RowId::VirtualPullRequest(child.identity.clone()) })
         );
+
+        app.set_disclosure_expanded(
+            DisclosureKey::Backburner(parent.identity.repository.clone()),
+            true,
+        );
+        let expanded = app.visible_rows();
+        let parent_row = expanded
+            .iter()
+            .position(|row| row.id() == &RowId::Worktree(local_path.clone()))
+            .unwrap();
+        let stack_header = expanded
+            .iter()
+            .position(|row| {
+                row.id()
+                    == &RowId::Section(
+                        BranchId::Worktree(local_path.clone()),
+                        InlineSection::StackedBranches,
+                    )
+            })
+            .unwrap();
+        let child_row = expanded
+            .iter()
+            .position(|row| row.id() == &RowId::VirtualPullRequest(child.identity.clone()))
+            .unwrap();
+        assert!(parent_row < stack_header && stack_header < child_row);
     }
 
     #[test]
