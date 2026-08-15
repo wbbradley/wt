@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.2.0] - 2026-08-14
+
+### Breaking Changes
+
+- Move a backburnered branch together with its complete represented local and virtual subtree, including descendants discovered after the Backburner state was saved. Un-backburner the stack root and reapply Backburner at the desired branch boundary to keep a local branch in the normal tree.
+
+### Added
+
+- Refresh local catalog, worktree, ancestry, and status data every 60 seconds without generating GitHub traffic.
+- Include the mapped checkout path, checked-out branch, and local-versus-pull-request HEAD status in copied agent prompts.
+
+### Changed
+
+- Include complete represented subtrees in explicit Backburner copy and review-request scopes.
+- Run manual refresh as an ordered local snapshot followed by a GitHub refresh.
+- Bind cached branch enrichment to repository identity, worktree path, and full branch ref, discarding obsolete local and remote results.
+
+### Fixed
+
+- Map authored pull requests by stable repository paths so catalog reloads, reordered repositories, and session-only rows cannot attach pull requests to the wrong repository.
+- Revalidate repository mappings when materializing authored pull requests.
+- Hide disclosure markers and make expansion a no-op for leaf branches.
+- Keep Backburner tree connectors visible while dimming branch content.
+- Place the review-comment resolution instruction once at the end of copied prompts.
+
 ## [0.1.4] - 2026-08-13
 
 ### Added
