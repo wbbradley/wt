@@ -24,6 +24,11 @@ pub const MAX_AUTHORED_PULL_REQUEST_PAGES: usize = 10;
 pub const CHECK_CONTEXTS_PER_PAGE: usize = 100;
 pub const MAX_CHECK_CONTEXT_PAGES: usize = 10;
 
+const VIEWER_PULL_REQUEST_SEARCHES: [(&str, &str); 2] = [
+    ("authored", "is:pr is:open author:@me"),
+    ("assigned", "is:pr is:open assignee:@me"),
+];
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum WebScheme {
     Http,
@@ -605,50 +610,60 @@ impl GitHubService {
                 errors.push(format!("{}: {error}", host.host));
                 continue;
             }
-            let mut cursor = None;
-            for page in 1..=MAX_AUTHORED_PULL_REQUEST_PAGES {
-                match self.fetch_authored_page(host, &token, cursor.as_deref()) {
-                    Ok(result) => {
-                        warnings.extend(result.warnings.clone());
-                        publish(AuthoredRefreshEvent::Page {
-                            host: host.host.clone(),
-                            page,
-                            pull_requests: result.pull_requests,
-                            warnings: result.warnings,
-                        });
-                        if !result.has_next_page {
-                            break;
+            let mut published_page = 0;
+            std::thread::scope(|scope| {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let token = &token;
+                let handles = VIEWER_PULL_REQUEST_SEARCHES.map(|(search_kind, search_query)| {
+                    let sender = sender.clone();
+                    scope.spawn(move || {
+                        self.fetch_viewer_search(host, &token, search_kind, search_query, sender);
+                    })
+                });
+                drop(sender);
+
+                for message in receiver {
+                    match message {
+                        ViewerSearchMessage::Page(result) => {
+                            warnings.extend(result.warnings.clone());
+                            published_page += 1;
+                            publish(AuthoredRefreshEvent::Page {
+                                host: host.host.clone(),
+                                page: published_page,
+                                pull_requests: result.pull_requests,
+                                warnings: result.warnings,
+                            });
                         }
-                        if page == MAX_AUTHORED_PULL_REQUEST_PAGES {
-                            let message = format!(
-                                "{}: authored pull request search was truncated at 1,000 results",
-                                host.host
-                            );
+                        ViewerSearchMessage::Failed {
+                            search_kind,
+                            page,
+                            error,
+                        } => {
+                            if let GitHubError::RateLimited { reset_at } = &error {
+                                self.suppress(&host.host, reset_at, None);
+                            }
+                            complete = false;
+                            errors
+                                .push(format!("{} {search_kind} page {page}: {error}", host.host));
+                        }
+                        ViewerSearchMessage::Incomplete(message) => {
+                            complete = false;
                             warnings.push(message.clone());
                             errors.push(message);
-                            complete = false;
-                            break;
                         }
-                        let Some(next_cursor) = result.end_cursor else {
-                            complete = false;
-                            errors.push(format!(
-                                "{}: authored pull request page lacks a cursor",
-                                host.host
-                            ));
-                            break;
-                        };
-                        cursor = Some(next_cursor);
-                    }
-                    Err(error) => {
-                        if let GitHubError::RateLimited { reset_at } = &error {
-                            self.suppress(&host.host, reset_at, None);
-                        }
-                        complete = false;
-                        errors.push(format!("{} page {page}: {error}", host.host));
-                        break;
                     }
                 }
-            }
+
+                for handle in handles {
+                    if handle.join().is_err() {
+                        complete = false;
+                        errors.push(format!(
+                            "{}: pull request search worker panicked",
+                            host.host
+                        ));
+                    }
+                }
+            });
         }
         publish(AuthoredRefreshEvent::Finished {
             complete,
@@ -810,13 +825,11 @@ impl GitHubService {
         &self,
         host: &AuthoredHost,
         token: &ResolvedToken,
+        search_query: &str,
         cursor: Option<&str>,
     ) -> Result<AuthoredPage, GitHubError> {
         let mut variables = serde_json::Map::new();
-        variables.insert(
-            "query".to_owned(),
-            Value::String("is:pr is:open (author:@me OR assignee:@me)".to_owned()),
-        );
+        variables.insert("query".to_owned(), Value::String(search_query.to_owned()));
         variables.insert(
             "cursor".to_owned(),
             cursor.map_or(Value::Null, |cursor| Value::String(cursor.to_owned())),
@@ -864,6 +877,54 @@ impl GitHubService {
             );
         }
         parse_authored_page(&host.host, &data, response_warnings)
+    }
+
+    fn fetch_viewer_search(
+        &self,
+        host: &AuthoredHost,
+        token: &ResolvedToken,
+        search_kind: &'static str,
+        search_query: &'static str,
+        sender: std::sync::mpsc::Sender<ViewerSearchMessage>,
+    ) {
+        let mut cursor = None;
+        for page in 1..=MAX_AUTHORED_PULL_REQUEST_PAGES {
+            match self.fetch_authored_page(host, token, search_query, cursor.as_deref()) {
+                Ok(result) => {
+                    let has_next_page = result.has_next_page;
+                    let end_cursor = result.end_cursor.clone();
+                    if sender.send(ViewerSearchMessage::Page(result)).is_err() {
+                        return;
+                    }
+                    if !has_next_page {
+                        return;
+                    }
+                    if page == MAX_AUTHORED_PULL_REQUEST_PAGES {
+                        let _ = sender.send(ViewerSearchMessage::Incomplete(format!(
+                            "{}: {search_kind} pull request search was truncated at 1,000 results",
+                            host.host,
+                        )));
+                        return;
+                    }
+                    let Some(next_cursor) = end_cursor else {
+                        let _ = sender.send(ViewerSearchMessage::Incomplete(format!(
+                            "{}: {search_kind} pull request page lacks a cursor",
+                            host.host,
+                        )));
+                        return;
+                    };
+                    cursor = Some(next_cursor);
+                }
+                Err(error) => {
+                    let _ = sender.send(ViewerSearchMessage::Failed {
+                        search_kind,
+                        page,
+                        error,
+                    });
+                    return;
+                }
+            }
+        }
     }
 
     fn fetch_pull_request_details(
@@ -1115,6 +1176,16 @@ struct AuthoredPage {
     has_next_page: bool,
     end_cursor: Option<String>,
     warnings: Vec<String>,
+}
+
+enum ViewerSearchMessage {
+    Page(AuthoredPage),
+    Failed {
+        search_kind: &'static str,
+        page: usize,
+        error: GitHubError,
+    },
+    Incomplete(String),
 }
 
 struct DetailPage {
@@ -2345,6 +2416,52 @@ mod tests {
         (format!("http://{address}"), receiver, handle)
     }
 
+    fn fake_server_with(
+        request_count: usize,
+        responder: impl Fn(&str) -> FakeResponse + Send + Sync + 'static,
+    ) -> (String, Receiver<String>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let responder = Arc::new(responder);
+        let handle = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let sender = sender.clone();
+                let responder = Arc::clone(&responder);
+                handlers.push(std::thread::spawn(move || {
+                    let request = read_request(&mut stream);
+                    let response = responder(&request);
+                    sender.send(request).unwrap();
+                    let headers = response
+                        .headers
+                        .iter()
+                        .map(|(name, value)| format!("{name}: {value}\r\n"))
+                        .collect::<String>();
+                    write!(
+                        stream,
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
+                        response.status,
+                        response.body.len(),
+                        headers,
+                        response.body
+                    )
+                    .unwrap();
+                }));
+            }
+            drop(sender);
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+        (format!("http://{address}"), receiver, handle)
+    }
+
+    fn request_body(request: &str) -> Value {
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
     fn read_request(stream: &mut TcpStream) -> String {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -2636,32 +2753,60 @@ mod tests {
 
     #[test]
     fn authored_search_includes_pull_requests_authored_by_or_assigned_to_the_viewer() {
-        let (base, requests, server) = fake_server(vec![
-            FakeResponse {
-                status: "200 OK",
-                headers: Vec::new(),
-                body: authored_body(
+        let initial_searches = Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
+        let searches_overlapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let responder_gate = Arc::clone(&initial_searches);
+        let responder_overlap = Arc::clone(&searches_overlapped);
+        let (base, requests, server) = fake_server_with(3, move |request| {
+            let body = request_body(request);
+            let query = body["variables"]["query"].as_str().unwrap();
+            let cursor = body["variables"]["cursor"].as_str();
+            if cursor.is_none() {
+                let (lock, condition) = &*responder_gate;
+                let mut arrived = lock.lock().unwrap();
+                *arrived += 1;
+                if *arrived == 2 {
+                    responder_overlap.store(true, std::sync::atomic::Ordering::SeqCst);
+                    condition.notify_all();
+                } else {
+                    let (next, _) = condition
+                        .wait_timeout_while(arrived, Duration::from_secs(2), |arrived| *arrived < 2)
+                        .unwrap();
+                    arrived = next;
+                }
+                drop(arrived);
+            }
+
+            let body = if query.contains("author:@me") && cursor.is_none() {
+                authored_body(
                     vec![
                         authored_node(1, "viewer", true),
-                        {
-                            let mut node = authored_node(2, "someone-else", false);
-                            node["assignees"] = serde_json::json!({
-                                "nodes": [{"login": "VIEWER"}]
-                            });
-                            node
-                        },
                         authored_node(4, "someone-else", false),
                     ],
                     true,
                     Some("cursor-1"),
-                ),
-            },
+                )
+            } else if query.contains("author:@me") {
+                authored_body(vec![authored_node(3, "VIEWER", false)], false, None)
+            } else {
+                authored_body(
+                    vec![{
+                        let mut node = authored_node(2, "someone-else", false);
+                        node["assignees"] = serde_json::json!({
+                            "nodes": [{"login": "VIEWER"}]
+                        });
+                        node
+                    }],
+                    false,
+                    None,
+                )
+            };
             FakeResponse {
                 status: "200 OK",
                 headers: Vec::new(),
-                body: authored_body(vec![authored_node(3, "VIEWER", false)], false, None),
-            },
-        ]);
+                body,
+            }
+        });
         let mut credentials = FakeCredentials::default();
         credentials
             .environment
@@ -2673,21 +2818,28 @@ mod tests {
         };
         let mut events = Vec::new();
         GitHubService::new().fetch_authored_with(&credentials, &[host], |event| events.push(event));
-        let first_request = requests.recv().unwrap();
-        let second_request = requests.recv().unwrap();
+        let request_bodies = (0..3)
+            .map(|_| request_body(&requests.recv().unwrap()))
+            .collect::<Vec<_>>();
         server.join().unwrap();
-        let request_body = |request: &str| -> Value {
-            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
-        };
-        let first = request_body(&first_request);
-        assert_eq!(
-            first["variables"]["query"],
-            "is:pr is:open (author:@me OR assignee:@me)"
+        assert!(searches_overlapped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(request_bodies.iter().any(|body| {
+            body["variables"]["query"] == "is:pr is:open author:@me"
+                && body["variables"]["cursor"].is_null()
+        }));
+        assert!(request_bodies.iter().any(|body| {
+            body["variables"]["query"] == "is:pr is:open author:@me"
+                && body["variables"]["cursor"] == "cursor-1"
+        }));
+        assert!(request_bodies.iter().any(|body| {
+            body["variables"]["query"] == "is:pr is:open assignee:@me"
+                && body["variables"]["cursor"].is_null()
+        }));
+        assert!(
+            request_bodies
+                .iter()
+                .all(|body| !body["query"].as_str().unwrap().contains("author:viewer"))
         );
-        assert!(first["variables"]["cursor"].is_null());
-        assert!(!first["query"].as_str().unwrap().contains("author:viewer"));
-        let second = request_body(&second_request);
-        assert_eq!(second["variables"]["cursor"], "cursor-1");
 
         let pages: Vec<_> = events
             .iter()
@@ -2696,12 +2848,16 @@ mod tests {
                 AuthoredRefreshEvent::Finished { .. } => None,
             })
             .collect();
-        assert_eq!(pages.len(), 2);
-        assert_eq!(pages[0].len(), 2);
-        assert_eq!(pages[0][0].pull_request.state, PullRequestState::Draft);
-        assert_eq!(pages[0][1].identity.number, 2);
-        assert_eq!(pages[0][1].author, "someone-else");
-        assert_eq!(pages[1][0].identity.number, 3);
+        assert_eq!(pages.len(), 3);
+        let mut pull_requests = pages
+            .iter()
+            .flat_map(|page| page.iter())
+            .collect::<Vec<_>>();
+        pull_requests.sort_by_key(|pull_request| pull_request.identity.number);
+        assert_eq!(pull_requests[0].pull_request.state, PullRequestState::Draft);
+        assert_eq!(pull_requests[1].identity.number, 2);
+        assert_eq!(pull_requests[1].author, "someone-else");
+        assert_eq!(pull_requests[2].identity.number, 3);
         assert!(matches!(
             events.last(),
             Some(AuthoredRefreshEvent::Finished {
@@ -3021,18 +3177,34 @@ mod tests {
 
     #[test]
     fn authored_search_reports_later_page_failure_after_publishing_prior_pages() {
-        let (base, requests, server) = fake_server(vec![
-            FakeResponse {
-                status: "200 OK",
-                headers: Vec::new(),
-                body: authored_body(vec![authored_node(1, "viewer", false)], true, Some("next")),
-            },
-            FakeResponse {
-                status: "500 Internal Server Error",
-                headers: Vec::new(),
-                body: r#"{"message":"temporary failure"}"#.to_owned(),
-            },
-        ]);
+        let (base, requests, server) = fake_server_with(3, |request| {
+            let body = request_body(request);
+            let query = body["variables"]["query"].as_str().unwrap();
+            let cursor = body["variables"]["cursor"].as_str();
+            if query.contains("assignee:@me") {
+                FakeResponse {
+                    status: "200 OK",
+                    headers: Vec::new(),
+                    body: authored_body(Vec::new(), false, None),
+                }
+            } else if cursor.is_none() {
+                FakeResponse {
+                    status: "200 OK",
+                    headers: Vec::new(),
+                    body: authored_body(
+                        vec![authored_node(1, "viewer", false)],
+                        true,
+                        Some("next"),
+                    ),
+                }
+            } else {
+                FakeResponse {
+                    status: "500 Internal Server Error",
+                    headers: Vec::new(),
+                    body: r#"{"message":"temporary failure"}"#.to_owned(),
+                }
+            }
+        });
         let mut credentials = FakeCredentials::default();
         credentials
             .environment
@@ -3047,8 +3219,9 @@ mod tests {
             }],
             |event| events.push(event),
         );
-        requests.recv().unwrap();
-        requests.recv().unwrap();
+        for _ in 0..3 {
+            requests.recv().unwrap();
+        }
         server.join().unwrap();
         assert!(matches!(events[0], AuthoredRefreshEvent::Page { .. }));
         assert!(matches!(
@@ -3063,14 +3236,24 @@ mod tests {
 
     #[test]
     fn authored_search_warns_when_the_thousand_result_ceiling_truncates() {
-        let responses = (0..MAX_AUTHORED_PULL_REQUEST_PAGES)
-            .map(|page| FakeResponse {
-                status: "200 OK",
-                headers: Vec::new(),
-                body: authored_body(Vec::new(), true, Some(&format!("cursor-{page}"))),
-            })
-            .collect();
-        let (base, requests, server) = fake_server(responses);
+        let request_count = MAX_AUTHORED_PULL_REQUEST_PAGES + 1;
+        let (base, requests, server) = fake_server_with(request_count, |request| {
+            let body = request_body(request);
+            let query = body["variables"]["query"].as_str().unwrap();
+            if query.contains("assignee:@me") {
+                FakeResponse {
+                    status: "200 OK",
+                    headers: Vec::new(),
+                    body: authored_body(Vec::new(), false, None),
+                }
+            } else {
+                FakeResponse {
+                    status: "200 OK",
+                    headers: Vec::new(),
+                    body: authored_body(Vec::new(), true, Some("next")),
+                }
+            }
+        });
         let mut credentials = FakeCredentials::default();
         credentials
             .environment
@@ -3085,7 +3268,7 @@ mod tests {
             }],
             |event| events.push(event),
         );
-        for _ in 0..MAX_AUTHORED_PULL_REQUEST_PAGES {
+        for _ in 0..request_count {
             requests.recv().unwrap();
         }
         server.join().unwrap();
