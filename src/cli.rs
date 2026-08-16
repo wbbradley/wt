@@ -29,7 +29,7 @@ pub struct Cli {
     /// Safely remove the linked worktree containing $PWD before opening the app.
     #[arg(short = 'x', long = "cleanup", conflicts_with = "selector")]
     cleanup: bool,
-    /// Navigate directly with <repository-label>:<branch-or-worktree>.
+    /// Navigate directly with `<repository-label>:<branch-or-worktree>`.
     selector: Option<String>,
 }
 
