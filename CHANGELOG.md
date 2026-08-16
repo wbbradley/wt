@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.2] - 2026-08-16
+
+### Added
+
+- Show repository filesystem paths alongside labels in the worktree tree and include them in filtering.
+- Discover open pull requests assigned to the authenticated user in addition to authored pull requests.
+
+### Changed
+
+- Fetch authored and assigned pull-request searches concurrently, with independent pagination and failure reporting.
+
+### Fixed
+
+- Keep local worktrees under mapped or bare repositories visible and recoverable after backburnering their pull requests.
+- Correct selector syntax formatting in generated CLI and Rust documentation.
+
 ## [0.2.1] - 2026-08-15
 
 ## [0.2.0] - 2026-08-14

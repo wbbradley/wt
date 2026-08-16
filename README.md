@@ -10,7 +10,7 @@ _Screenshot generated from fictional repositories and pull-request data._
 
 - **See all active development in one place.** Browse worktrees across every registered repository alongside branch dirtiness, pull requests, checks, reviews, unresolved comments, conflicts, and stacked work.
 - **Use it like `cd`.** Load the Bash or Zsh integration, navigate to a worktree, and press Enter; `wt` changes the current shell to that directory. Unique repository-qualified selectors work directly from the command line too.
-- **Create worktrees quickly.** Press `n` for the common tracked-worktree flow, materialize an authored pull request that is not local yet, or use scriptable commands for advanced creation.
+- **Create worktrees quickly.** Press `n` for the common tracked-worktree flow, materialize a discovered pull request that is not local yet, or use scriptable commands for advanced creation.
 - **Hand failures to an agent.** Press `c` on a failed check, review comment, pull request, stack, or repository to copy a scoped, agent-ready follow-up prompt with IDs, URLs, and reusable `gh api` commands.
 - **Keep attention focused.** Search every visible and hidden detail, jump between actionable pull requests, copy review-request links, and move lower-priority work to the Backburner.
 - **Operate safely.** Preview and confirm mutations, refuse unsafe removal by default, and clean up merged worktrees only after live GitHub and local-state revalidation.
@@ -94,7 +94,7 @@ An ambiguous qualified selector opens the TUI prefiltered instead of guessing. T
 
 ## TUI
 
-The initial selection is the worktree containing the current directory. The body is one full-width, selectable tree: repositories own local worktree and virtual pull-request branches, and every branch's metadata and attention details are inline. GitHub commit associations are candidates: an exact PR head-branch match wins, followed by an exact head-SHA match, before the open/newest fallback. A local row suppresses only that selected PR; every other authored PR remains virtual, so changing or removing a worktree cannot erase the rest of its remote stack. Local commit ancestry wins when it disagrees with GitHub stack ancestry, and each remaining virtual PR is attached once by an unambiguous base/head relationship.
+The initial selection is the worktree containing the current directory. The body is one full-width, selectable tree: repositories own local worktree and virtual pull-request branches, and every branch's metadata and attention details are inline. GitHub commit associations are candidates: an exact PR head-branch match wins, followed by an exact head-SHA match, before the open/newest fallback. A local row suppresses only that selected PR; every other discovered PR remains virtual, so changing or removing a worktree cannot erase the rest of its remote stack. Local commit ancestry wins when it disagrees with GitHub stack ancestry, and each remaining virtual PR is attached once by an unambiguous base/head relationship.
 
 ```text
   └─▾acme/web
@@ -162,7 +162,7 @@ Checks:
   - integration (https://github.com/acme/web/actions/runs/123)
 ```
 
-Authored PRs are grouped under their canonical base `owner/repository`. `[no local repo]` means the base repository is not registered; `virtual-only` means no local worktree represents that PR. Enter materializes a virtual row after a live SHA recheck. Ordinary worktree actions and direct selectors never materialize implicitly.
+Discovered PRs are grouped under their canonical base `owner/repository`. `[no local repo]` means the base repository is not registered; `virtual-only` means no local worktree represents that PR. Enter materializes a virtual row after a live SHA recheck. Ordinary worktree actions and direct selectors never materialize implicitly.
 
 Backburner membership is host-aware and persisted in `$XDG_STATE_HOME/wt/state.json` (normally `~/.local/state/wt/state.json`; override with `WT_STATE_PATH`). A backburnered branch moves under the final collapsed Backburner group together with its complete represented subtree, including local worktrees and descendants discovered after membership was saved. Explicit navigation and `c`/`p` remain available, while repository prompts and attention traversal skip them.
 
@@ -235,7 +235,7 @@ Example:
 }
 ```
 
-`label`, `worktree_root`, `github_remote`, `repository_root`, and `github_hosts` are optional. `repository_root` defaults to `~/src` and is where unmapped authored-PR repositories are bootstrapped. Its leading `~`, `$VAR`, or `${VAR}` is expanded without evaluating shell syntax; relative paths, undefined variables, command substitutions, and existing non-directory roots are rejected. A configured `worktree_root` supplies the suggested destination for `wt worktree create` and is created on first use if it does not exist yet. Local catalog, worktree, ancestry, and status data refresh independently every 60 seconds. The GitHub refresh interval defaults to 300 seconds and is clamped to a minimum of 30 seconds.
+`label`, `worktree_root`, `github_remote`, `repository_root`, and `github_hosts` are optional. `repository_root` defaults to `~/src` and is where unmapped discovered-PR repositories are bootstrapped. Its leading `~`, `$VAR`, or `${VAR}` is expanded without evaluating shell syntax; relative paths, undefined variables, command substitutions, and existing non-directory roots are rejected. A configured `worktree_root` supplies the suggested destination for `wt worktree create` and is created on first use if it does not exist yet. Local catalog, worktree, ancestry, and status data refresh independently every 60 seconds. The GitHub refresh interval defaults to 300 seconds and is clamped to a minimum of 30 seconds.
 
 Catalog mutations use a sidecar lock next to the JSON file. PR materialization holds that lock continuously from repository bootstrap through registration, fetch, branch preparation, and linked-worktree creation. The TUI remains responsive and shows `waiting for catalog lock` while another process owns it.
 
@@ -245,7 +245,7 @@ For each local branch, `wt` prefers its configured upstream remote, then the cat
 
 At startup and on refresh, `wt` searches each configured or inferred host for open pull requests authored by or assigned to the authenticated viewer, including drafts. Results arrive progressively in the background, are deduplicated by base repository and PR number, and retain the last complete snapshot if a host/page fails. `github.com` is always included; Enterprise hosts can be listed in `github_hosts` and are also inferred from cached local remotes. Enterprise GraphQL uses `https://<host>/api/graphql`.
 
-Successful authored-PR and local-branch enrichment snapshots are cached in `$XDG_CACHE_HOME/wt/github.json` (or `~/.cache/wt/github.json`) with mode `0600`. Set `WT_CACHE_PATH` to override the location. Cache entries are matched to the configured repository identity, worktree path, and full branch ref, so changing a checkout or its repository mapping cannot display stale PR data. Cache corruption or an unsupported future schema never prevents startup; `wt` falls back to the asynchronous network refresh.
+Successful discovered-PR and local-branch enrichment snapshots are cached in `$XDG_CACHE_HOME/wt/github.json` (or `~/.cache/wt/github.json`) with mode `0600`. Set `WT_CACHE_PATH` to override the location. Cache entries are matched to the configured repository identity, worktree path, and full branch ref, so changing a checkout or its repository mapping cannot display stale PR data. Cache corruption or an unsupported future schema never prevents startup; `wt` falls back to the asynchronous network refresh.
 
 Periodic local refreshes do not generate GitHub traffic. They preserve branch-specific GitHub data only while the configured repository identity, worktree path, and full local branch ref still match the lookup that produced it. New, removed, detached, bare, trunk, or branch-switched worktrees remain free of stale PR associations until the next compatible GitHub result arrives. Pressing `r` still performs an ordered local refresh followed by a GitHub refresh.
 
@@ -268,7 +268,7 @@ The TUI shows PR number, title, URL, base/head repository and branch, draft/open
 
 When a refresh fails, the last successful PR data remains visible as stale. Exhausted hosts are not retried until their reset time. Manual, automatic, and post-mutation refreshes coalesce into one background catalog request at a time.
 
-### Authored-PR materialization safety
+### Discovered-PR materialization safety
 
 Before creating anything, `wt` re-fetches the selected PR and its current head SHA. Closed and merged PRs remain materializable while GitHub still exposes them; a missing or inaccessible PR/repository is rejected.
 
@@ -283,7 +283,7 @@ Configured repositories use `<worktree_root>/<sanitized-local-branch>`; otherwis
 - **Repository is stale:** relink it with `wt repo edit <label> --path <new-path>`, or unregister it with `wt repo remove <label>`.
 - **Repository is invalid:** the configured path exists but is not a usable Git repository. Select it to see the exact path, then relink or unregister it; `wt` will not delete the existing path.
 - **No PR data:** verify the selected remote with `git remote -v`, ensure the branch has an upstream when appropriate, and configure a token for that host.
-- **Authored PR is missing:** confirm the token resolves to the expected viewer and that its host is present in `github_hosts` or a registered remote.
+- **Discovered PR is missing:** confirm that it is authored by or assigned to the token's viewer and that its host is present in `github_hosts` or a registered remote.
 - **PR materialization is waiting:** another `wt` process holds the catalog sidecar lock; wait or press Ctrl-C to cancel without changing directories.
 - **SSO/SAML or classic PAT error:** authorize the token for the organization or use a token type allowed by its policy.
 - **Rate limited:** `wt` suppresses requests until the reported reset time while retaining stale data.
