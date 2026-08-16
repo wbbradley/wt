@@ -815,7 +815,7 @@ impl GitHubService {
         let mut variables = serde_json::Map::new();
         variables.insert(
             "query".to_owned(),
-            Value::String("is:pr is:open author:@me".to_owned()),
+            Value::String("is:pr is:open (author:@me OR assignee:@me)".to_owned()),
         );
         variables.insert(
             "cursor".to_owned(),
@@ -1458,6 +1458,7 @@ fn authored_pull_request_query() -> String {
             number title url state isDraft mergedAt updatedAt reviewDecision
             autoMergeRequest {{ enabledAt }}
             author {{ login }}
+            assignees(first: 10) {{ nodes {{ login }} }}
             baseRefName baseRefOid baseRepository {{ nameWithOwner }}
             headRefName headRefOid headRepository {{ nameWithOwner }}
             commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state }} }} }} }}
@@ -1507,9 +1508,20 @@ fn parse_authored_page(
             .pointer("/author/login")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if !author.eq_ignore_ascii_case(viewer) {
+        let assigned_to_viewer = node
+            .pointer("/assignees/nodes")
+            .and_then(Value::as_array)
+            .is_some_and(|assignees| {
+                assignees.iter().any(|assignee| {
+                    assignee
+                        .get("login")
+                        .and_then(Value::as_str)
+                        .is_some_and(|login| login.eq_ignore_ascii_case(viewer))
+                })
+            });
+        if !author.eq_ignore_ascii_case(viewer) && !assigned_to_viewer {
             warnings.push(format!(
-                "{host}: ignored search result not authored by viewer {viewer}"
+                "{host}: ignored search result neither authored by nor assigned to viewer {viewer}"
             ));
             continue;
         }
@@ -2397,6 +2409,7 @@ mod tests {
             "updatedAt": "2026-01-02T00:00:00Z",
             "reviewDecision": null,
             "author": {"login": author},
+            "assignees": {"nodes": []},
             "baseRefName": "main",
             "baseRefOid": "baseoid",
             "baseRepository": {"nameWithOwner": "base/project"},
@@ -2622,7 +2635,7 @@ mod tests {
     }
 
     #[test]
-    fn authored_search_paginates_and_filters_to_the_exact_viewer() {
+    fn authored_search_includes_pull_requests_authored_by_or_assigned_to_the_viewer() {
         let (base, requests, server) = fake_server(vec![
             FakeResponse {
                 status: "200 OK",
@@ -2630,7 +2643,14 @@ mod tests {
                 body: authored_body(
                     vec![
                         authored_node(1, "viewer", true),
-                        authored_node(2, "someone-else", false),
+                        {
+                            let mut node = authored_node(2, "someone-else", false);
+                            node["assignees"] = serde_json::json!({
+                                "nodes": [{"login": "VIEWER"}]
+                            });
+                            node
+                        },
+                        authored_node(4, "someone-else", false),
                     ],
                     true,
                     Some("cursor-1"),
@@ -2660,7 +2680,10 @@ mod tests {
             serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
         };
         let first = request_body(&first_request);
-        assert_eq!(first["variables"]["query"], "is:pr is:open author:@me");
+        assert_eq!(
+            first["variables"]["query"],
+            "is:pr is:open (author:@me OR assignee:@me)"
+        );
         assert!(first["variables"]["cursor"].is_null());
         assert!(!first["query"].as_str().unwrap().contains("author:viewer"));
         let second = request_body(&second_request);
@@ -2674,8 +2697,10 @@ mod tests {
             })
             .collect();
         assert_eq!(pages.len(), 2);
-        assert_eq!(pages[0].len(), 1);
+        assert_eq!(pages[0].len(), 2);
         assert_eq!(pages[0][0].pull_request.state, PullRequestState::Draft);
+        assert_eq!(pages[0][1].identity.number, 2);
+        assert_eq!(pages[0][1].author, "someone-else");
         assert_eq!(pages[1][0].identity.number, 3);
         assert!(matches!(
             events.last(),
