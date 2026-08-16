@@ -253,7 +253,7 @@ pub enum VisibleRow {
         id: RowId,
     },
     Backburner {
-        virtual_repository_index: usize,
+        identity: GitHubRepositoryIdentity,
         expanded: bool,
         id: RowId,
     },
@@ -609,31 +609,30 @@ impl App {
             Some(repository_index),
             singleton_node,
         );
-        for virtual_repository_index in &virtual_repository_indexes {
-            let identity = self.virtual_repositories[*virtual_repository_index]
+        let mut backburner_groups = BTreeMap::<GitHubRepositoryIdentity, BTreeSet<usize>>::new();
+        for index in &backburner {
+            let root = backburner_root_index(&forest, *index);
+            let Some(identity) = forest.nodes[root]
                 .identity
-                .clone();
-            let group = backburner
-                .iter()
-                .copied()
-                .filter(|index| {
-                    let root = backburner_root_index(&forest, *index);
-                    forest.nodes[root]
-                        .identity
-                        .as_ref()
-                        .is_some_and(|candidate| candidate.repository == identity)
-                })
-                .collect::<BTreeSet<_>>();
-            if !group.is_empty() {
-                self.append_backburner(
-                    &mut children,
-                    &forest,
-                    &group,
-                    *virtual_repository_index,
-                    1,
-                    Some(repository_index),
-                );
-            }
+                .as_ref()
+                .map(|identity| identity.repository.clone())
+            else {
+                continue;
+            };
+            backburner_groups
+                .entry(identity)
+                .or_default()
+                .insert(*index);
+        }
+        for (identity, group) in backburner_groups {
+            self.append_backburner(
+                &mut children,
+                &forest,
+                &group,
+                identity,
+                1,
+                Some(repository_index),
+            );
         }
         let expanded = self.disclosure_expanded(
             &DisclosureKey::Repository(repository.config.path.clone()),
@@ -674,7 +673,7 @@ impl App {
                     rows,
                     &forest,
                     &backburner,
-                    virtual_repository_index,
+                    repository.identity.clone(),
                     1,
                     None,
                 );
@@ -899,14 +898,9 @@ impl App {
                     identity.clone(),
                 )))
             }
-            VisibleRow::Backburner {
-                virtual_repository_index,
-                ..
-            } => Some(DisclosureKey::Backburner(
-                self.virtual_repositories[*virtual_repository_index]
-                    .identity
-                    .clone(),
-            )),
+            VisibleRow::Backburner { identity, .. } => {
+                Some(DisclosureKey::Backburner(identity.clone()))
+            }
             VisibleRow::Inline {
                 owner,
                 section,
@@ -1416,17 +1410,14 @@ impl App {
         rows: &mut Vec<VisibleRow>,
         forest: &BranchForest,
         included: &BTreeSet<usize>,
-        virtual_repository_index: usize,
+        identity: GitHubRepositoryIdentity,
         depth: usize,
         mapped_repository_index: Option<usize>,
     ) {
-        let identity = self.virtual_repositories[virtual_repository_index]
-            .identity
-            .clone();
         let expanded =
             self.disclosure_expanded(&DisclosureKey::Backburner(identity.clone()), false);
         rows.push(VisibleRow::Backburner {
-            virtual_repository_index,
+            identity: identity.clone(),
             expanded,
             id: RowId::Backburner(identity),
         });
@@ -3146,7 +3137,6 @@ impl App {
             }
         }
         if backburnering
-            && matches!(self.selected, Some(RowId::VirtualPullRequest(_)))
             && !self.displayed_disclosure_expanded(
                 &DisclosureKey::Backburner(identity.repository.clone()),
                 false,
@@ -3739,13 +3729,7 @@ impl App {
                 self.set_disclosure_expanded(DisclosureKey::VirtualRepository(identity), !expanded);
                 Intent::None
             }
-            Some(VisibleRow::Backburner {
-                virtual_repository_index,
-                ..
-            }) => {
-                let identity = self.virtual_repositories[virtual_repository_index]
-                    .identity
-                    .clone();
+            Some(VisibleRow::Backburner { identity, .. }) => {
                 let expanded = self.displayed_disclosure_expanded(
                     &DisclosureKey::Backburner(identity.clone()),
                     false,
@@ -3822,13 +3806,7 @@ impl App {
                     self.set_disclosure_expanded(DisclosureKey::VirtualRepository(identity), false);
                     self.selected = Some(self.virtual_repositories[virtual_repository_index].id());
                 }
-                VisibleRow::Backburner {
-                    virtual_repository_index,
-                    ..
-                } => {
-                    let identity = self.virtual_repositories[virtual_repository_index]
-                        .identity
-                        .clone();
+                VisibleRow::Backburner { identity, .. } => {
                     self.set_disclosure_expanded(DisclosureKey::Backburner(identity), false);
                 }
                 VisibleRow::Repository { .. }
@@ -3885,13 +3863,7 @@ impl App {
                     .clone();
                 self.set_disclosure_expanded(DisclosureKey::VirtualRepository(identity), true);
             }
-            Some(VisibleRow::Backburner {
-                virtual_repository_index,
-                ..
-            }) => {
-                let identity = self.virtual_repositories[virtual_repository_index]
-                    .identity
-                    .clone();
+            Some(VisibleRow::Backburner { identity, .. }) => {
                 self.set_disclosure_expanded(DisclosureKey::Backburner(identity), true);
             }
             Some(VisibleRow::Worktree {
@@ -5249,6 +5221,76 @@ mod tests {
                 .map(|row| row.id().clone())
                 .collect::<Vec<_>>(),
             vec![RowId::Repository(PathBuf::from("/repo.git"))]
+        );
+    }
+
+    #[test]
+    fn local_only_backburnered_worktree_remains_recoverable_under_bare_repository() {
+        let pull_request = authored("team", "project", 42, "2026-01-01");
+        let repository_identity = pull_request.identity.repository.clone();
+        let mut bare = repository("/repo.git", true);
+        bare.config
+            .github_remotes
+            .insert("origin".to_owned(), repository_identity.clone());
+        bare.worktrees = vec![
+            worktree("/repo.git", "main", true),
+            worktree("/trees/topic", "topic", false),
+        ];
+        let local_path = bare.worktrees[1].path.clone();
+        let mut app = App::new(vec![bare], PathBuf::from("/elsewhere"));
+        app.github.insert(
+            local_path.clone(),
+            GitHubState::Ready(GitHubBranchData {
+                pull_request: Some(pull_request.pull_request.clone()),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+        app.selected = Some(RowId::Worktree(local_path.clone()));
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('b'))),
+            Intent::PersistBackburner
+        );
+        assert!(app.virtual_repositories.is_empty());
+        assert_eq!(
+            app.selected,
+            Some(RowId::Backburner(repository_identity.clone()))
+        );
+        let collapsed = app.visible_rows();
+        assert!(
+            collapsed
+                .iter()
+                .any(|row| { row.id() == &RowId::Backburner(repository_identity.clone()) })
+        );
+        assert!(
+            !collapsed
+                .iter()
+                .any(|row| row.id() == &RowId::Worktree(local_path.clone()))
+        );
+
+        app.set_disclosure_expanded(DisclosureKey::Backburner(repository_identity.clone()), true);
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|row| row.id() == &RowId::Worktree(local_path.clone()))
+        );
+
+        app.selected = Some(RowId::Worktree(local_path.clone()));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('b'))),
+            Intent::PersistBackburner
+        );
+        let restored = app.visible_rows();
+        assert!(
+            restored
+                .iter()
+                .any(|row| row.id() == &RowId::Worktree(local_path.clone()))
+        );
+        assert!(
+            !restored
+                .iter()
+                .any(|row| matches!(row, VisibleRow::Backburner { .. }))
         );
     }
 
