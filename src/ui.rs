@@ -90,7 +90,10 @@ pub(crate) fn row_search_text(app: &App, row: &VisibleRow) -> String {
             ..
         } => {
             let repository = &app.repositories[*repository_index];
-            let mut spans = vec![Span::raw(repository.config.display_label())];
+            let mut spans = vec![
+                Span::raw(repository.config.display_label()),
+                Span::raw(format!(" · {}", display_path(&repository.config.path))),
+            ];
             if let Some(worktree) =
                 singleton_worktree_index.map(|worktree_index| &repository.worktrees[worktree_index])
             {
@@ -308,6 +311,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 spans.push(Span::styled(
                     repository.config.display_label(),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    format!(" · {}", display_path(&repository.config.path)),
+                    Style::default().fg(MUTED),
                 ));
                 if let Some(worktree) = singleton {
                     spans.push(Span::styled(
@@ -1786,8 +1793,9 @@ mod tests {
             .into_iter()
             .find(|line| line.contains("project"))
             .unwrap();
-        assert!(row.contains("project (main) · [+1 ~2 ?3] · locked · prunable [session-only]"));
-        assert!(!row.contains("/repo"));
+        assert!(
+            row.contains("project · /repo (main) · [+1 ~2 ?3] · locked · prunable [session-only]")
+        );
         assert!(!row.contains("12345678"));
         assert!(!content.contains(" Details "));
         assert!(!content.contains("Tab"));
@@ -1802,9 +1810,9 @@ mod tests {
             .find(|line| line.contains("project"))
             .unwrap();
         assert!(
-            narrow_row.contains("project (main) · [+1 ~2 ?3] · locked · prunable [session-only]")
+            narrow_row
+                .contains("project · /repo (main) · [+1 ~2 ?3] · locked · prunable [session-only]")
         );
-        assert!(!narrow_row.contains("/repo"));
         assert!(!narrow_row.contains("12345678"));
 
         app.current_directory = PathBuf::from("/repo");
@@ -1850,8 +1858,8 @@ mod tests {
             .iter()
             .find(|line| line.contains("project"))
             .unwrap();
-        assert!(repository_line.contains("project (main)"));
-        assert!(repository_line.contains("▶● └─ project (main)"));
+        assert!(repository_line.contains("project · /repo (main)"));
+        assert!(repository_line.contains("▶● └─ project · /repo (main)"));
         assert!(!repository_line.contains("●project"));
         assert!(repository_line.contains('●'));
         assert!(!repository_line.contains('▾'));
@@ -1953,7 +1961,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
 
         let content = buffer_text(terminal.backend().buffer());
-        assert!(content.contains("project [bare]"));
+        assert!(content.contains("project · /repo.git [bare]"));
         assert!(content.contains("topic"));
         assert!(!content.contains("[anchor]"));
     }
@@ -2521,7 +2529,7 @@ mod tests {
     #[test]
     fn renders_empty_stale_and_action_palette_states() {
         let mut empty = App::new(Vec::new(), PathBuf::from("/outside"));
-        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
         terminal.draw(|frame| render(frame, &mut empty)).unwrap();
         assert!(buffer_text(terminal.backend().buffer()).contains("No repositories or authored"));
 
@@ -2557,13 +2565,13 @@ mod tests {
             .draw(|frame| render(frame, &mut stale_app))
             .unwrap();
         let content = buffer_text(terminal.backend().buffer());
-        assert!(content.contains("lost [stale]"));
+        assert!(content.contains("lost · /missing [stale]"));
         assert!(content.contains("not found"));
 
         let directory = tempfile::tempdir().unwrap();
         let invalid_path = directory.path().join("invalid");
         std::fs::create_dir(&invalid_path).unwrap();
-        stale_app.repositories[0].config.path = invalid_path;
+        stale_app.repositories[0].config.path = invalid_path.clone();
         stale_app.repositories[0].stale_error =
             Some("exists but is not a usable Git repository".to_owned());
         stale_app.selected = Some(stale_app.repositories[0].id());
@@ -2571,7 +2579,7 @@ mod tests {
             .draw(|frame| render(frame, &mut stale_app))
             .unwrap();
         let content = buffer_text(terminal.backend().buffer());
-        assert!(content.contains("lost [invalid]"));
+        assert!(content.contains(&format!("lost · {} [invalid]", display_path(&invalid_path))));
         assert!(content.contains("exists but is not a usable Git repository"));
     }
 
