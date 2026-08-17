@@ -470,6 +470,7 @@ pub struct App {
     pub current_directory: PathBuf,
     pub generation: u64,
     pending_status: usize,
+    status_progress_visible: bool,
     refresh_queued: bool,
 }
 
@@ -508,6 +509,7 @@ impl App {
             current_directory,
             generation: 0,
             pending_status: 0,
+            status_progress_visible: false,
             refresh_queued: false,
         };
         app.select_initial();
@@ -2661,6 +2663,7 @@ impl App {
     pub fn request_refresh(&mut self) -> Intent {
         if self.pending_status > 0 {
             self.refresh_queued = true;
+            self.status_progress_visible = true;
             self.progress = Some("refresh queued".to_owned());
             Intent::RefreshGitHub
         } else {
@@ -2668,12 +2671,18 @@ impl App {
         }
     }
 
-    pub fn begin_status_refresh(&mut self, paths: &[PathBuf]) -> u64 {
+    pub fn begin_status_refresh(&mut self, paths: &[PathBuf], show_progress: bool) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.pending_status = paths.len();
-        self.progress = (!paths.is_empty()).then(|| format!("loading status: 0/{}", paths.len()));
+        self.status_progress_visible = show_progress && !paths.is_empty();
+        if show_progress {
+            self.progress =
+                (!paths.is_empty()).then(|| format!("loading status: 0/{}", paths.len()));
+        }
         for path in paths {
-            self.statuses.insert(path.clone(), StatusState::Pending);
+            self.statuses
+                .entry(path.clone())
+                .or_insert(StatusState::Pending);
         }
         self.generation
     }
@@ -2689,10 +2698,15 @@ impl App {
         self.statuses.insert(update.path, state);
         self.pending_status = self.pending_status.saturating_sub(1);
         if self.pending_status == 0 {
-            self.progress = None;
+            if self.status_progress_visible {
+                self.progress = None;
+            }
+            self.status_progress_visible = false;
             return std::mem::take(&mut self.refresh_queued);
         }
-        self.progress = Some(format!("loading status: {} remaining", self.pending_status));
+        if self.status_progress_visible {
+            self.progress = Some(format!("loading status: {} remaining", self.pending_status));
+        }
         false
     }
 
@@ -6751,7 +6765,7 @@ mod tests {
     fn refreshes_coalesce_and_stale_generations_are_rejected() {
         let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
         let paths = vec![PathBuf::from("/repo"), PathBuf::from("/repo-topic")];
-        let generation = app.begin_status_refresh(&paths);
+        let generation = app.begin_status_refresh(&paths, true);
         assert_eq!(app.request_refresh(), Intent::RefreshGitHub);
         assert!(!app.apply_status(StatusUpdate {
             generation: generation.wrapping_sub(1),
@@ -6768,6 +6782,33 @@ mod tests {
             path: paths[1].clone(),
             result: Ok(WorktreeStatus::default()),
         }));
+    }
+
+    #[test]
+    fn quiet_status_refresh_retains_visible_state_and_hides_progress() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let path = PathBuf::from("/repo");
+        let status = WorktreeStatus {
+            unstaged: 1,
+            ..WorktreeStatus::default()
+        };
+        app.statuses
+            .insert(path.clone(), StatusState::Ready(status.clone()));
+
+        let generation = app.begin_status_refresh(std::slice::from_ref(&path), false);
+
+        assert_eq!(app.statuses.get(&path), Some(&StatusState::Ready(status)));
+        assert_eq!(app.progress, None);
+        assert!(!app.apply_status(StatusUpdate {
+            generation,
+            path: path.clone(),
+            result: Ok(WorktreeStatus::default()),
+        }));
+        assert_eq!(
+            app.statuses.get(&path),
+            Some(&StatusState::Ready(WorktreeStatus::default()))
+        );
+        assert_eq!(app.progress, None);
     }
 
     #[test]

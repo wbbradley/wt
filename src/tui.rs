@@ -193,7 +193,7 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
     terminal
         .terminal_mut()
         .draw(|frame| ui::render(frame, &mut controller.app))?;
-    controller.start_status_refresh();
+    controller.start_status_refresh(true);
     controller.request_github_refresh();
     terminal
         .terminal_mut()
@@ -1165,7 +1165,7 @@ impl Controller {
 
     fn refresh_local(&mut self) -> Result<(), TuiError> {
         self.reload_catalog_and_worktrees()?;
-        self.start_status_refresh();
+        self.start_status_refresh(true);
         self.request_github_refresh();
         Ok(())
     }
@@ -1233,7 +1233,7 @@ impl Controller {
         Ok(())
     }
 
-    fn start_status_refresh(&mut self) {
+    fn start_status_refresh(&mut self, show_progress: bool) {
         let paths: Vec<PathBuf> = self
             .app
             .repositories
@@ -1242,7 +1242,7 @@ impl Controller {
             .filter(|worktree| worktree.navigable() && worktree.path.exists())
             .map(|worktree| worktree.path.clone())
             .collect();
-        let generation = self.app.begin_status_refresh(&paths);
+        let generation = self.app.begin_status_refresh(&paths, show_progress);
         self.status_backlog = paths
             .into_iter()
             .map(|path| StatusTask { generation, path })
@@ -1465,8 +1465,12 @@ impl Controller {
         self.submit_status_backlog();
         let mut refresh = false;
         while let Some(result) = self.status_pool.try_recv() {
-            changed = true;
+            let path = result.path.clone();
+            let previous_status = self.app.statuses.get(&path).cloned();
+            let previous_progress = self.app.progress.clone();
             refresh |= self.app.apply_status(result);
+            changed |= previous_status != self.app.statuses.get(&path).cloned()
+                || previous_progress != self.app.progress;
         }
         if refresh && let Err(error) = self.refresh_local() {
             self.app.inline_error = Some(error.to_string());
@@ -1596,8 +1600,8 @@ impl Controller {
         if Instant::now() >= self.next_local_refresh {
             if let Err(error) = self.request_local_refresh(false) {
                 self.app.inline_error = Some(error.to_string());
+                changed = true;
             }
-            changed = true;
         }
         changed
     }
@@ -1621,7 +1625,7 @@ impl Controller {
                 match result {
                     Ok(snapshot) => {
                         self.apply_local_snapshot(snapshot);
-                        self.start_status_refresh();
+                        self.start_status_refresh(refresh_github);
                     }
                     Err(JobError::Cancelled) => {}
                     Err(JobError::Failed(error)) => {
@@ -2550,7 +2554,7 @@ mod tests {
         controller.next_github_refresh = Instant::now() + Duration::from_secs(300);
         controller.next_local_refresh = Instant::now();
 
-        assert!(controller.pump_background_results());
+        assert!(!controller.pump_background_results());
         assert!(controller.local_refresh_job.is_some());
         assert!(!controller.github_in_flight);
         controller.request_local_refresh(false).unwrap();
