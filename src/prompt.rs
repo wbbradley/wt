@@ -119,10 +119,10 @@ fn format_feedback(
         if let Some(permalink) = &feedback.permalink {
             output.push_str(&format!("    URL: {permalink}\n"));
         }
-        let body = concise_comment_text(&feedback.body);
-        output.push_str("    Body: ");
+        let body = agent_comment_text(&feedback.body);
+        output.push_str("    Body:\n~~~\n");
         output.push_str(if body.is_empty() { "(empty)" } else { &body });
-        output.push('\n');
+        output.push_str("\n~~~\n");
     }
 }
 
@@ -228,8 +228,16 @@ fn strip_conventional_commit_prefix(title: &str) -> &str {
 }
 
 pub fn concise_comment_text(text: &str) -> String {
+    sanitized_comment_lines(text).join(" • ")
+}
+
+fn agent_comment_text(text: &str) -> String {
+    sanitized_comment_lines(text).join("\n")
+}
+
+fn sanitized_comment_lines(text: &str) -> Vec<String> {
     let stripped = strip_html_comments(text);
-    let mut concise = String::with_capacity(stripped.len());
+    let mut lines = Vec::new();
 
     for line in stripped.lines() {
         let line = line.trim();
@@ -247,13 +255,10 @@ pub fn concise_comment_text(text: &str) -> String {
             continue;
         }
 
-        if !concise.is_empty() {
-            concise.push_str(" • ");
-        }
-        concise.push_str(&line);
+        lines.push(line);
     }
 
-    concise
+    lines
 }
 
 fn strip_markdown_line_prefix(line: &str) -> &str {
@@ -383,7 +388,7 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "In feature (#42 Fix feedback):\n\nUse this existing checkout:\n```bash\ncd -- '/worktrees/feature'\n```\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nReview comments:\n  - Comment 91 by reviewer on `src/lib.rs`\n    URL: https://git.example.com/comment/91\n    Body: Summary • split this line • follow up\n\nReview summaries:\n  - Review 92 by lead\n    Body: Please add coverage\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nFix, reply to the comments, and mark as resolved as appropriate."
+            "In feature (#42 Fix feedback):\n\nUse this existing checkout:\n```bash\ncd -- '/worktrees/feature'\n```\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nReview comments:\n  - Comment 91 by reviewer on `src/lib.rs`\n    URL: https://git.example.com/comment/91\n    Body:\n~~~\nSummary\nsplit this line\nfollow up\n~~~\n\nReview summaries:\n  - Review 92 by lead\n    Body:\n~~~\nPlease add coverage\n~~~\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nFix, reply to the comments, and mark as resolved as appropriate."
         );
         assert!(!actual.contains("gh api"));
         assert!(!actual.contains("not merge-required"));
@@ -457,11 +462,11 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request]).unwrap();
         assert!(actual.contains(&format!(
             "Review comments:\n  - Comment node-with-link by reviewer\n    \
-             URL: https://git.example.com/comment/fallback\n    Body: {} trailing\n",
+             URL: https://git.example.com/comment/fallback\n    Body:\n~~~\n{} trailing\n~~~\n",
             "x".repeat(101)
         )));
         assert!(actual.contains(
-            "Review summaries:\n  - Review node-only by lead\n    Body: review • summary"
+            "Review summaries:\n  - Review node-only by lead\n    Body:\n~~~\nreview\nsummary\n~~~"
         ));
         assert!(!actual.contains("gh api"));
     }
