@@ -272,8 +272,9 @@ Rollup's lower-case copy keys are part of the desired UI:
   failing checks and unresolved inline comments, not historical review summaries. Branch nodes
   include themselves and all stacked descendants; Stacked branches excludes the parent; a repository
   covers all represented PRs; Backburner covers its explicit members. The formatter groups by
-  `In branch (#PR title)`, emits stored IDs plus reusable `gh api` commands, includes check URLs,
-  and closes with Rollup's worktree instruction. Scope is independent of visibility and fold state.
+  `In branch (#PR title)`, emits complete sanitized review feedback with stored IDs and URLs,
+  includes check URLs, and closes with Rollup's worktree instruction. Scope is independent of
+  visibility and fold state.
 - `p` copies one terse line per PR in the same structural scope:
   `{url} - {title-with-conventional-prefix-removed}`, appending ` - DRAFT` for drafts. Any leaf or
   non-stacking section resolves to its owning PR. Ordering is deterministic tree pre-order and
