@@ -89,7 +89,7 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
     }
     output.truncate(output.trim_end_matches('\n').len());
     if has_thread_comments {
-        output.push_str("\n\nFix, reply to the comments, and mark as resolved as appropriate.");
+        output.push_str("\n\nPlease investigate the above.");
     }
     Some(output)
 }
