@@ -75,8 +75,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         );
     }
 
-    render_list(frame, app, vertical[1]);
-    render_footer(frame, app, vertical[2]);
+    let rows = app.visible_rows();
+    app.set_viewport_height_with_rows(vertical[1].height.saturating_sub(2) as usize, &rows);
+    render_list(frame, app, &rows, vertical[1]);
+    render_footer(frame, app, &rows, vertical[2]);
     if let Some(modal) = &app.modal {
         render_modal(frame, app, modal, area);
     }
@@ -241,9 +243,7 @@ pub(crate) fn row_search_text(app: &App, row: &VisibleRow) -> String {
         .collect()
 }
 
-fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let rows = app.visible_rows();
-    app.set_viewport_height(area.height.saturating_sub(2) as usize);
+fn render_list(frame: &mut Frame<'_>, app: &mut App, rows: &[VisibleRow], area: Rect) {
     if rows.is_empty() {
         let message = if !app.filter.is_empty() {
             "No repositories or worktrees match the search."
@@ -255,12 +255,15 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         frame.render_widget(
             Paragraph::new(message)
                 .wrap(Wrap { trim: true })
-                .block(list_block(app)),
+                .block(list_block(app, rows)),
             area,
         );
         return;
     }
-    let tree_prefixes = tree_prefixes(app, &rows);
+    let start = app.scroll.min(rows.len());
+    let end = start.saturating_add(app.viewport_height).min(rows.len());
+    let visible_range = start..end;
+    let tree_prefixes = tree_prefixes_for_range(app, rows, visible_range.clone());
     let search_query = (app.filter_active || !app.filter.is_empty())
         .then(|| {
             RegexBuilder::new(&app.filter)
@@ -269,7 +272,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 .ok()
         })
         .flatten();
-    let items: Vec<ListItem<'_>> = rows
+    let items: Vec<ListItem<'_>> = rows[visible_range.clone()]
         .iter()
         .zip(tree_prefixes)
         .map(|(row, tree_prefix)| match row {
@@ -566,30 +569,33 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let selected = app
         .selected
         .as_ref()
-        .and_then(|selected| rows.iter().position(|row| row.id() == selected));
-    let mut state = ListState::default()
-        .with_selected(selected)
-        .with_offset(app.scroll);
+        .and_then(|selected| rows.iter().position(|row| row.id() == selected))
+        .filter(|selected| visible_range.contains(selected))
+        .map(|selected| selected - visible_range.start);
+    let mut state = ListState::default().with_selected(selected).with_offset(0);
     let selection_style = if app.filter_active || !app.filter.is_empty() {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default().bg(SELECTION).add_modifier(Modifier::BOLD)
     };
     let list = List::new(items)
-        .block(list_block(app))
+        .block(list_block(app, rows))
         .highlight_style(selection_style)
         .highlight_symbol("▶")
         .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(list, area, &mut state);
-    app.scroll = state.offset();
 }
 
-fn tree_prefixes(app: &App, rows: &[VisibleRow]) -> Vec<String> {
+fn tree_prefixes_for_range(
+    app: &App,
+    rows: &[VisibleRow],
+    range: std::ops::Range<usize>,
+) -> Vec<String> {
     let depths = rows
         .iter()
         .map(|row| visible_row_depth(app, row))
         .collect::<Vec<_>>();
-    tree_prefixes_from_depths(&depths)
+    tree_prefixes_from_depths_for_range(&depths, range)
 }
 
 fn location_marker_span(app: &App, row: &VisibleRow) -> Span<'static> {
@@ -598,17 +604,15 @@ fn location_marker_span(app: &App, row: &VisibleRow) -> Span<'static> {
             repository_index,
             singleton_worktree_index: Some(worktree_index),
             ..
-        } => path_contains(
+        } => app.is_current_worktree(
             &app.repositories[*repository_index].worktrees[*worktree_index].path,
-            &app.current_directory,
         ),
         VisibleRow::Worktree {
             repository_index,
             worktree_index,
             ..
-        } => path_contains(
+        } => app.is_current_worktree(
             &app.repositories[*repository_index].worktrees[*worktree_index].path,
-            &app.current_directory,
         ),
         _ => false,
     };
@@ -618,39 +622,64 @@ fn location_marker_span(app: &App, row: &VisibleRow) -> Span<'static> {
     )
 }
 
+#[cfg(test)]
 fn tree_prefixes_from_depths(depths: &[usize]) -> Vec<String> {
-    depths
-        .iter()
-        .enumerate()
-        .map(|(index, depth)| {
-            if *depth == 0 {
-                let has_earlier_root = depths[..index].contains(&0);
-                return match (has_earlier_root, has_later_sibling(depths, index, 0)) {
+    tree_prefixes_from_depths_for_range(depths, 0..depths.len())
+}
+
+fn tree_prefixes_from_depths_for_range(
+    depths: &[usize],
+    range: std::ops::Range<usize>,
+) -> Vec<String> {
+    let mut later_sibling = vec![false; depths.len()];
+    let mut seen_at_depth = Vec::<bool>::new();
+    for (index, depth) in depths.iter().copied().enumerate().rev() {
+        if seen_at_depth.len() <= depth {
+            seen_at_depth.resize(depth + 1, false);
+        }
+        later_sibling[index] = seen_at_depth[depth];
+        seen_at_depth[depth] = true;
+        seen_at_depth.truncate(depth + 1);
+    }
+
+    let start = range.start.min(depths.len());
+    let end = range.end.min(depths.len()).max(start);
+    let mut prefixes = Vec::with_capacity(end - start);
+    let mut ancestors_have_later_sibling = Vec::<bool>::new();
+    let mut seen_root = false;
+    for (index, depth) in depths.iter().copied().enumerate().take(end) {
+        ancestors_have_later_sibling.truncate(depth);
+        if index >= start {
+            if depth == 0 {
+                prefixes.push(match (seen_root, later_sibling[index]) {
                     (false, true) => "┌─ ".to_owned(),
                     (true, true) => "├─ ".to_owned(),
                     (_, false) => "└─ ".to_owned(),
-                };
-            }
-            let mut prefix = String::new();
-            for ancestor_depth in 0..*depth {
-                let ancestor = (0..index)
-                    .rev()
-                    .find(|candidate| depths[*candidate] == ancestor_depth)
-                    .expect("visible tree depth must have an ancestor");
-                prefix.push_str(if has_later_sibling(depths, ancestor, ancestor_depth) {
-                    "│  "
-                } else {
-                    "   "
                 });
-            }
-            prefix.push_str(if has_later_sibling(depths, index, *depth) {
-                "├─ "
             } else {
-                "└─ "
-            });
-            prefix
-        })
-        .collect()
+                assert_eq!(
+                    ancestors_have_later_sibling.len(),
+                    depth,
+                    "visible tree depth must have an ancestor"
+                );
+                let mut prefix = String::with_capacity((depth + 1) * 3);
+                for ancestor_has_later in &ancestors_have_later_sibling {
+                    prefix.push_str(if *ancestor_has_later { "│  " } else { "   " });
+                }
+                prefix.push_str(if later_sibling[index] {
+                    "├─ "
+                } else {
+                    "└─ "
+                });
+                prefixes.push(prefix);
+            }
+        }
+        if depth == 0 {
+            seen_root = true;
+        }
+        ancestors_have_later_sibling.push(later_sibling[index]);
+    }
+    prefixes
 }
 
 fn disclosure_tree_prefix(prefix: String, expanded: bool) -> String {
@@ -658,13 +687,6 @@ fn disclosure_tree_prefix(prefix: String, expanded: bool) -> String {
         .strip_suffix(' ')
         .expect("tree row prefix must end in spacing");
     format!("{stem}{}", if expanded { '▾' } else { '▸' })
-}
-
-fn has_later_sibling(depths: &[usize], index: usize, depth: usize) -> bool {
-    depths[index + 1..]
-        .iter()
-        .take_while(|candidate| **candidate >= depth)
-        .any(|candidate| *candidate == depth)
 }
 
 fn visible_row_depth(app: &App, row: &VisibleRow) -> usize {
@@ -685,18 +707,18 @@ fn visible_row_depth(app: &App, row: &VisibleRow) -> usize {
     }
 }
 
-fn list_block(app: &App) -> Block<'static> {
+fn list_block(app: &App, rows: &[VisibleRow]) -> Block<'static> {
     Block::default()
         .title(format!(
             " Repos / Worktrees / PRs · h/l fold · {} ",
-            list_selection_hint(app)
+            list_selection_hint(app, rows)
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
 }
 
-fn list_selection_hint(app: &App) -> &'static str {
-    let Some(row) = app.selected_row() else {
+fn list_selection_hint(app: &App, rows: &[VisibleRow]) -> &'static str {
+    let Some(row) = app.selected_row_in(rows) else {
         return "Enter selects";
     };
     match row {
@@ -1386,7 +1408,7 @@ fn shortcut_line(shortcuts: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
-fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_footer(frame: &mut Frame<'_>, app: &App, _rows: &[VisibleRow], area: Rect) {
     let top = if app.filter_active {
         Line::from(vec![
             Span::styled(
@@ -1709,12 +1731,6 @@ fn shorten_home(path: &std::path::Path, home: Option<&std::path::Path>) -> Strin
     }
 }
 
-fn path_contains(worktree: &std::path::Path, candidate: &std::path::Path) -> bool {
-    let worktree = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_owned());
-    let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_owned());
-    candidate.starts_with(worktree)
-}
-
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -1748,6 +1764,49 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
+
+    #[test]
+    fn redraw_uses_one_row_snapshot_and_cached_current_location() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository_path = directory.path().join("repo");
+        let current_directory = repository_path.join("nested");
+        std::fs::create_dir_all(&current_directory).unwrap();
+        let repository = RepositoryView {
+            config: RepositoryConfig {
+                path: repository_path.clone(),
+                label: Some("cached-location".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            },
+            session_only: false,
+            stale_error: None,
+            expanded: true,
+            worktrees: vec![Worktree {
+                path: repository_path.clone(),
+                head: Some("1234567890".to_owned()),
+                branch: Some("refs/heads/main".to_owned()),
+                detached: false,
+                bare: false,
+                locked: None,
+                prunable: None,
+            }],
+        };
+        let mut app = App::new(vec![repository], current_directory);
+        std::fs::remove_dir_all(&repository_path).unwrap();
+        app.reset_visible_row_builds();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(app.visible_row_builds(), 1);
+        let current = buffer_lines(terminal.backend().buffer())
+            .into_iter()
+            .find(|line| line.contains("cached-location"))
+            .unwrap();
+        assert!(current.contains('●'));
+    }
 
     #[test]
     fn renders_compact_repository_status_and_resizes() {
@@ -1816,6 +1875,7 @@ mod tests {
         assert!(!narrow_row.contains("12345678"));
 
         app.current_directory = PathBuf::from("/repo");
+        app.replace_repositories(app.repositories.clone());
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert!(colored_text(terminal.backend().buffer(), SUCCESS).contains("●"));
         assert!(!buffer_text(terminal.backend().buffer()).contains("current main"));
@@ -1917,6 +1977,14 @@ mod tests {
         assert!(content.contains("└─ child"));
         assert!(!content.contains("Worktree ·"));
         assert!(colored_text(buffer, MUTED).contains("Stacked worktrees"));
+
+        app.selected = Some(RowId::Worktree(PathBuf::from("/repo-child")));
+        let mut clipped = Terminal::new(TestBackend::new(100, 7)).unwrap();
+        clipped.draw(|frame| render(frame, &mut app)).unwrap();
+        let clipped_content = buffer_text(clipped.backend().buffer());
+        assert!(clipped_content.contains("▶"));
+        assert!(clipped_content.contains("child"));
+        assert!(clipped_content.contains("│"));
     }
 
     #[test]
@@ -2055,21 +2123,36 @@ mod tests {
             BranchId::VirtualPullRequest(pull_request_id.clone()),
             InlineSection::Overview,
         ));
-        assert_eq!(list_selection_hint(&app), "Enter/w opens PR");
+        assert_eq!(
+            list_selection_hint(&app, &app.visible_rows()),
+            "Enter/w opens PR"
+        );
         app.selected = Some(RowId::Section(
             BranchId::VirtualPullRequest(pull_request_id.clone()),
             InlineSection::Checks,
         ));
-        assert_eq!(list_selection_hint(&app), "Enter/w opens Checks");
+        assert_eq!(
+            list_selection_hint(&app, &app.visible_rows()),
+            "Enter/w opens Checks"
+        );
         app.selected = Some(RowId::Check(pull_request_id.clone(), "required".to_owned()));
-        assert_eq!(list_selection_hint(&app), "Enter/w opens Check");
+        assert_eq!(
+            list_selection_hint(&app, &app.visible_rows()),
+            "Enter/w opens Check"
+        );
         app.selected = Some(RowId::OpenComment(
             pull_request_id.clone(),
             "comment".to_owned(),
         ));
-        assert_eq!(list_selection_hint(&app), "Enter/w opens Comment");
+        assert_eq!(
+            list_selection_hint(&app, &app.visible_rows()),
+            "Enter/w opens Comment"
+        );
         app.selected = Some(RowId::VirtualPullRequest(pull_request_id.clone()));
-        assert_eq!(list_selection_hint(&app), "Enter creates · w opens PR");
+        assert_eq!(
+            list_selection_hint(&app, &app.visible_rows()),
+            "Enter creates · w opens PR"
+        );
         app.selected = Some(RowId::Section(
             BranchId::VirtualPullRequest(pull_request_id.clone()),
             InlineSection::Overview,
@@ -2435,6 +2518,10 @@ mod tests {
             ["┌─ ", "│  ├─ ", "│  │  └─ ", "│  └─ ", "└─ ", "   └─ ",]
         );
         assert_eq!(tree_prefixes_from_depths(&[0, 0, 0]), ["┌─ ", "├─ ", "└─ "]);
+        assert_eq!(
+            tree_prefixes_from_depths_for_range(&[0, 1, 2, 1, 0, 1], 2..4),
+            ["│  │  └─ ", "│  └─ "]
+        );
         assert_eq!(disclosure_tree_prefix("├─ ".to_owned(), true), "├─▾");
         assert_eq!(disclosure_tree_prefix("└─ ".to_owned(), false), "└─▸");
     }
@@ -2827,6 +2914,115 @@ mod tests {
         let content = buffer_text(terminal.backend().buffer());
         assert!(content.contains("Repository: project"));
         assert!(content.contains("Path: /src/project"));
+    }
+
+    #[test]
+    #[ignore = "release-mode latency benchmark; run explicitly with --ignored"]
+    fn cursor_navigation_redraw_benchmark() {
+        let repository_identity =
+            GitHubRepositoryIdentity::canonical("github.com", "benchmark", "large-tree");
+        let mut pull_requests = Vec::new();
+        let mut details = Vec::new();
+        for number in 1..=200 {
+            let identity = CanonicalPullRequestId {
+                repository: repository_identity.clone(),
+                number,
+            };
+            let pull_request = PullRequest {
+                number,
+                title: format!("Synthetic pull request {number}"),
+                url: format!("https://github.com/benchmark/large-tree/pull/{number}"),
+                state: PullRequestState::Open,
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                review_decision: Some("REVIEW_REQUIRED".to_owned()),
+                auto_merge: false,
+                base: PullRequestIdentity {
+                    repository: Some("benchmark/large-tree".to_owned()),
+                    branch: "main".to_owned(),
+                    oid: Some("base".to_owned()),
+                },
+                head: PullRequestIdentity {
+                    repository: Some("benchmark/large-tree".to_owned()),
+                    branch: format!("feature-{number}"),
+                    oid: Some(format!("head-{number}")),
+                },
+                checks: CheckRollup::Failure,
+            };
+            pull_requests.push(AuthoredPullRequest {
+                identity: identity.clone(),
+                author: "benchmark".to_owned(),
+                pull_request,
+            });
+            details.push((
+                identity,
+                PullRequestDetails {
+                    checks: vec![PullRequestCheck {
+                        name: format!("required-{number}"),
+                        state: CheckState::Failure,
+                        target_url: None,
+                        required: true,
+                        source_order: 0,
+                        completed_at: None,
+                    }],
+                    check_contexts_complete: true,
+                    reviewer_reviews: vec![ReviewerReview {
+                        id: format!("review-{number}"),
+                        database_id: Some(number),
+                        reviewer: format!("reviewer-{number}"),
+                        state: SubmittedReviewState::ChangesRequested,
+                        submitted_at: None,
+                    }],
+                    reviews_complete: true,
+                    feedback: vec![PullRequestFeedback {
+                        id: format!("comment-{number}"),
+                        database_id: Some(number),
+                        thread_id: Some(format!("thread-{number}")),
+                        kind: FeedbackKind::InlineThread,
+                        author: format!("reviewer-{number}"),
+                        body: "Synthetic unresolved feedback for latency measurement".to_owned(),
+                        path: Some("src/main.rs".to_owned()),
+                        permalink: None,
+                        outdated: false,
+                    }],
+                    feedback_complete: true,
+                    ..PullRequestDetails::default()
+                },
+            ));
+        }
+        let mut app = App::new(Vec::new(), PathBuf::from("/outside"));
+        app.virtual_repositories.push(VirtualRepositoryView {
+            identity: repository_identity,
+            mapped_repository: None,
+            expanded: true,
+            pull_requests,
+        });
+        app.pull_request_details.extend(details);
+        let row_count = app.visible_rows().len();
+        assert!(row_count >= 1_000, "fixture produced only {row_count} rows");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let mut samples = Vec::with_capacity(1_000);
+        for iteration in 0..1_000 {
+            let started = std::time::Instant::now();
+            app.handle_key(crossterm::event::KeyEvent::new(
+                if iteration % 2 == 0 {
+                    crossterm::event::KeyCode::Char('j')
+                } else {
+                    crossterm::event::KeyCode::Char('k')
+                },
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let p95 = samples[samples.len() * 95 / 100];
+        println!("rows={row_count} samples={} p95={p95:?}", samples.len());
+        assert!(
+            p95 < std::time::Duration::from_millis(16),
+            "cursor event plus redraw p95 {p95:?} exceeds a 60 Hz frame"
+        );
     }
 
     #[test]

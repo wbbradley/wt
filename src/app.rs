@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -468,10 +470,13 @@ pub struct App {
     pub backburner: BTreeSet<CanonicalPullRequestId>,
     pub authored_mappings: Vec<PullRequestMapping>,
     pub current_directory: PathBuf,
+    current_worktree: Option<PathBuf>,
     pub generation: u64,
     pending_status: usize,
     status_progress_visible: bool,
     refresh_queued: bool,
+    #[cfg(test)]
+    visible_row_builds: Cell<usize>,
 }
 
 impl App {
@@ -507,11 +512,15 @@ impl App {
             backburner: BTreeSet::new(),
             authored_mappings: Vec::new(),
             current_directory,
+            current_worktree: None,
             generation: 0,
             pending_status: 0,
             status_progress_visible: false,
             refresh_queued: false,
+            #[cfg(test)]
+            visible_row_builds: Cell::new(0),
         };
+        app.refresh_current_worktree();
         app.select_initial();
         app
     }
@@ -522,12 +531,46 @@ impl App {
     }
 
     pub fn visible_rows(&self) -> Vec<VisibleRow> {
+        #[cfg(test)]
+        self.visible_row_builds
+            .set(self.visible_row_builds.get().saturating_add(1));
         let rows = self.logical_rows();
         if self.filter_mode() {
             self.filtered_rows(rows, true)
         } else {
             rows
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_visible_row_builds(&self) {
+        self.visible_row_builds.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_row_builds(&self) -> usize {
+        self.visible_row_builds.get()
+    }
+
+    pub(crate) fn is_current_worktree(&self, path: &Path) -> bool {
+        self.current_worktree.as_deref() == Some(path)
+    }
+
+    fn refresh_current_worktree(&mut self) {
+        let candidate = canonical_path_or_owned(&self.current_directory);
+        self.current_worktree = self
+            .repositories
+            .iter()
+            .flat_map(|repository| &repository.worktrees)
+            .filter(|worktree| !worktree.bare)
+            .filter_map(|worktree| {
+                let canonical = canonical_path_or_owned(&worktree.path);
+                candidate
+                    .starts_with(&canonical)
+                    .then_some((canonical.components().count(), worktree.path.clone()))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, path)| path);
     }
 
     fn logical_rows(&self) -> Vec<VisibleRow> {
@@ -1435,71 +1478,49 @@ impl App {
             .find(|row| row.id() == selected)
     }
 
+    pub(crate) fn selected_row_in<'a>(&self, rows: &'a [VisibleRow]) -> Option<&'a VisibleRow> {
+        let selected = self.selected.as_ref()?;
+        rows.iter().find(|row| row.id() == selected)
+    }
+
     pub fn selected_worktree(&self) -> Option<(&RepositoryView, &Worktree, usize)> {
-        let row = self.selected_row()?;
-        let owner = row.owner();
-        match row {
-            VisibleRow::Worktree {
-                repository_index,
-                worktree_index,
-                ..
-            } => Some((
-                &self.repositories[repository_index],
-                &self.repositories[repository_index].worktrees[worktree_index],
-                worktree_index,
-            )),
-            VisibleRow::Inline { .. } => {
-                let BranchId::Worktree(path) = owner? else {
-                    return None;
-                };
-                self.repositories.iter().find_map(|repository| {
-                    repository
-                        .worktrees
-                        .iter()
-                        .position(|worktree| worktree.path == path)
-                        .map(|index| (repository, &repository.worktrees[index], index))
-                })
-            }
-            VisibleRow::Repository {
-                repository_index,
-                singleton_worktree_index: Some(worktree_index),
-                ..
-            } => Some((
-                &self.repositories[repository_index],
-                &self.repositories[repository_index].worktrees[worktree_index],
-                worktree_index,
-            )),
-            VisibleRow::Repository { .. }
-            | VisibleRow::VirtualRepository { .. }
-            | VisibleRow::Backburner { .. }
-            | VisibleRow::VirtualPullRequest { .. } => None,
+        let selected = self.selected.as_ref()?;
+        if let RowId::Repository(path) = selected {
+            let repository = self
+                .repositories
+                .iter()
+                .find(|repository| repository.config.path == *path)?;
+            let (index, worktree) = repository.singleton_worktree()?;
+            return Some((repository, worktree, index));
         }
+        let BranchId::Worktree(path) = self.branch_for_row_id(selected)? else {
+            return None;
+        };
+        self.repositories.iter().find_map(|repository| {
+            repository
+                .worktrees
+                .iter()
+                .position(|worktree| worktree.path == path)
+                .map(|index| (repository, &repository.worktrees[index], index))
+        })
     }
 
     pub fn selected_repository(&self) -> Option<(&RepositoryView, usize)> {
-        let row = self.selected_row()?;
-        let index = match row {
-            VisibleRow::Repository {
-                repository_index, ..
-            }
-            | VisibleRow::Worktree {
-                repository_index, ..
-            } => repository_index,
-            VisibleRow::Inline {
-                owner: BranchId::Worktree(path),
-                ..
-            } => self.repositories.iter().position(|repository| {
+        let selected = self.selected.as_ref()?;
+        let index = if let RowId::Repository(path) = selected {
+            self.repositories
+                .iter()
+                .position(|repository| repository.config.path == *path)?
+        } else {
+            let BranchId::Worktree(path) = self.branch_for_row_id(selected)? else {
+                return None;
+            };
+            self.repositories.iter().position(|repository| {
                 repository
                     .worktrees
                     .iter()
                     .any(|worktree| worktree.path == path)
-            })?,
-            VisibleRow::Inline { .. }
-            | VisibleRow::VirtualRepository { .. }
-            | VisibleRow::Backburner { .. }
-            | VisibleRow::VirtualPullRequest { .. } => {
-                return None;
-            }
+            })?
         };
         Some((&self.repositories[index], index))
     }
@@ -1507,32 +1528,18 @@ impl App {
     pub fn selected_virtual_pull_request(
         &self,
     ) -> Option<(&VirtualRepositoryView, &AuthoredPullRequest)> {
-        let row = self.selected_row()?;
-        let owner = row.owner();
-        match row {
-            VisibleRow::VirtualPullRequest {
-                virtual_repository_index,
-                pull_request_index,
-                ..
-            } => Some((
-                &self.virtual_repositories[virtual_repository_index],
-                &self.virtual_repositories[virtual_repository_index].pull_requests
-                    [pull_request_index],
-            )),
-            VisibleRow::Inline { .. } => {
-                let BranchId::VirtualPullRequest(identity) = owner? else {
-                    return None;
-                };
-                self.virtual_repositories.iter().find_map(|repository| {
-                    repository
-                        .pull_requests
-                        .iter()
-                        .find(|pull_request| pull_request.identity == identity)
-                        .map(|pull_request| (repository, pull_request))
-                })
-            }
-            _ => None,
-        }
+        let BranchId::VirtualPullRequest(identity) =
+            self.branch_for_row_id(self.selected.as_ref()?)?
+        else {
+            return None;
+        };
+        self.virtual_repositories.iter().find_map(|repository| {
+            repository
+                .pull_requests
+                .iter()
+                .find(|pull_request| pull_request.identity == identity)
+                .map(|pull_request| (repository, pull_request))
+        })
     }
 
     fn append_local_pull_request_rows(
@@ -2143,71 +2150,6 @@ impl App {
         )
     }
 
-    fn selected_pull_request_data(
-        &self,
-    ) -> Option<(
-        CanonicalPullRequestId,
-        PullRequest,
-        Option<PullRequestDetails>,
-        Vec<String>,
-    )> {
-        if let Some((repository, authored)) = self.selected_virtual_pull_request() {
-            let mut context = vec![format!("repository: {}", repository.identity.full_name())];
-            context.push(format!(
-                "local repo: {}",
-                repository
-                    .mapped_repository
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "none (virtual)".to_owned())
-            ));
-            context.push(format!("author: {}", authored.author));
-            if self.authored_pull_requests.loading {
-                context.push("GitHub: refreshing".to_owned());
-            } else if let Some(error) = &self.authored_pull_requests.stale_error {
-                context.push(format!("GitHub stale: {error}"));
-            }
-            return Some((
-                authored.identity.clone(),
-                authored.pull_request.clone(),
-                self.pull_request_details.get(&authored.identity).cloned(),
-                context,
-            ));
-        }
-        let (repository, worktree, _) = self.selected_worktree()?;
-        let github_state = self.github.get(&worktree.path)?;
-        let data = github_state.data()?;
-        let pull_request = data.pull_request.as_ref()?;
-        let identity = self.pull_request_identity(repository, pull_request)?;
-        let mut context = vec![
-            format!("repository: {}", repository.config.display_label()),
-            format!("local path: {}", worktree.path.display()),
-        ];
-        if let Some(status) = self.statuses.get(&worktree.path) {
-            context.push(match status {
-                StatusState::Pending => "local status: loading".to_owned(),
-                StatusState::Ready(status) => format!("local status: {}", status.summary()),
-                StatusState::Error(error) => format!("local status error: {error}"),
-            });
-        }
-        match github_state {
-            GitHubState::Loading { .. } => context.push("GitHub: refreshing".to_owned()),
-            GitHubState::Stale { error, .. } => context.push(format!("GitHub stale: {error}")),
-            GitHubState::Ready(_) => {}
-        }
-        context.extend(
-            data.warnings
-                .iter()
-                .map(|warning| format!("warning: {warning}")),
-        );
-        Some((
-            identity.clone(),
-            pull_request.clone(),
-            self.pull_request_details.get(&identity).cloned(),
-            context,
-        ))
-    }
-
     pub fn pull_request_identity(
         &self,
         repository: &RepositoryView,
@@ -2390,7 +2332,7 @@ impl App {
                 .unwrap_or_else(|| *matches.last().unwrap())
         };
         self.selected = Some(rows[next].id().clone());
-        self.ensure_selected_in_view();
+        self.ensure_selected_in_view_with_rows(&rows);
     }
 
     fn clear_search_preserving_selection(&mut self) {
@@ -2563,17 +2505,15 @@ impl App {
                 disabled("selected branch has no associated pull request")
             };
         }
-        if matches!(
-            self.selected_row(),
-            Some(
-                VisibleRow::VirtualRepository { .. }
-                    | VisibleRow::VirtualPullRequest { .. }
-                    | VisibleRow::Inline {
-                        owner: BranchId::VirtualPullRequest(_),
-                        ..
-                    }
-            )
-        ) {
+        let selected_is_virtual = match self.selected.as_ref() {
+            Some(RowId::VirtualRepository(_) | RowId::VirtualPullRequest(_)) => true,
+            Some(selected) => matches!(
+                self.branch_for_row_id(selected),
+                Some(BranchId::VirtualPullRequest(_))
+            ),
+            None => false,
+        };
+        if selected_is_virtual {
             return disabled("virtual pull requests support only Enter to create a worktree");
         }
         let Some((repository, _)) = self.selected_repository() else {
@@ -2645,7 +2585,7 @@ impl App {
                             disabled("worktree has local changes")
                         }
                         Some(StatusState::Ready(_)) => {
-                            if contains_path(&worktree.path, &self.current_directory) {
+                            if self.is_current_worktree(&worktree.path) {
                                 disabled("worktree contains the current directory")
                             } else {
                                 enabled()
@@ -2814,6 +2754,7 @@ impl App {
             .map(|repository| (repository.config.path.clone(), repository.expanded))
             .collect();
         self.repositories = repositories;
+        self.refresh_current_worktree();
         for repository in &mut self.repositories {
             if let Some(expanded) = collapsed.get(&repository.config.path) {
                 repository.expanded = *expanded;
@@ -2928,13 +2869,19 @@ impl App {
         self.ensure_selected_in_view();
     }
 
+    #[cfg(test)]
     pub fn set_viewport_height(&mut self, height: usize) {
+        let rows = self.visible_rows();
+        self.set_viewport_height_with_rows(height, &rows);
+    }
+
+    pub(crate) fn set_viewport_height_with_rows(&mut self, height: usize, rows: &[VisibleRow]) {
         self.viewport_height = height.max(1);
         if self.viewport_initialized {
-            self.ensure_selected_in_view();
+            self.ensure_selected_in_view_with_rows(rows);
         } else {
             self.viewport_initialized = true;
-            self.ensure_initial_selection_in_view();
+            self.ensure_initial_selection_in_view_with_rows(rows);
         }
     }
 
@@ -2946,8 +2893,15 @@ impl App {
     }
 
     pub fn selected_pull_request_url(&self) -> Option<String> {
-        self.selected_pull_request_data()
-            .map(|(_, pull_request, _, _)| pull_request.url)
+        if let Some((_, authored)) = self.selected_virtual_pull_request() {
+            return Some(authored.pull_request.url.clone());
+        }
+        let (_, worktree, _) = self.selected_worktree()?;
+        self.github
+            .get(&worktree.path)
+            .and_then(GitHubState::data)
+            .and_then(|data| data.pull_request.as_ref())
+            .map(|pull_request| pull_request.url.clone())
     }
 
     pub fn agent_prompt(&self) -> Option<String> {
@@ -3913,21 +3867,22 @@ impl App {
         let next = (current as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
         let next_id = rows[next].id().clone();
         self.selected = Some(next_id);
-        self.ensure_selected_in_view();
+        self.ensure_selected_in_view_with_rows(&rows);
     }
 
     fn select_index(&mut self, index: usize) {
-        if let Some(row) = self.visible_rows().get(index) {
+        let rows = self.visible_rows();
+        if let Some(row) = rows.get(index) {
             let id = row.id().clone();
             self.selected = Some(id);
-            self.ensure_selected_in_view();
+            self.ensure_selected_in_view_with_rows(&rows);
         }
     }
 
     fn select_initial(&mut self) {
         for repository in &self.repositories {
             for worktree in &repository.worktrees {
-                if worktree.navigable() && contains_path(&worktree.path, &self.current_directory) {
+                if worktree.navigable() && self.current_worktree.as_ref() == Some(&worktree.path) {
                     self.selected = Some(if repository.singleton_worktree().is_some() {
                         repository.id()
                     } else {
@@ -4168,6 +4123,10 @@ impl App {
 
     fn ensure_selected_in_view(&mut self) {
         let rows = self.visible_rows();
+        self.ensure_selected_in_view_with_rows(&rows);
+    }
+
+    fn ensure_selected_in_view_with_rows(&mut self, rows: &[VisibleRow]) {
         let Some(index) = self
             .selected
             .as_ref()
@@ -4188,8 +4147,7 @@ impl App {
         self.clamp_list_scroll(rows.len());
     }
 
-    fn ensure_initial_selection_in_view(&mut self) {
-        let rows = self.visible_rows();
+    fn ensure_initial_selection_in_view_with_rows(&mut self, rows: &[VisibleRow]) {
         let Some(index) = self
             .selected
             .as_ref()
@@ -4444,10 +4402,8 @@ fn debug_label(value: impl std::fmt::Debug) -> String {
     label
 }
 
-fn contains_path(worktree: &Path, candidate: &Path) -> bool {
-    let worktree = std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_owned());
-    let candidate = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_owned());
-    candidate.starts_with(worktree)
+fn canonical_path_or_owned(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
 #[cfg(test)]
@@ -5698,6 +5654,56 @@ mod tests {
         );
         app.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(app.selected, Some(RowId::Repository(_))));
+    }
+
+    #[test]
+    fn cursor_navigation_builds_visible_rows_once_and_preserves_scroll() {
+        let repositories = (0..20)
+            .map(|index| repository(&format!("/repo-{index}"), true))
+            .collect();
+        let mut app = App::new(repositories, PathBuf::from("/elsewhere"));
+        app.set_viewport_height(6);
+
+        app.reset_visible_row_builds();
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.visible_row_builds(), 1);
+
+        for _ in 0..20 {
+            app.reset_visible_row_builds();
+            app.handle_key(key(KeyCode::Char('j')));
+            assert_eq!(app.visible_row_builds(), 1);
+        }
+        assert!(app.scroll > 0);
+        for _ in 0..10 {
+            app.reset_visible_row_builds();
+            app.handle_key(key(KeyCode::Char('k')));
+            assert_eq!(app.visible_row_builds(), 1);
+        }
+        let rows = app.visible_rows();
+        let selected = app.selected.as_ref().unwrap();
+        let index = rows.iter().position(|row| row.id() == selected).unwrap();
+        assert!(index >= app.scroll);
+        assert!(index < app.scroll + app.viewport_height);
+    }
+
+    #[test]
+    fn repository_refresh_recomputes_cached_current_worktree() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let current = first.join("nested");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let mut initial = repository(first.to_str().unwrap(), true);
+        initial.worktrees.truncate(1);
+        let mut app = App::new(vec![initial], current);
+        assert!(app.is_current_worktree(&first));
+
+        let mut replacement = repository(second.to_str().unwrap(), true);
+        replacement.worktrees.truncate(1);
+        app.replace_repositories(vec![replacement]);
+        assert!(!app.is_current_worktree(&first));
+        assert!(!app.is_current_worktree(&second));
     }
 
     #[test]

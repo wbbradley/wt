@@ -617,7 +617,7 @@ impl GitHubService {
                 let handles = VIEWER_PULL_REQUEST_SEARCHES.map(|(search_kind, search_query)| {
                     let sender = sender.clone();
                     scope.spawn(move || {
-                        self.fetch_viewer_search(host, &token, search_kind, search_query, sender);
+                        self.fetch_viewer_search(host, token, search_kind, search_query, sender);
                     })
                 });
                 drop(sender);
