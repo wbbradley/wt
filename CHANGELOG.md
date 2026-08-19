@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.3] - 2026-08-18
+
+### Added
+
+- Add a release-mode regression benchmark and profiling guide for keeping cursor navigation and redraw latency below one 60 Hz frame on large trees.
+
+### Changed
+
+- Improve cursor navigation and redraw performance by reusing visible-row snapshots, rendering only the viewport, computing tree prefixes in a linear pass, and caching current-worktree path resolution outside hot paths.
+
+### Fixed
+
+- Prevent periodic background status refreshes from flashing loading states or redrawing when visible status and progress are unchanged.
+- Preserve selection visibility, scrolling, tree connectors, current-worktree markers, and selected-row actions with optimized viewport rendering.
+
 ## [0.2.2] - 2026-08-16
 
 ### Added
