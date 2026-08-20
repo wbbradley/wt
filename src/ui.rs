@@ -692,7 +692,7 @@ fn disclosure_tree_prefix(prefix: String, expanded: bool) -> String {
 fn visible_row_depth(app: &App, row: &VisibleRow) -> usize {
     match row {
         VisibleRow::Repository { .. } => 0,
-        VisibleRow::Worktree { stack_depth, .. } => 1 + stack_depth,
+        VisibleRow::Worktree { depth, .. } => *depth,
         VisibleRow::VirtualRepository {
             virtual_repository_index,
             ..
@@ -701,16 +701,20 @@ fn visible_row_depth(app: &App, row: &VisibleRow) -> usize {
                 .mapped_repository
                 .is_some(),
         ),
-        VisibleRow::VirtualPullRequest { stack_depth, .. } => 1 + *stack_depth,
-        VisibleRow::Backburner { .. } => 1,
+        VisibleRow::VirtualPullRequest { depth, .. } => *depth,
+        VisibleRow::Backburner { depth, .. } => *depth,
         VisibleRow::Inline { depth, .. } => *depth,
     }
 }
 
 fn list_block(app: &App, rows: &[VisibleRow]) -> Block<'static> {
+    let scope = app.focus_label().map_or_else(
+        || "Repos / Worktrees / PRs".to_owned(),
+        |label| format!("Focus: {label}"),
+    );
     Block::default()
         .title(format!(
-            " Repos / Worktrees / PRs · h/l fold · {} ",
+            " {scope} · h/l fold · {} ",
             list_selection_hint(app, rows)
         ))
         .borders(Borders::ALL)
@@ -1431,6 +1435,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, _rows: &[VisibleRow], area: R
             ("j/k", "move"),
             ("]", "next issue"),
             ("h/l", "fold"),
+            ("F", if app.is_focused() { "unfocus" } else { "focus" }),
             ("/", "search"),
             ("r", "refresh"),
             ("?", "actions"),
@@ -1806,6 +1811,67 @@ mod tests {
             .find(|line| line.contains("cached-location"))
             .unwrap();
         assert!(current.contains('●'));
+    }
+
+    #[test]
+    fn renders_focus_title_root_connector_and_contextual_shortcut() {
+        let repository = RepositoryView {
+            config: RepositoryConfig {
+                path: PathBuf::from("/repo"),
+                label: Some("project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            },
+            session_only: false,
+            stale_error: None,
+            expanded: true,
+            worktrees: vec![
+                Worktree {
+                    path: PathBuf::from("/repo"),
+                    head: Some("1234567890".to_owned()),
+                    branch: Some("refs/heads/main".to_owned()),
+                    detached: false,
+                    bare: false,
+                    locked: None,
+                    prunable: None,
+                },
+                Worktree {
+                    path: PathBuf::from("/repo-topic"),
+                    head: Some("abcdef123456".to_owned()),
+                    branch: Some("refs/heads/topic".to_owned()),
+                    detached: false,
+                    bare: false,
+                    locked: None,
+                    prunable: None,
+                },
+            ],
+        };
+        let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        app.selected = Some(RowId::Worktree(PathBuf::from("/repo-topic")));
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('F'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let focused = buffer_text(terminal.backend().buffer());
+        assert!(focused.contains("Focus: project: topic"));
+        assert!(focused.contains("└─ topic"));
+        assert!(focused.contains("F unfocus"));
+        assert!(!focused.contains("Repos / Worktrees / PRs"));
+
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('F'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let restored = buffer_text(terminal.backend().buffer());
+        assert!(restored.contains("Repos / Worktrees / PRs"));
+        assert!(restored.contains("F focus"));
     }
 
     #[test]

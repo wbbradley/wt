@@ -62,6 +62,14 @@ pub enum RowId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum FocusTarget {
+    Repository(PathBuf),
+    VirtualRepository(GitHubRepositoryIdentity),
+    Backburner(GitHubRepositoryIdentity),
+    Branch(BranchId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatusState {
     Pending,
     Ready(WorktreeStatus),
@@ -236,7 +244,7 @@ pub enum VisibleRow {
     Worktree {
         repository_index: usize,
         worktree_index: usize,
-        stack_depth: usize,
+        depth: usize,
         expanded: bool,
         has_children: bool,
         id: RowId,
@@ -249,13 +257,14 @@ pub enum VisibleRow {
         virtual_repository_index: usize,
         pull_request_index: usize,
         mapped_repository_index: Option<usize>,
-        stack_depth: usize,
+        depth: usize,
         expanded: bool,
         has_children: bool,
         id: RowId,
     },
     Backburner {
         identity: GitHubRepositoryIdentity,
+        depth: usize,
         expanded: bool,
         id: RowId,
     },
@@ -443,6 +452,7 @@ pub struct App {
     pub repositories: Vec<RepositoryView>,
     pub virtual_repositories: Vec<VirtualRepositoryView>,
     pub selected: Option<RowId>,
+    focus_target: Option<FocusTarget>,
     pub filter: String,
     pub filter_active: bool,
     pub scroll: usize,
@@ -485,6 +495,7 @@ impl App {
             repositories,
             virtual_repositories: Vec::new(),
             selected: None,
+            focus_target: None,
             filter: String::new(),
             filter_active: false,
             scroll: 0,
@@ -534,7 +545,7 @@ impl App {
         #[cfg(test)]
         self.visible_row_builds
             .set(self.visible_row_builds.get().saturating_add(1));
-        let rows = self.logical_rows();
+        let rows = self.scoped_logical_rows();
         if self.filter_mode() {
             self.filtered_rows(rows, true)
         } else {
@@ -612,6 +623,112 @@ impl App {
             }
         }
         rows
+    }
+
+    fn scoped_logical_rows(&self) -> Vec<VisibleRow> {
+        self.focus_target
+            .as_ref()
+            .and_then(|target| self.focused_rows(target))
+            .unwrap_or_else(|| self.logical_rows())
+    }
+
+    fn focused_rows(&self, target: &FocusTarget) -> Option<Vec<VisibleRow>> {
+        let mut rows = Vec::new();
+        match target {
+            FocusTarget::Repository(path) => {
+                let repository_index = self
+                    .repositories
+                    .iter()
+                    .position(|repository| repository.config.path == *path)?;
+                self.append_local_repository(&mut rows, repository_index);
+            }
+            FocusTarget::VirtualRepository(identity) => {
+                let virtual_repository_index =
+                    self.virtual_repositories.iter().position(|repository| {
+                        repository.identity == *identity && repository.mapped_repository.is_none()
+                    })?;
+                self.append_virtual_repository(&mut rows, virtual_repository_index);
+            }
+            FocusTarget::Backburner(identity) => {
+                let (forest, included, mapped_repository_index) =
+                    self.backburner_focus_context(identity)?;
+                self.append_backburner(
+                    &mut rows,
+                    &forest,
+                    &included,
+                    identity.clone(),
+                    0,
+                    mapped_repository_index,
+                );
+            }
+            FocusTarget::Branch(branch) => {
+                let (forest, index, mapped_repository_index) = self.branch_scope_context(branch)?;
+                let included = branch_subtree_indexes(&forest, index);
+                self.append_branch(
+                    &mut rows,
+                    &forest,
+                    &included,
+                    index,
+                    0,
+                    mapped_repository_index,
+                    None,
+                );
+            }
+        }
+        Some(rows)
+    }
+
+    fn backburner_focus_context(
+        &self,
+        identity: &GitHubRepositoryIdentity,
+    ) -> Option<(BranchForest, BTreeSet<usize>, Option<usize>)> {
+        for (repository_index, repository) in self.repositories.iter().enumerate() {
+            let virtual_indexes = self
+                .virtual_repositories
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| {
+                    candidate.mapped_repository.as_ref() == Some(&repository.config.path)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let forest = self.branch_forest(Some(repository_index), &virtual_indexes);
+            let included = self.backburner_group_indexes(&forest, identity);
+            if !included.is_empty() {
+                return Some((forest, included, Some(repository_index)));
+            }
+        }
+        for (virtual_index, repository) in self.virtual_repositories.iter().enumerate() {
+            if repository.mapped_repository.is_some() || repository.identity != *identity {
+                continue;
+            }
+            let forest = self.branch_forest(None, &[virtual_index]);
+            let included = self.backburner_group_indexes(&forest, identity);
+            if !included.is_empty() {
+                return Some((forest, included, None));
+            }
+        }
+        None
+    }
+
+    fn backburner_group_indexes(
+        &self,
+        forest: &BranchForest,
+        identity: &GitHubRepositoryIdentity,
+    ) -> BTreeSet<usize> {
+        forest
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(index, node)| {
+                node.backburnered
+                    && forest.nodes[backburner_root_index(forest, *index)]
+                        .identity
+                        .as_ref()
+                        .is_some_and(|root| root.repository == *identity)
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 
     fn append_local_repository(&self, rows: &mut Vec<VisibleRow>, repository_index: usize) {
@@ -891,7 +1008,7 @@ impl App {
     fn visible_row_depth(&self, row: &VisibleRow) -> usize {
         match row {
             VisibleRow::Repository { .. } => 0,
-            VisibleRow::Worktree { stack_depth, .. } => 1 + stack_depth,
+            VisibleRow::Worktree { depth, .. } => *depth,
             VisibleRow::VirtualRepository {
                 virtual_repository_index,
                 ..
@@ -900,8 +1017,8 @@ impl App {
                     .mapped_repository
                     .is_some(),
             ),
-            VisibleRow::VirtualPullRequest { stack_depth, .. } => 1 + stack_depth,
-            VisibleRow::Backburner { .. } => 1,
+            VisibleRow::VirtualPullRequest { depth, .. } => *depth,
+            VisibleRow::Backburner { depth, .. } => *depth,
             VisibleRow::Inline { depth, .. } => *depth,
         }
     }
@@ -1272,7 +1389,7 @@ impl App {
             } => rows.push(VisibleRow::Worktree {
                 repository_index,
                 worktree_index,
-                stack_depth: depth.saturating_sub(1),
+                depth,
                 expanded,
                 has_children,
                 id: RowId::Worktree(
@@ -1288,7 +1405,7 @@ impl App {
                 virtual_repository_index,
                 pull_request_index,
                 mapped_repository_index,
-                stack_depth: depth.saturating_sub(1),
+                depth,
                 expanded,
                 has_children,
                 id: RowId::VirtualPullRequest(
@@ -1463,6 +1580,7 @@ impl App {
             self.disclosure_expanded(&DisclosureKey::Backburner(identity.clone()), false);
         rows.push(VisibleRow::Backburner {
             identity: identity.clone(),
+            depth,
             expanded,
             id: RowId::Backburner(identity),
         });
@@ -2125,7 +2243,7 @@ impl App {
         else {
             return false;
         };
-        let rows = self.logical_rows();
+        let rows = self.scoped_logical_rows();
         let mut ancestors = Vec::<usize>::new();
         for (index, row) in rows.iter().enumerate() {
             let depth = self.visible_row_depth(row);
@@ -2178,6 +2296,62 @@ impl App {
     ) -> Option<(&'a CanonicalPullRequestId, &'a PullRequestDetails)> {
         let identity = self.pull_request_identity(repository, pull_request)?;
         self.pull_request_details.get_key_value(&identity)
+    }
+
+    pub fn is_focused(&self) -> bool {
+        self.focus_target.is_some()
+    }
+
+    pub fn focus_label(&self) -> Option<String> {
+        match self.focus_target.as_ref()? {
+            FocusTarget::Repository(path) => self
+                .repositories
+                .iter()
+                .find(|repository| repository.config.path == *path)
+                .map(|repository| repository.config.display_label()),
+            FocusTarget::VirtualRepository(identity) => Some(identity.full_name()),
+            FocusTarget::Backburner(identity) => {
+                Some(format!("{} / Backburner", identity.full_name()))
+            }
+            FocusTarget::Branch(branch) => {
+                let (forest, index, mapped_repository_index) = self.branch_scope_context(branch)?;
+                let owner = mapped_repository_index
+                    .map(|repository_index| {
+                        self.repositories[repository_index].config.display_label()
+                    })
+                    .or_else(|| {
+                        forest.nodes[index]
+                            .identity
+                            .as_ref()
+                            .map(|identity| identity.repository.full_name())
+                    })?;
+                Some(format!(
+                    "{owner}: {}",
+                    self.branch_sort_label(&forest.nodes[index])
+                ))
+            }
+        }
+    }
+
+    fn toggle_focus(&mut self) {
+        if self.focus_target.take().is_some() {
+            self.scroll = 0;
+            self.ensure_selection_visible();
+            return;
+        }
+        let Some(selected) = self.selected.as_ref() else {
+            return;
+        };
+        self.focus_target = match selected {
+            RowId::Repository(path) => Some(FocusTarget::Repository(path.clone())),
+            RowId::VirtualRepository(identity) => {
+                Some(FocusTarget::VirtualRepository(identity.clone()))
+            }
+            RowId::Backburner(identity) => Some(FocusTarget::Backburner(identity.clone())),
+            _ => self.branch_for_row_id(selected).map(FocusTarget::Branch),
+        };
+        self.scroll = 0;
+        self.ensure_selection_visible();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Intent {
@@ -2242,6 +2416,10 @@ impl App {
                 Intent::None
             }
             KeyCode::Char('b') => self.toggle_selected_backburner(),
+            KeyCode::Char('F') => {
+                self.toggle_focus();
+                Intent::None
+            }
             KeyCode::Char(']') => {
                 self.navigate_attention(true);
                 Intent::None
@@ -2337,7 +2515,7 @@ impl App {
 
     fn clear_search_preserving_selection(&mut self) {
         if let Some(selected) = self.selected.as_ref() {
-            let rows = self.logical_rows();
+            let rows = self.scoped_logical_rows();
             if let Some(selected_index) = rows.iter().position(|row| row.id() == selected) {
                 let mut ancestors = Vec::new();
                 for row in &rows[..=selected_index] {
@@ -2840,6 +3018,7 @@ impl App {
             });
         }
 
+        self.reconcile_focus_target();
         self.selected = previous_selected;
         let current_rows = self.visible_rows();
         let selected_exists = self
@@ -3485,6 +3664,14 @@ impl App {
     }
 
     fn branch_scope_forest(&self, branch: &BranchId) -> Option<(BranchForest, usize)> {
+        self.branch_scope_context(branch)
+            .map(|(forest, index, _)| (forest, index))
+    }
+
+    fn branch_scope_context(
+        &self,
+        branch: &BranchId,
+    ) -> Option<(BranchForest, usize, Option<usize>)> {
         let (repository_index, virtual_repository_indexes) = match branch {
             BranchId::Worktree(path) => {
                 let repository_index = self.repositories.iter().position(|repository| {
@@ -3538,7 +3725,7 @@ impl App {
         };
         let forest = self.branch_forest(repository_index, &virtual_repository_indexes);
         let index = forest.nodes.iter().position(|node| node.id == *branch)?;
-        Some((forest, index))
+        Some((forest, index, repository_index))
     }
 
     fn repository_scope_identities(&self, path: &Path) -> Vec<CanonicalPullRequestId> {
@@ -3912,6 +4099,7 @@ impl App {
     }
 
     fn ensure_selection_visible(&mut self) {
+        self.reconcile_focus_target();
         let selected = self.selected.clone();
         let owner = self
             .selected
@@ -3956,6 +4144,16 @@ impl App {
         self.ensure_selected_in_view();
     }
 
+    fn reconcile_focus_target(&mut self) {
+        if self
+            .focus_target
+            .clone()
+            .is_some_and(|target| self.focused_rows(&target).is_none())
+        {
+            self.focus_target = None;
+        }
+    }
+
     fn filtered_ancestor_fallback(
         &self,
         selected: &RowId,
@@ -3964,7 +4162,7 @@ impl App {
         if !self.filter_mode() {
             return None;
         }
-        let expanded = self.filtered_rows(self.logical_rows(), false);
+        let expanded = self.filtered_rows(self.scoped_logical_rows(), false);
         let index = expanded.iter().position(|row| row.id() == selected)?;
         let mut child_depth = self.visible_row_depth(&expanded[index]);
         for row in expanded[..index].iter().rev() {
@@ -4235,6 +4433,17 @@ fn branch_subtree_identity_order(
         append_branch_identities(forest, root, &mut seen, &mut identities);
     }
     identities
+}
+
+fn branch_subtree_indexes(forest: &BranchForest, root: usize) -> BTreeSet<usize> {
+    let mut included = BTreeSet::new();
+    let mut pending = vec![root];
+    while let Some(index) = pending.pop() {
+        if included.insert(index) {
+            pending.extend(forest.nodes[index].children.iter().copied());
+        }
+    }
+    included
 }
 
 fn append_branch_identities(
@@ -4715,18 +4924,18 @@ mod tests {
             .filter_map(|row| match row {
                 VisibleRow::VirtualPullRequest {
                     pull_request_index,
-                    stack_depth,
+                    depth,
                     ..
                 } => Some((
                     app.virtual_repositories[0].pull_requests[*pull_request_index]
                         .identity
                         .number,
-                    *stack_depth,
+                    *depth,
                 )),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(nested, vec![(10, 0), (11, 2), (12, 4), (13, 0)]);
+        assert_eq!(nested, vec![(10, 1), (11, 3), (12, 5), (13, 1)]);
 
         app.filter = "stack-grandchild".to_owned();
         app.filter_active = true;
@@ -4736,18 +4945,18 @@ mod tests {
             .filter_map(|row| match row {
                 VisibleRow::VirtualPullRequest {
                     pull_request_index,
-                    stack_depth,
+                    depth,
                     ..
                 } => Some((
                     app.virtual_repositories[0].pull_requests[*pull_request_index]
                         .identity
                         .number,
-                    *stack_depth,
+                    *depth,
                 )),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(filtered, vec![(10, 0), (11, 2), (12, 4)]);
+        assert_eq!(filtered, vec![(10, 1), (11, 3), (12, 5)]);
         assert_eq!(
             app.visible_rows()
                 .into_iter()
@@ -4884,14 +5093,14 @@ mod tests {
             .filter_map(|row| match row {
                 VisibleRow::Worktree {
                     worktree_index,
-                    stack_depth,
+                    depth,
                     ..
-                } => Some((worktree_index, stack_depth)),
+                } => Some((worktree_index, depth)),
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(nested, vec![(0, 0), (1, 2), (2, 4)]);
+        assert_eq!(nested, vec![(0, 1), (1, 3), (2, 5)]);
     }
 
     #[test]
@@ -5290,7 +5499,238 @@ mod tests {
                 .map(|(_, worktree, _)| &worktree.path),
             Some(&path)
         );
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), Intent::Accept(path));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Intent::Accept(path.clone())
+        );
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(
+            app.focus_target,
+            Some(FocusTarget::Repository(path.clone()))
+        );
+        assert_eq!(app.visible_rows().len(), 1);
+    }
+
+    #[test]
+    fn focus_mode_toggles_repository_and_branch_scopes_without_persistence() {
+        let mut app = App::new(
+            vec![repository("/alpha", true), repository("/beta", true)],
+            PathBuf::from("/elsewhere"),
+        );
+        assert!(!app.is_focused());
+
+        app.selected = Some(RowId::Repository(PathBuf::from("/alpha")));
+        assert_eq!(app.handle_key(key(KeyCode::Char('F'))), Intent::None);
+        assert_eq!(app.focus_label().as_deref(), Some("alpha"));
+        assert!(app.visible_rows().iter().all(|row| match row {
+            VisibleRow::Repository {
+                repository_index, ..
+            }
+            | VisibleRow::Worktree {
+                repository_index, ..
+            } => *repository_index == 0,
+            _ => true,
+        }));
+        assert!(
+            !app.visible_rows()
+                .iter()
+                .any(|row| row.id() == &RowId::Repository(PathBuf::from("/beta")))
+        );
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('F'))), Intent::None);
+        assert!(!app.is_focused());
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|row| row.id() == &RowId::Repository(PathBuf::from("/beta")))
+        );
+
+        let branch = RowId::Worktree(PathBuf::from("/alpha-topic"));
+        app.selected = Some(branch.clone());
+        assert_eq!(app.handle_key(key(KeyCode::Char('F'))), Intent::None);
+        assert_eq!(app.focus_label().as_deref(), Some("alpha: topic"));
+        assert_eq!(
+            app.visible_rows()
+                .iter()
+                .map(|row| row.id())
+                .collect::<Vec<_>>(),
+            vec![&branch]
+        );
+        assert!(matches!(
+            app.visible_rows().first(),
+            Some(VisibleRow::Worktree { depth: 0, .. })
+        ));
+
+        app.handle_key(key(KeyCode::Char('F')));
+        app.repositories[0].worktrees[1].branch = None;
+        app.repositories[0].worktrees[1].detached = true;
+        app.selected = Some(branch);
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(
+            app.focus_label().as_deref(),
+            Some("alpha: detached:12345678")
+        );
+
+        let fresh = App::new(
+            vec![repository("/fresh", true)],
+            PathBuf::from("/elsewhere"),
+        );
+        assert!(!fresh.is_focused());
+    }
+
+    #[test]
+    fn focus_mode_uses_owning_branch_for_nested_and_detail_rows() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        app.branch_parents
+            .insert(PathBuf::from("/repo-topic"), PathBuf::from("/repo"));
+        let owner = BranchId::Worktree(PathBuf::from("/repo"));
+        app.selected = Some(RowId::Section(
+            owner.clone(),
+            InlineSection::StackedBranches,
+        ));
+        app.handle_key(key(KeyCode::Char('F')));
+        let rows = app.visible_rows();
+        assert!(matches!(
+            rows.first(),
+            Some(VisibleRow::Worktree { depth: 0, .. })
+        ));
+        assert!(rows.iter().any(|row| matches!(
+            row,
+            VisibleRow::Worktree {
+                id: RowId::Worktree(path),
+                depth: 2,
+                ..
+            } if path == &PathBuf::from("/repo-topic")
+        )));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| matches!(row, VisibleRow::Repository { .. }))
+        );
+
+        let (mut detail_app, identity) = filter_test_app();
+        let detail_owner = BranchId::VirtualPullRequest(identity.clone());
+        for section in [
+            InlineSection::Overview,
+            InlineSection::Checks,
+            InlineSection::PendingChecks,
+            InlineSection::ValidResults,
+            InlineSection::Reviewers,
+            InlineSection::OpenComments,
+        ] {
+            detail_app.set_disclosure_expanded(
+                DisclosureKey::Section(detail_owner.clone(), section),
+                true,
+            );
+        }
+        let detail_rows = detail_app.logical_rows();
+        for kind in [
+            InlineRowKind::Section,
+            InlineRowKind::Metadata,
+            InlineRowKind::Check,
+            InlineRowKind::Reviewer,
+            InlineRowKind::OpenComment,
+        ] {
+            let selected = detail_rows
+                .iter()
+                .find(|row| {
+                    matches!(row, VisibleRow::Inline { kind: candidate, .. } if *candidate == kind)
+                })
+                .expect("detail fixture should contain every inline row kind")
+                .id()
+                .clone();
+            detail_app.selected = Some(selected);
+            detail_app.handle_key(key(KeyCode::Char('F')));
+            assert_eq!(
+                detail_app.focus_target,
+                Some(FocusTarget::Branch(detail_owner.clone()))
+            );
+            detail_app.handle_key(key(KeyCode::Char('F')));
+        }
+    }
+
+    #[test]
+    fn focus_mode_composes_with_search_and_clears_when_target_disappears() {
+        let parent = authored("team", "project", 1, "2026-01-01");
+        let unrelated = authored("team", "project", 2, "2026-01-02");
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        replace_authored(
+            &mut app,
+            vec![parent.clone(), unrelated.clone()],
+            vec![
+                (parent.identity.clone(), None),
+                (unrelated.identity.clone(), None),
+            ],
+        );
+        app.selected = Some(RowId::VirtualRepository(parent.identity.repository.clone()));
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.focus_label().as_deref(), Some("team/project"));
+        assert!(matches!(
+            app.visible_rows().first(),
+            Some(VisibleRow::VirtualRepository { .. })
+        ));
+        app.handle_key(key(KeyCode::Char('F')));
+
+        app.selected = Some(RowId::VirtualPullRequest(parent.identity.clone()));
+        app.handle_key(key(KeyCode::Char('F')));
+        assert!(app.is_focused());
+        assert_eq!(app.focus_label().as_deref(), Some("team/project: topic-1"));
+
+        app.set_committed_filter("topic-1");
+        assert!(app.is_focused());
+        assert!(
+            app.visible_rows()
+                .iter()
+                .all(|row| row.id() != &RowId::VirtualPullRequest(unrelated.identity.clone()))
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.is_focused());
+        assert!(app.filter.is_empty());
+
+        app.filter_active = true;
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.filter, "F");
+        assert!(app.is_focused());
+        app.filter_active = false;
+        app.filter.clear();
+
+        replace_authored(
+            &mut app,
+            vec![unrelated.clone()],
+            vec![(unrelated.identity.clone(), None)],
+        );
+        assert!(!app.is_focused());
+    }
+
+    #[test]
+    fn focus_mode_rebases_backburner_as_a_named_root() {
+        let parent = authored("team", "project", 1, "2026-01-01");
+        let identity = parent.identity.repository.clone();
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: identity.clone(),
+            mapped_repository: None,
+            expanded: true,
+            pull_requests: vec![parent.clone()],
+        }];
+        app.backburner.insert(parent.identity.clone());
+        app.set_disclosure_expanded(DisclosureKey::Backburner(identity.clone()), true);
+        app.selected = Some(RowId::Backburner(identity.clone()));
+
+        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(
+            app.focus_label().as_deref(),
+            Some("team/project / Backburner")
+        );
+        assert!(matches!(
+            app.visible_rows().first(),
+            Some(VisibleRow::Backburner { depth: 0, .. })
+        ));
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|row| { row.id() == &RowId::VirtualPullRequest(parent.identity.clone()) })
+        );
     }
 
     #[test]

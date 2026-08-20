@@ -2912,18 +2912,18 @@ mod tests {
             .filter_map(|row| match row {
                 crate::app::VisibleRow::VirtualPullRequest {
                     pull_request_index,
-                    stack_depth,
+                    depth,
                     ..
                 } => Some((
                     controller.app.virtual_repositories[0].pull_requests[pull_request_index]
                         .identity
                         .number,
-                    stack_depth,
+                    depth,
                 )),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(mixed_virtual_rows, vec![(33902, 1)]);
+        assert_eq!(mixed_virtual_rows, vec![(33902, 2)]);
         let mixed_rows = controller.app.visible_rows();
         assert!(mixed_rows.iter().any(|row| {
             matches!(
@@ -2991,18 +2991,18 @@ mod tests {
             .filter_map(|row| match row {
                 crate::app::VisibleRow::VirtualPullRequest {
                     pull_request_index,
-                    stack_depth,
+                    depth,
                     ..
                 } => Some((
                     controller.app.virtual_repositories[0].pull_requests[pull_request_index]
                         .identity
                         .number,
-                    stack_depth,
+                    depth,
                 )),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(all_virtual_rows, vec![(33580, 0), (33902, 2)]);
+        assert_eq!(all_virtual_rows, vec![(33580, 1), (33902, 3)]);
     }
 
     #[test]

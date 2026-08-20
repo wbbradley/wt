@@ -388,7 +388,7 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "In feature (#42 Fix feedback):\n\nUse this existing checkout:\n```bash\ncd -- '/worktrees/feature'\n```\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nReview comments:\n  - Comment 91 by reviewer on `src/lib.rs`\n    URL: https://git.example.com/comment/91\n    Body:\n~~~\nSummary\nsplit this line\nfollow up\n~~~\n\nReview summaries:\n  - Review 92 by lead\n    Body:\n~~~\nPlease add coverage\n~~~\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nFix, reply to the comments, and mark as resolved as appropriate."
+            "In feature (#42 Fix feedback):\n\nUse this existing checkout:\n```bash\ncd -- '/worktrees/feature'\n```\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nReview comments:\n  - Comment 91 by reviewer on `src/lib.rs`\n    URL: https://git.example.com/comment/91\n    Body:\n~~~\nSummary\nsplit this line\nfollow up\n~~~\n\nReview summaries:\n  - Review 92 by lead\n    Body:\n~~~\nPlease add coverage\n~~~\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nPlease investigate the above."
         );
         assert!(!actual.contains("gh api"));
         assert!(!actual.contains("not merge-required"));

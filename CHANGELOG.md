@@ -5,6 +5,7 @@
 ### Added
 
 - Add a release-mode regression benchmark and profiling guide for keeping cursor navigation and redraw latency below one 60 Hz frame on large trees.
+- Add an in-memory `F` focus mode that solos a selected repository, Backburner group, or owning branch and identifies the focused target in the list title.
 
 ### Changed
 
