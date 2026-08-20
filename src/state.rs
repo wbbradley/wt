@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::model::CanonicalPullRequestId;
+use crate::model::{CanonicalPullRequestId, GitHubRepositoryIdentity};
 
 #[cfg(not(test))]
 pub const STATE_PATH_ENV: &str = "WT_STATE_PATH";
@@ -20,6 +20,28 @@ pub struct PersistentState {
     pub version: u32,
     #[serde(default)]
     pub backburner: BTreeSet<CanonicalPullRequestId>,
+    #[serde(default)]
+    pub focus: Option<PersistentFocusTarget>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PersistentFocusTarget {
+    Repository {
+        path: PathBuf,
+    },
+    VirtualRepository {
+        repository: GitHubRepositoryIdentity,
+    },
+    Backburner {
+        repository: GitHubRepositoryIdentity,
+    },
+    Worktree {
+        path: PathBuf,
+    },
+    PullRequest {
+        pull_request: CanonicalPullRequestId,
+    },
 }
 
 impl Default for PersistentState {
@@ -27,6 +49,7 @@ impl Default for PersistentState {
         Self {
             version: STATE_VERSION,
             backburner: BTreeSet::new(),
+            focus: None,
         }
     }
 }
@@ -161,9 +184,16 @@ mod tests {
         let state = PersistentState {
             version: STATE_VERSION,
             backburner: BTreeSet::from([identity("github.com"), identity("github.example.com")]),
+            focus: Some(PersistentFocusTarget::PullRequest {
+                pull_request: identity("github.example.com"),
+            }),
         };
         save(&path, &state).unwrap();
         assert_eq!(load(&path).unwrap(), state);
+        let encoded = fs::read_to_string(&path).unwrap();
+        assert!(encoded.contains("\"kind\": \"pull_request\""));
+        assert!(encoded.contains("\"number\": 7"));
+        assert!(!encoded.contains("index"));
         let replacement = PersistentState::default();
         save(&path, &replacement).unwrap();
         assert_eq!(load(&path).unwrap(), replacement);

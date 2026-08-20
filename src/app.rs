@@ -18,10 +18,11 @@ use crate::prompt::{
     PromptPullRequest, PromptWorktree, concise_comment_text, format_agent_prompt,
     format_review_request,
 };
+use crate::state::PersistentFocusTarget;
 
 const LIST_SCROLL_MARGIN: usize = 5;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BranchId {
     Worktree(PathBuf),
     VirtualPullRequest(CanonicalPullRequestId),
@@ -438,6 +439,7 @@ pub enum Intent {
     MaterializePullRequest(CanonicalPullRequestId),
     OpenUrl(String),
     PersistBackburner,
+    PersistFocus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -593,6 +595,7 @@ impl App {
             .map(|(index, repository)| {
                 (
                     repository.config.display_label(),
+                    TopLevelRepositoryKey::Local(repository.config.path.clone()),
                     TopLevelRepository::Local(index),
                 )
             })
@@ -604,15 +607,16 @@ impl App {
                     .map(|(index, repository)| {
                         (
                             repository.identity.full_name(),
+                            TopLevelRepositoryKey::Virtual(repository.identity.clone()),
                             TopLevelRepository::Virtual(index),
                         )
                     }),
             )
             .collect::<Vec<_>>();
-        repositories.sort_by(|(left_label, left), (right_label, right)| {
-            alphabetical_cmp(left_label, right_label).then_with(|| left.cmp(right))
+        repositories.sort_by(|(left_label, left_key, _), (right_label, right_key, _)| {
+            alphabetical_cmp(left_label, right_label).then_with(|| left_key.cmp(right_key))
         });
-        for (_, repository) in repositories {
+        for (_, _, repository) in repositories {
             match repository {
                 TopLevelRepository::Local(repository_index) => {
                     self.append_local_repository(&mut rows, repository_index)
@@ -1505,7 +1509,7 @@ impl App {
                 &self.branch_sort_label(&forest.nodes[*left]),
                 &self.branch_sort_label(&forest.nodes[*right]),
             )
-            .then_with(|| left.cmp(right))
+            .then_with(|| forest.nodes[*left].id.cmp(&forest.nodes[*right].id))
         });
         indexes
     }
@@ -2302,6 +2306,55 @@ impl App {
         self.focus_target.is_some()
     }
 
+    pub(crate) fn persistent_focus(&self) -> Option<PersistentFocusTarget> {
+        self.focus_target.as_ref().map(|target| match target {
+            FocusTarget::Repository(path) => {
+                PersistentFocusTarget::Repository { path: path.clone() }
+            }
+            FocusTarget::VirtualRepository(repository) => {
+                PersistentFocusTarget::VirtualRepository {
+                    repository: repository.clone(),
+                }
+            }
+            FocusTarget::Backburner(repository) => PersistentFocusTarget::Backburner {
+                repository: repository.clone(),
+            },
+            FocusTarget::Branch(BranchId::Worktree(path)) => {
+                PersistentFocusTarget::Worktree { path: path.clone() }
+            }
+            FocusTarget::Branch(BranchId::VirtualPullRequest(pull_request)) => {
+                PersistentFocusTarget::PullRequest {
+                    pull_request: pull_request.clone(),
+                }
+            }
+        })
+    }
+
+    pub(crate) fn restore_focus(&mut self, target: &PersistentFocusTarget) -> bool {
+        let target = match target {
+            PersistentFocusTarget::Repository { path } => FocusTarget::Repository(path.clone()),
+            PersistentFocusTarget::VirtualRepository { repository } => {
+                FocusTarget::VirtualRepository(repository.clone())
+            }
+            PersistentFocusTarget::Backburner { repository } => {
+                FocusTarget::Backburner(repository.clone())
+            }
+            PersistentFocusTarget::Worktree { path } => {
+                FocusTarget::Branch(BranchId::Worktree(path.clone()))
+            }
+            PersistentFocusTarget::PullRequest { pull_request } => {
+                FocusTarget::Branch(BranchId::VirtualPullRequest(pull_request.clone()))
+            }
+        };
+        if self.focused_rows(&target).is_none() {
+            return false;
+        }
+        self.focus_target = Some(target);
+        self.scroll = 0;
+        self.ensure_selection_visible();
+        true
+    }
+
     pub fn focus_label(&self) -> Option<String> {
         match self.focus_target.as_ref()? {
             FocusTarget::Repository(path) => self
@@ -2333,12 +2386,7 @@ impl App {
         }
     }
 
-    fn toggle_focus(&mut self) {
-        if self.focus_target.take().is_some() {
-            self.scroll = 0;
-            self.ensure_selection_visible();
-            return;
-        }
+    fn focus_selected(&mut self) {
         let Some(selected) = self.selected.as_ref() else {
             return;
         };
@@ -2350,6 +2398,12 @@ impl App {
             RowId::Backburner(identity) => Some(FocusTarget::Backburner(identity.clone())),
             _ => self.branch_for_row_id(selected).map(FocusTarget::Branch),
         };
+        self.scroll = 0;
+        self.ensure_selection_visible();
+    }
+
+    fn clear_focus(&mut self) {
+        self.focus_target = None;
         self.scroll = 0;
         self.ensure_selection_visible();
     }
@@ -2416,9 +2470,9 @@ impl App {
                 Intent::None
             }
             KeyCode::Char('b') => self.toggle_selected_backburner(),
-            KeyCode::Char('F') => {
-                self.toggle_focus();
-                Intent::None
+            KeyCode::Char('f') => {
+                self.focus_selected();
+                Intent::PersistFocus
             }
             KeyCode::Char(']') => {
                 self.navigate_attention(true);
@@ -2437,6 +2491,10 @@ impl App {
             KeyCode::Char('w') => self.open_selected_url(),
             KeyCode::Char(character) => self.direct_action(character),
             KeyCode::Enter => self.accept_or_toggle(),
+            KeyCode::Esc if self.is_focused() => {
+                self.clear_focus();
+                Intent::PersistFocus
+            }
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.clear_search_preserving_selection();
                 Intent::None
@@ -2943,11 +3001,7 @@ impl App {
     }
 
     pub fn rebuild_virtual_repositories(&mut self) {
-        let previous_rows = self.visible_rows();
         let previous_selected = self.selected.clone();
-        let previous_index = previous_selected
-            .as_ref()
-            .and_then(|selected| previous_rows.iter().position(|row| row.id() == selected));
         let previous_expansion: HashMap<GitHubRepositoryIdentity, bool> = self
             .virtual_repositories
             .iter()
@@ -3036,13 +3090,6 @@ impl App {
                 }
                 _ => None,
             }
-            .or_else(|| {
-                previous_index
-                    .and_then(|index| {
-                        current_rows.get(index.min(current_rows.len().saturating_sub(1)))
-                    })
-                    .map(|row| row.id().clone())
-            })
             .or_else(|| current_rows.first().map(|row| row.id().clone()));
         }
         self.ensure_selected_in_view();
@@ -4375,6 +4422,12 @@ enum TopLevelRepository {
     Virtual(usize),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TopLevelRepositoryKey {
+    Local(PathBuf),
+    Virtual(GitHubRepositoryIdentity),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BranchSource {
     Worktree {
@@ -5503,7 +5556,7 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)),
             Intent::Accept(path.clone())
         );
-        app.handle_key(key(KeyCode::Char('F')));
+        app.handle_key(key(KeyCode::Char('f')));
         assert_eq!(
             app.focus_target,
             Some(FocusTarget::Repository(path.clone()))
@@ -5512,7 +5565,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_mode_toggles_repository_and_branch_scopes_without_persistence() {
+    fn focus_mode_retargets_from_repository_to_branch_and_escape_clears_it() {
         let mut app = App::new(
             vec![repository("/alpha", true), repository("/beta", true)],
             PathBuf::from("/elsewhere"),
@@ -5521,6 +5574,11 @@ mod tests {
 
         app.selected = Some(RowId::Repository(PathBuf::from("/alpha")));
         assert_eq!(app.handle_key(key(KeyCode::Char('F'))), Intent::None);
+        assert!(!app.is_focused());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('f'))),
+            Intent::PersistFocus
+        );
         assert_eq!(app.focus_label().as_deref(), Some("alpha"));
         assert!(app.visible_rows().iter().all(|row| match row {
             VisibleRow::Repository {
@@ -5537,17 +5595,12 @@ mod tests {
                 .any(|row| row.id() == &RowId::Repository(PathBuf::from("/beta")))
         );
 
-        assert_eq!(app.handle_key(key(KeyCode::Char('F'))), Intent::None);
-        assert!(!app.is_focused());
-        assert!(
-            app.visible_rows()
-                .iter()
-                .any(|row| row.id() == &RowId::Repository(PathBuf::from("/beta")))
-        );
-
         let branch = RowId::Worktree(PathBuf::from("/alpha-topic"));
         app.selected = Some(branch.clone());
-        assert_eq!(app.handle_key(key(KeyCode::Char('F'))), Intent::None);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('f'))),
+            Intent::PersistFocus
+        );
         assert_eq!(app.focus_label().as_deref(), Some("alpha: topic"));
         assert_eq!(
             app.visible_rows()
@@ -5561,11 +5614,18 @@ mod tests {
             Some(VisibleRow::Worktree { depth: 0, .. })
         ));
 
-        app.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Intent::PersistFocus);
+        assert!(!app.is_focused());
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|row| row.id() == &RowId::Repository(PathBuf::from("/beta")))
+        );
+
         app.repositories[0].worktrees[1].branch = None;
         app.repositories[0].worktrees[1].detached = true;
         app.selected = Some(branch);
-        app.handle_key(key(KeyCode::Char('F')));
+        app.handle_key(key(KeyCode::Char('f')));
         assert_eq!(
             app.focus_label().as_deref(),
             Some("alpha: detached:12345678")
@@ -5588,7 +5648,7 @@ mod tests {
             owner.clone(),
             InlineSection::StackedBranches,
         ));
-        app.handle_key(key(KeyCode::Char('F')));
+        app.handle_key(key(KeyCode::Char('f')));
         let rows = app.visible_rows();
         assert!(matches!(
             rows.first(),
@@ -5640,12 +5700,12 @@ mod tests {
                 .id()
                 .clone();
             detail_app.selected = Some(selected);
-            detail_app.handle_key(key(KeyCode::Char('F')));
+            detail_app.handle_key(key(KeyCode::Char('f')));
             assert_eq!(
                 detail_app.focus_target,
                 Some(FocusTarget::Branch(detail_owner.clone()))
             );
-            detail_app.handle_key(key(KeyCode::Char('F')));
+            detail_app.handle_key(key(KeyCode::Esc));
         }
     }
 
@@ -5663,16 +5723,14 @@ mod tests {
             ],
         );
         app.selected = Some(RowId::VirtualRepository(parent.identity.repository.clone()));
-        app.handle_key(key(KeyCode::Char('F')));
+        app.handle_key(key(KeyCode::Char('f')));
         assert_eq!(app.focus_label().as_deref(), Some("team/project"));
         assert!(matches!(
             app.visible_rows().first(),
             Some(VisibleRow::VirtualRepository { .. })
         ));
-        app.handle_key(key(KeyCode::Char('F')));
-
         app.selected = Some(RowId::VirtualPullRequest(parent.identity.clone()));
-        app.handle_key(key(KeyCode::Char('F')));
+        app.handle_key(key(KeyCode::Char('f')));
         assert!(app.is_focused());
         assert_eq!(app.focus_label().as_deref(), Some("team/project: topic-1"));
 
@@ -5684,15 +5742,20 @@ mod tests {
                 .all(|row| row.id() != &RowId::VirtualPullRequest(unrelated.identity.clone()))
         );
         app.handle_key(key(KeyCode::Esc));
-        assert!(app.is_focused());
+        assert!(!app.is_focused());
+        assert_eq!(app.filter, "topic-1");
+        app.handle_key(key(KeyCode::Esc));
         assert!(app.filter.is_empty());
 
+        app.selected = Some(RowId::VirtualPullRequest(parent.identity.clone()));
+        app.handle_key(key(KeyCode::Char('f')));
         app.filter_active = true;
-        app.handle_key(key(KeyCode::Char('F')));
-        assert_eq!(app.filter, "F");
+        app.handle_key(key(KeyCode::Char('f')));
+        assert_eq!(app.filter, "f");
         assert!(app.is_focused());
-        app.filter_active = false;
-        app.filter.clear();
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.is_focused());
+        assert!(app.filter.is_empty());
 
         replace_authored(
             &mut app,
@@ -5700,6 +5763,45 @@ mod tests {
             vec![(unrelated.identity.clone(), None)],
         );
         assert!(!app.is_focused());
+    }
+
+    #[test]
+    fn focus_round_trips_by_canonical_pull_request_identity() {
+        let pull_request = authored("team", "project", 42, "2026-01-01");
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        replace_authored(
+            &mut app,
+            vec![pull_request.clone()],
+            vec![(pull_request.identity.clone(), None)],
+        );
+        app.selected = Some(RowId::VirtualPullRequest(pull_request.identity.clone()));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('f'))),
+            Intent::PersistFocus
+        );
+        let persisted = app.persistent_focus().unwrap();
+        assert_eq!(
+            persisted,
+            PersistentFocusTarget::PullRequest {
+                pull_request: pull_request.identity.clone()
+            }
+        );
+
+        let mut restored = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        replace_authored(
+            &mut restored,
+            vec![pull_request.clone()],
+            vec![(pull_request.identity.clone(), None)],
+        );
+        assert!(restored.restore_focus(&persisted));
+        assert_eq!(
+            restored.focus_label().as_deref(),
+            Some("team/project: topic-42")
+        );
+        assert_eq!(
+            restored.selected,
+            Some(RowId::VirtualPullRequest(pull_request.identity))
+        );
     }
 
     #[test]
@@ -5717,7 +5819,7 @@ mod tests {
         app.set_disclosure_expanded(DisclosureKey::Backburner(identity.clone()), true);
         app.selected = Some(RowId::Backburner(identity.clone()));
 
-        app.handle_key(key(KeyCode::Char('F')));
+        app.handle_key(key(KeyCode::Char('f')));
         assert_eq!(
             app.focus_label().as_deref(),
             Some("team/project / Backburner")
@@ -5867,8 +5969,8 @@ mod tests {
             })
         );
         assert_eq!(
-            app.branch_for_row_id(app.selected.as_ref().unwrap()),
-            Some(BranchId::VirtualPullRequest(other.identity.clone()))
+            app.selected,
+            Some(RowId::Repository(PathBuf::from("/repo")))
         );
     }
 

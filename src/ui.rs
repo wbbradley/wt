@@ -1426,16 +1426,32 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, _rows: &[VisibleRow], area: R
             Span::styled("search: ", Style::default().fg(MUTED)),
             Span::styled(app.filter.clone(), Style::default().fg(WARNING)),
             Span::styled(
-                " · n/N hits · Esc clear · / replace · h/l fold",
+                if app.is_focused() {
+                    " · n/N hits · Esc unfocus · / replace · h/l fold"
+                } else {
+                    " · n/N hits · Esc clear · / replace · h/l fold"
+                },
                 Style::default().fg(MUTED),
             ),
+        ])
+    } else if app.is_focused() {
+        shortcut_line(&[
+            ("j/k", "move"),
+            ("]", "next issue"),
+            ("h/l", "fold"),
+            ("f", "focus"),
+            ("Esc", "unfocus"),
+            ("/", "search"),
+            ("r", "refresh"),
+            ("?", "actions"),
+            ("Enter", "select/create"),
         ])
     } else {
         shortcut_line(&[
             ("j/k", "move"),
             ("]", "next issue"),
             ("h/l", "fold"),
-            ("F", if app.is_focused() { "unfocus" } else { "focus" }),
+            ("f", "focus"),
             ("/", "search"),
             ("r", "refresh"),
             ("?", "actions"),
@@ -1447,7 +1463,11 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, _rows: &[VisibleRow], area: R
             if app.filter_active {
                 return shortcut_line(&[("Enter", "apply"), ("Esc", "cancel search")]);
             }
-            let exit_key = if app.filter.is_empty() { "q/Esc" } else { "q" };
+            let exit_key = if app.filter.is_empty() && !app.is_focused() {
+                "q/Esc"
+            } else {
+                "q"
+            };
             let mut shortcuts = vec![
                 ("w", "web"),
                 ("c", "prompt"),
@@ -1851,7 +1871,7 @@ mod tests {
         let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
         app.selected = Some(RowId::Worktree(PathBuf::from("/repo-topic")));
         app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('F'),
+            crossterm::event::KeyCode::Char('f'),
             crossterm::event::KeyModifiers::NONE,
         ));
         let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
@@ -1861,17 +1881,18 @@ mod tests {
         let focused = buffer_text(terminal.backend().buffer());
         assert!(focused.contains("Focus: project: topic"));
         assert!(focused.contains("└─ topic"));
-        assert!(focused.contains("F unfocus"));
+        assert!(focused.contains("f focus"));
+        assert!(focused.contains("Esc unfocus"));
         assert!(!focused.contains("Repos / Worktrees / PRs"));
 
         app.handle_key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('F'),
+            crossterm::event::KeyCode::Esc,
             crossterm::event::KeyModifiers::NONE,
         ));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let restored = buffer_text(terminal.backend().buffer());
         assert!(restored.contains("Repos / Worktrees / PRs"));
-        assert!(restored.contains("F focus"));
+        assert!(restored.contains("f focus"));
     }
 
     #[test]

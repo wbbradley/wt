@@ -5,7 +5,7 @@
 ### Added
 
 - Add a release-mode regression benchmark and profiling guide for keeping cursor navigation and redraw latency below one 60 Hz frame on large trees.
-- Add an in-memory `F` focus mode that solos a selected repository, Backburner group, or owning branch and identifies the focused target in the list title.
+- Add an `f` focus mode that solos a selected repository, Backburner group, or owning branch and identifies the focused target in the list title.
 
 ### Changed
 
@@ -13,6 +13,8 @@
 
 ### Fixed
 
+- Persist focus mode by stable repository, worktree, or canonical pull-request identity and avoid positional selection fallback during refreshes.
+- Bind focus to lowercase `f`, allow it to narrow the current focus, and use `Esc` to restore the full tree.
 - Prevent periodic background status refreshes from flashing loading states or redrawing when visible status and progress are unchanged.
 - Preserve selection visibility, scrolling, tree connectors, current-worktree markers, and selected-row actions with optimized viewport rendering.
 

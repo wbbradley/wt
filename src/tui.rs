@@ -22,7 +22,7 @@ use crate::github::{
 };
 use crate::model::{Catalog, RepositoryConfig, Worktree};
 use crate::operations::{self, CreateMode};
-use crate::state::{self, PersistentState};
+use crate::state::{self, PersistentFocusTarget, PersistentState};
 use crate::terminal::{InteractiveTerminal, PanicHookGuard};
 use crate::ui;
 
@@ -364,6 +364,7 @@ struct Controller {
     url_opener: Arc<dyn UrlOpener>,
     clipboard: Arc<dyn Clipboard>,
     state_path: PathBuf,
+    pending_focus: Option<PersistentFocusTarget>,
 }
 
 impl Controller {
@@ -375,9 +376,13 @@ impl Controller {
         let (github_sender, github_receiver) = mpsc::channel();
         let remote_cache_path = cache::path(&catalog_path);
         let state_path = state::path(&catalog_path);
+        let mut pending_focus = None;
         match state::load(&state_path) {
-            Ok(state) => app.backburner = state.backburner,
-            Err(error) => app.inline_error = Some(format!("Backburner state ignored: {error}")),
+            Ok(state) => {
+                app.backburner = state.backburner;
+                pending_focus = state.focus;
+            }
+            Err(error) => app.inline_error = Some(format!("UI state ignored: {error}")),
         }
         let mut controller = Self {
             catalog_path,
@@ -408,13 +413,25 @@ impl Controller {
             url_opener: Arc::new(SystemUrlOpener),
             clipboard: Arc::new(SystemClipboard),
             state_path,
+            pending_focus,
         };
+        controller.restore_pending_focus();
         controller.github_bindings = controller
             .current_github_bindings()
             .into_iter()
             .filter(|(path, _)| controller.app.github.contains_key(path))
             .collect();
         controller
+    }
+
+    fn restore_pending_focus(&mut self) {
+        if self
+            .pending_focus
+            .as_ref()
+            .is_some_and(|target| self.app.restore_focus(target))
+        {
+            self.pending_focus = None;
+        }
     }
 
     #[cfg(test)]
@@ -568,11 +585,24 @@ impl Controller {
             Intent::PersistBackburner => {
                 let persistent = PersistentState {
                     backburner: self.app.backburner.clone(),
+                    focus: self.app.persistent_focus(),
                     ..PersistentState::default()
                 };
                 if let Err(error) = state::save(&self.state_path, &persistent) {
                     self.app.inline_error =
                         Some(format!("unable to save Backburner state: {error}"));
+                }
+                Ok(ControlFlow::Continue)
+            }
+            Intent::PersistFocus => {
+                self.pending_focus = None;
+                let persistent = PersistentState {
+                    backburner: self.app.backburner.clone(),
+                    focus: self.app.persistent_focus(),
+                    ..PersistentState::default()
+                };
+                if let Err(error) = state::save(&self.state_path, &persistent) {
+                    self.app.inline_error = Some(format!("unable to save focus state: {error}"));
                 }
                 Ok(ControlFlow::Continue)
             }
@@ -1734,6 +1764,7 @@ impl Controller {
             |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
         );
         self.app.rebuild_virtual_repositories();
+        self.restore_pending_focus();
     }
 
     fn start_pull_request_materialization(
@@ -2269,6 +2300,26 @@ mod tests {
                 .inline_error
                 .as_deref()
                 .is_some_and(|error| error.contains("unable to save Backburner state"))
+        );
+    }
+
+    #[test]
+    fn controller_persists_and_restores_named_focus_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog_path = directory.path().join("wt.json");
+        let mut app = prompt_app();
+        let intent = app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('f'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let mut controller = Controller::new(catalog_path.clone(), Catalog::default(), app);
+        controller.handle_intent(intent).unwrap();
+
+        let restored = Controller::new(catalog_path, Catalog::default(), prompt_app());
+        assert!(restored.app.is_focused());
+        assert_eq!(
+            restored.app.focus_label().as_deref(),
+            Some("team/project: fix-ci")
         );
     }
 
