@@ -427,13 +427,28 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, rows: &[VisibleRow], area: 
                 let label_width = line_width
                     .saturating_sub(prefix_width + priority_suffix_width + 1)
                     .max(4);
+                let path = display_path(&worktree.path);
+                let identity_width = display_width(&identity);
+                let path_width = display_width(&path);
+                let (identity_width, path_width) = if identity_width + 3 + path_width <= label_width
+                {
+                    (identity_width, path_width)
+                } else {
+                    let field_width = label_width.saturating_sub(3);
+                    let identity_width = (field_width / 3).max(1);
+                    (identity_width, field_width.saturating_sub(identity_width))
+                };
                 let mut spans = vec![
                     location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
                 ];
                 spans.push(Span::styled(
-                    truncate_label(&identity, label_width),
+                    truncate_label(&identity, identity_width),
                     Style::default().fg(BRANCH),
+                ));
+                spans.push(Span::styled(
+                    format!(" · {}", truncate_label(&path, path_width)),
+                    Style::default().fg(MUTED),
                 ));
                 spans.extend(local_state);
                 spans.extend(suffix);
@@ -2059,11 +2074,14 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("└─▾project"));
-        assert!(content.contains("└─▾parent"));
+        assert!(content.contains("└─▾parent · /repo"));
         assert!(content.contains("Stacked worktrees"));
-        assert!(content.contains("└─ child"));
+        assert!(content.contains("└─ child · /repo-child"));
         assert!(!content.contains("Worktree ·"));
-        assert!(colored_text(buffer, MUTED).contains("Stacked worktrees"));
+        let muted = colored_text(buffer, MUTED);
+        assert!(muted.contains(" · /repo"));
+        assert!(muted.contains(" · /repo-child"));
+        assert!(muted.contains("Stacked worktrees"));
 
         app.selected = Some(RowId::Worktree(PathBuf::from("/repo-child")));
         let mut clipped = Terminal::new(TestBackend::new(100, 7)).unwrap();
