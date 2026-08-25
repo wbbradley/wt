@@ -467,7 +467,6 @@ pub struct App {
     pub inline_error: Option<String>,
     pub progress: Option<String>,
     pub statuses: HashMap<PathBuf, StatusState>,
-    pub branch_parents: HashMap<PathBuf, PathBuf>,
     pub github: HashMap<PathBuf, GitHubState>,
     pub github_generation: u64,
     pub github_loading: bool,
@@ -510,7 +509,6 @@ impl App {
             inline_error: None,
             progress: None,
             statuses: HashMap::new(),
-            branch_parents: HashMap::new(),
             github: HashMap::new(),
             github_generation: 0,
             github_loading: false,
@@ -1112,7 +1110,6 @@ impl App {
         virtual_repository_indexes: &[usize],
     ) -> BranchForest {
         let mut nodes = Vec::new();
-        let mut local_indexes = HashMap::new();
         let mut represented_pull_requests = BTreeSet::new();
         if let Some(repository_index) = repository_index {
             let repository = &self.repositories[repository_index];
@@ -1131,7 +1128,6 @@ impl App {
                 if let Some(identity) = &identity {
                     represented_pull_requests.insert(identity.clone());
                 }
-                local_indexes.insert(worktree.path.clone(), nodes.len());
                 nodes.push(BranchNode {
                     id: BranchId::Worktree(worktree.path.clone()),
                     source: BranchSource::Worktree {
@@ -1194,25 +1190,6 @@ impl App {
             if let [parent] = candidates.as_slice() {
                 nodes[child].parent = Some(*parent);
             }
-        }
-        for (index, node) in nodes.iter_mut().enumerate() {
-            if node.pull_request.is_some() {
-                continue;
-            }
-            let BranchSource::Worktree {
-                repository_index,
-                worktree_index,
-            } = node.source
-            else {
-                continue;
-            };
-            let path = &self.repositories[repository_index].worktrees[worktree_index].path;
-            node.parent = self
-                .branch_parents
-                .get(path)
-                .and_then(|parent| local_indexes.get(parent))
-                .copied()
-                .filter(|parent| *parent != index);
         }
         let mut cyclic = BTreeSet::new();
         for start in 0..nodes.len() {
@@ -4768,6 +4745,37 @@ mod tests {
         }
     }
 
+    fn local_pr_stack_app() -> App {
+        let mut repository = repository("/repo", true);
+        let mut parent = authored("team", "project", 1, "2026-01-01");
+        parent.pull_request.head.repository = Some("team/project".to_owned());
+        parent.pull_request.head.branch = "main-pr".to_owned();
+        let mut child = authored("team", "project", 2, "2026-01-02");
+        child.pull_request.base = parent.pull_request.head.clone();
+        repository
+            .config
+            .github_remotes
+            .insert("origin".to_owned(), parent.identity.repository.clone());
+        let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        app.github.insert(
+            PathBuf::from("/repo"),
+            GitHubState::Ready(GitHubBranchData {
+                pull_request: Some(parent.pull_request),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+        app.github.insert(
+            PathBuf::from("/repo-topic"),
+            GitHubState::Ready(GitHubBranchData {
+                pull_request: Some(child.pull_request),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+        app
+    }
+
     fn filter_test_app() -> (App, CanonicalPullRequestId) {
         let authored = authored("team", "project", 42, "2026-01-01T00:00:00Z");
         let identity = authored.identity.clone();
@@ -5129,18 +5137,14 @@ mod tests {
     }
 
     #[test]
-    fn local_branch_ancestry_nests_each_worktree_once() {
+    fn ordinary_worktrees_remain_siblings_without_pull_request_ancestry() {
         let mut repository = repository("/repo", true);
         repository
             .worktrees
             .push(worktree("/repo-child", "child", false));
-        let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
-        app.branch_parents
-            .insert(PathBuf::from("/repo-topic"), PathBuf::from("/repo"));
-        app.branch_parents
-            .insert(PathBuf::from("/repo-child"), PathBuf::from("/repo-topic"));
+        let app = App::new(vec![repository], PathBuf::from("/elsewhere"));
 
-        let nested = app
+        let worktrees = app
             .visible_rows()
             .into_iter()
             .filter_map(|row| match row {
@@ -5153,7 +5157,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(nested, vec![(0, 1), (1, 3), (2, 5)]);
+        assert_eq!(worktrees, vec![(2, 1), (0, 1), (1, 1)]);
+        assert!(!app.visible_rows().iter().any(|row| matches!(
+            row,
+            VisibleRow::Inline {
+                id: RowId::Section(_, InlineSection::StackedBranches),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -5176,8 +5187,6 @@ mod tests {
             .insert("origin".to_owned(), parent.identity.repository.clone());
         let topic = local.worktrees[1].path.clone();
         let mut app = App::new(vec![local], PathBuf::from("/elsewhere"));
-        app.branch_parents
-            .insert(topic.clone(), PathBuf::from("/repo"));
         app.github.insert(
             PathBuf::from("/repo"),
             GitHubState::Ready(GitHubBranchData {
@@ -5277,8 +5286,6 @@ mod tests {
             .insert("origin".to_owned(), local_child.identity.repository.clone());
         let topic = local.worktrees[1].path.clone();
         let mut app = App::new(vec![local], PathBuf::from("/elsewhere"));
-        app.branch_parents
-            .insert(topic.clone(), PathBuf::from("/repo"));
         app.github.insert(
             topic.clone(),
             GitHubState::Ready(GitHubBranchData {
@@ -5351,7 +5358,7 @@ mod tests {
     }
 
     #[test]
-    fn github_trunk_base_vetoes_incidental_local_commit_ancestry() {
+    fn pull_request_without_an_explicit_pr_parent_remains_a_root() {
         let mut local = repository("/repo", true);
         let pull_request = authored("team", "project", 21, "2026-01-02");
         local.config.github_remotes.insert(
@@ -5360,8 +5367,6 @@ mod tests {
         );
         let topic = local.worktrees[1].path.clone();
         let mut app = App::new(vec![local], PathBuf::from("/elsewhere"));
-        app.branch_parents
-            .insert(topic.clone(), PathBuf::from("/repo"));
         app.github.insert(
             topic.clone(),
             GitHubState::Ready(GitHubBranchData {
@@ -5382,10 +5387,8 @@ mod tests {
 
     #[test]
     fn branch_and_stack_disclosures_survive_refresh_independently() {
-        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let mut app = local_pr_stack_app();
         let owner = BranchId::Worktree(PathBuf::from("/repo"));
-        app.branch_parents
-            .insert(PathBuf::from("/repo-topic"), PathBuf::from("/repo"));
         app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
         app.handle_key(key(KeyCode::Char('h')));
         assert!(!app.visible_rows().iter().any(|row| {
@@ -5640,9 +5643,7 @@ mod tests {
 
     #[test]
     fn focus_mode_uses_owning_branch_for_nested_and_detail_rows() {
-        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
-        app.branch_parents
-            .insert(PathBuf::from("/repo-topic"), PathBuf::from("/repo"));
+        let mut app = local_pr_stack_app();
         let owner = BranchId::Worktree(PathBuf::from("/repo"));
         app.selected = Some(RowId::Section(
             owner.clone(),

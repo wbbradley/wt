@@ -94,7 +94,7 @@ An ambiguous qualified selector opens the TUI prefiltered instead of guessing. T
 
 ## TUI
 
-The initial selection is the worktree containing the current directory. The body is one full-width, selectable tree: repositories own local worktree and virtual pull-request branches, and every branch's metadata and attention details are inline. GitHub commit associations are candidates: an exact PR head-branch match wins, followed by an exact head-SHA match, before the open/newest fallback. A local row suppresses only that selected PR; every other discovered PR remains virtual, so changing or removing a worktree cannot erase the rest of its remote stack. Local commit ancestry wins when it disagrees with GitHub stack ancestry, and each remaining virtual PR is attached once by an unambiguous base/head relationship.
+The initial selection is the worktree containing the current directory. The body is one full-width, selectable tree: repositories own local worktree and virtual pull-request branches, and every branch's metadata and attention details are inline. GitHub commit associations are candidates: an exact PR head-branch match wins, followed by an exact head-SHA match, before the open/newest fallback. A local row suppresses only that selected PR; every other discovered PR remains virtual, so changing or removing a worktree cannot erase the rest of its remote stack. Ordinary worktrees remain siblings, while associated local and virtual PRs are attached once by an unambiguous base/head relationship.
 
 ```text
   └─▾acme/web · ~/src/web
@@ -167,7 +167,7 @@ Discovered PRs are grouped under their canonical base `owner/repository`. `[no l
 
 Backburner membership is host-aware and persisted in `$XDG_STATE_HOME/wt/state.json` (normally `~/.local/state/wt/state.json`; override with `WT_STATE_PATH`). A backburnered branch moves under the final collapsed Backburner group together with its complete represented subtree, including local worktrees and descendants discovered after membership was saved. Explicit navigation and `c`/`p` remain available, while repository prompts and attention traversal skip them.
 
-Local worktrees are nested by nearest commit ancestry. Local ancestry takes precedence over pull-request stack metadata, and each branch is rendered only once. Worktrees are always enumerated from each tracked repository's centralized `git worktree list --porcelain` data, including linked worktrees outside configured roots.
+Ordinary local worktrees are siblings. Worktrees are nested only when explicit pull-request base/head metadata identifies a stack; `Stacked worktrees` means those related PR branches both have local worktrees. Each branch is rendered only once. Worktrees are always enumerated from each tracked repository's centralized `git worktree list --porcelain` data, including linked worktrees outside configured roots.
 
 ## Scriptable worktree operations
 
@@ -236,7 +236,7 @@ Example:
 }
 ```
 
-`label`, `worktree_root`, `github_remote`, `repository_root`, and `github_hosts` are optional. `repository_root` defaults to `~/src` and is where unmapped discovered-PR repositories are bootstrapped. Its leading `~`, `$VAR`, or `${VAR}` is expanded without evaluating shell syntax; relative paths, undefined variables, command substitutions, and existing non-directory roots are rejected. A configured `worktree_root` supplies the suggested destination for `wt worktree create` and is created on first use if it does not exist yet. Local catalog, worktree, ancestry, and status data refresh independently every 60 seconds. The GitHub refresh interval defaults to 300 seconds and is clamped to a minimum of 30 seconds.
+`label`, `worktree_root`, `github_remote`, `repository_root`, and `github_hosts` are optional. `repository_root` defaults to `~/src` and is where unmapped discovered-PR repositories are bootstrapped. Its leading `~`, `$VAR`, or `${VAR}` is expanded without evaluating shell syntax; relative paths, undefined variables, command substitutions, and existing non-directory roots are rejected. A configured `worktree_root` supplies the suggested destination for `wt worktree create` and is created on first use if it does not exist yet. Local catalog, worktree, and status data refresh independently every 60 seconds. The GitHub refresh interval defaults to 300 seconds and is clamped to a minimum of 30 seconds.
 
 Catalog mutations use a sidecar lock next to the JSON file. PR materialization holds that lock continuously from repository bootstrap through registration, fetch, branch preparation, and linked-worktree creation. The TUI remains responsive and shows `waiting for catalog lock` while another process owns it.
 

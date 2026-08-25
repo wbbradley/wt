@@ -42,7 +42,6 @@ struct LocalGitHubBinding {
 struct LocalSnapshot {
     catalog: Catalog,
     repositories: Vec<RepositoryView>,
-    branch_parents: HashMap<PathBuf, PathBuf>,
     github_bindings: HashMap<PathBuf, LocalGitHubBinding>,
 }
 
@@ -183,7 +182,6 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
     let mut app = App::new(repositories, current_directory);
     app.set_committed_filter(initial_filter);
     let mut controller = Controller::new(catalog_path, catalog, app);
-    controller.refresh_branch_parents();
     controller.load_remote_cache();
     let _panic_hook = PanicHookGuard::install();
     let mut terminal = InteractiveTerminal::open()?;
@@ -1216,7 +1214,6 @@ impl Controller {
         self.catalog = snapshot.catalog;
         self.github_refresh_interval = github_refresh_interval(&self.catalog);
         self.app.replace_repositories(snapshot.repositories);
-        self.app.branch_parents = snapshot.branch_parents;
         let current_paths = self
             .app
             .repositories
@@ -1234,10 +1231,6 @@ impl Controller {
             .github
             .retain(|path, _| self.github_bindings.contains_key(path));
         self.refresh_authored_mappings();
-    }
-
-    fn refresh_branch_parents(&mut self) {
-        self.app.branch_parents = infer_branch_parents(&self.app.repositories);
     }
 
     fn request_local_refresh(&mut self, refresh_github: bool) -> Result<(), TuiError> {
@@ -1888,25 +1881,12 @@ fn collect_local_snapshot(
 ) -> Result<LocalSnapshot, config::ConfigError> {
     let catalog = config::load(catalog_path)?;
     let repositories = load_repository_views(&catalog, current_directory);
-    let branch_parents = infer_branch_parents(&repositories);
     let github_bindings = github_bindings(&github_inputs_for_repositories(&repositories));
     Ok(LocalSnapshot {
         catalog,
         repositories,
-        branch_parents,
         github_bindings,
     })
-}
-
-fn infer_branch_parents(repositories: &[RepositoryView]) -> HashMap<PathBuf, PathBuf> {
-    repositories
-        .iter()
-        .filter(|repository| repository.stale_error.is_none())
-        .filter_map(|repository| {
-            git::infer_worktree_parents(&SystemGit, &repository.config, &repository.worktrees).ok()
-        })
-        .flat_map(|parents| parents.into_iter())
-        .collect()
 }
 
 fn github_bindings(inputs: &[RepositoryGitHubInput]) -> HashMap<PathBuf, LocalGitHubBinding> {
@@ -2717,7 +2697,6 @@ mod tests {
         controller.apply_local_snapshot(LocalSnapshot {
             catalog: Catalog::default(),
             repositories: vec![unchanged.clone()],
-            branch_parents: HashMap::new(),
             github_bindings: github_bindings(&github_inputs_for_repositories(&[unchanged])),
         });
         assert!(controller.app.github.contains_key(&worktree_path));
@@ -2729,7 +2708,6 @@ mod tests {
         controller.apply_local_snapshot(LocalSnapshot {
             catalog: Catalog::default(),
             repositories: vec![repository("other")],
-            branch_parents: HashMap::new(),
             github_bindings: github_bindings(&github_inputs_for_repositories(&[repository(
                 "other",
             )])),

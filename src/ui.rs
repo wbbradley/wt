@@ -2030,7 +2030,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_outer_branch_disclosures_and_stacked_worktree_connectors() {
+    fn renders_ordinary_worktrees_as_siblings_without_stack_section() {
         let repository = RepositoryView {
             config: RepositoryConfig {
                 path: PathBuf::from("/repo"),
@@ -2065,8 +2065,6 @@ mod tests {
             ],
         };
         let mut app = App::new(vec![repository], PathBuf::from("/outside"));
-        app.branch_parents
-            .insert(PathBuf::from("/repo-child"), PathBuf::from("/repo"));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
 
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -2074,14 +2072,14 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("└─▾project"));
-        assert!(content.contains("└─▾parent · /repo"));
-        assert!(content.contains("Stacked worktrees"));
-        assert!(content.contains("└─ child · /repo-child"));
+        assert!(content.contains("├─ child · /repo-child"));
+        assert!(content.contains("└─ parent · /repo"));
+        assert!(!content.contains("Stacked worktrees"));
         assert!(!content.contains("Worktree ·"));
         let muted = colored_text(buffer, MUTED);
         assert!(muted.contains(" · /repo"));
         assert!(muted.contains(" · /repo-child"));
-        assert!(muted.contains("Stacked worktrees"));
+        assert!(!muted.contains("Stacked worktrees"));
 
         app.selected = Some(RowId::Worktree(PathBuf::from("/repo-child")));
         let mut clipped = Terminal::new(TestBackend::new(100, 7)).unwrap();

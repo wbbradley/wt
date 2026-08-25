@@ -24,10 +24,9 @@ Before this migration, `src/ui.rs::render` assigned 63% of the body to `render_l
 - `Pane`, `detail_selected`, `detail_scroll`, `detail_viewport_height`, and `detail_expanded` switch
   focus and retain detail-pane state.
 
-The old main tree was already strong at repository/worktree concerns: local commit ancestry took
-precedence, active PRs were represented by their worktree instead of duplicated virtual rows,
-virtual-only PRs used merge-target ancestry, and stable `RowId`s preserved selection through
-refresh.
+The old main tree was already strong at repository/worktree concerns: active PRs were represented
+by their worktree instead of duplicated virtual rows, virtual-only PRs used merge-target ancestry,
+and stable `RowId`s preserved selection through refresh.
 Filtering already searched undisplayed PR details as well as local fields. The PR detail builder
 already had most of the data and summaries needed by an inline tree, including required-check
 counts, folded reviewer state, unresolved feedback, URLs, and stable GitHub IDs.
@@ -84,11 +83,12 @@ The remaining differences are deliberate:
   `repository (branch)`. Known-clean Worktree details disappear entirely, while dirty/loading/error
   status and PR sections remain direct children. Bare and multi-worktree repositories keep explicit
   branch rows.
-- Local commit ancestry wins in `wt`; GitHub base/head ancestry attaches only otherwise-unrepresented
-  virtual PRs. Commit associations are candidates rather than proof that every associated PR is
-  locally represented: an exact head branch wins, then an exact head SHA, and one local row suppresses
-  only its selected PR. Other authored associations remain virtual, preserving mixed stacks when
-  worktrees move. Rollup's Authored tree is PR-only and uses merge-target ancestry.
+- Local worktrees without an explicit PR relationship remain siblings. GitHub base/head ancestry
+  attaches associated local and otherwise-unrepresented virtual PRs. Commit associations are
+  candidates rather than proof that every associated PR is locally represented: an exact head
+  branch wins, then an exact head SHA, and one local row suppresses only its selected PR. Other
+  authored associations remain virtual, preserving mixed stacks when worktrees move. Rollup's
+  Authored tree is PR-only and uses merge-target ancestry.
 - Enter can select a local worktree or materialize a virtual PR after a live head-SHA check. Rollup
   opens the selected GitHub item and has no worktree-materialization lifecycle.
 - `wt` keeps its orange PR numbers and green current-worktree marker. Its branch row begins with the
@@ -172,11 +172,12 @@ hidden values.
   that renders review feedback and is omitted when empty.
 - **Stacked branches** starts expanded and owns local worktree descendants plus virtual-only PR
   descendants. The label says `Stacked PRs` when every descendant is virtual and `Stacked
-  worktrees` when every descendant is local; mixed trees use `Stacked branches`. Local ancestry
-  remains authoritative when local and GitHub topology disagree.
+  worktrees` when every descendant is local; mixed trees use `Stacked branches`. Stack topology
+  comes only from explicit pull-request base/head relationships; unrelated local worktrees remain
+  siblings.
 
 Backburner retains `wt`'s existing semantics: virtual-only subtrees move under the final,
-default-collapsed group; local worktrees stay in their ordinary ancestry position, dimmed and
+default-collapsed group; local worktrees stay in their ordinary tree position, dimmed and
 marked. Prompt and attention traversal continue to skip Backburner unless it is explicitly
 selected.
 
@@ -226,8 +227,8 @@ Building rows and resolving actions must share the same semantic branch topology
 2. select at most one associated PR for it, preferring an exact head branch and then exact head SHA,
    and attach that PR's details when available;
 3. create one node for every remaining virtual-only authored PR;
-4. choose local worktree ancestry first;
-5. attach remaining virtual nodes by unambiguous PR head/base ancestry;
+4. attach associated local and remaining virtual nodes by unambiguous PR head/base ancestry;
+5. leave worktrees without an explicit PR parent at the repository root;
 6. break cycles and ambiguous parentage into repository roots, as today;
 7. apply filtering, Backburner visibility, and disclosure while flattening.
 
@@ -345,7 +346,7 @@ audit.
 ## Principal risks and constraints
 
 - The mixed local/virtual topology is the highest-risk area. It must preserve the invariant that a
-  branch/PR appears once and local ancestry wins without losing virtual descendants.
+  branch/PR appears once and explicit pull-request ancestry retains virtual descendants.
 - A flattened row's visible index is ephemeral. Every persistent selection, fold, action, and
   refresh reconciliation must use stable semantic IDs.
 - Width calculations must use terminal display width rather than byte length; existing helpers that
