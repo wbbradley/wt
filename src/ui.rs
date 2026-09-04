@@ -1135,6 +1135,10 @@ fn pull_request_tree_spans(
     spans
 }
 
+pub fn spinner_frame(frame: usize) -> &'static str {
+    GITHUB_SPINNER_FRAMES[frame % GITHUB_SPINNER_FRAMES.len()]
+}
+
 fn github_freshness_spans(network_active: bool, spinner_frame: usize) -> Vec<Span<'static>> {
     if network_active {
         vec![tree_label(

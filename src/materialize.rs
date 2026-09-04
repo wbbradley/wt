@@ -16,6 +16,9 @@ use crate::model::{
 use crate::operations::{self, CreateMode};
 
 const PULL_REQUEST_MARKER: &str = "wt-pr";
+/// Prefix of the temporary path a pull request worktree is checked out at
+/// before it is moved to its final destination.
+const STAGING_WORKTREE_PREFIX: &str = ".wt-incomplete-worktree-";
 
 #[derive(Clone)]
 pub struct FetchRequest {
@@ -199,6 +202,7 @@ pub fn materialize_pull_request(
     }
 
     let marker = canonical_marker(&authored.identity);
+    let _ = sweep_abandoned_staging_worktrees(runner, repository);
     let worktrees = operations::list(runner, repository)?;
     let mut suffix = 0_u64;
     loop {
@@ -259,7 +263,7 @@ pub fn materialize_pull_request(
         operations::prepare_destination_parent(repository, &destination, false)?;
         let destination_parent = destination.parent().unwrap_or_else(|| Path::new("."));
         let staging_file = tempfile::Builder::new()
-            .prefix(".wt-incomplete-worktree-")
+            .prefix(STAGING_WORKTREE_PREFIX)
             .tempfile_in(destination_parent)
             .map_err(|source| MaterializeError::IncompleteMarker {
                 path: destination_parent.to_owned(),
@@ -301,6 +305,19 @@ pub fn materialize_pull_request(
 }
 
 fn cleanup_owned_incomplete_worktree(repository: &RepositoryConfig, destination: &Path) {
+    // `git worktree add` locks the entry with the reason "initializing" while it
+    // checks files out. Killing the add leaves that lock behind, and both
+    // `worktree remove` and `worktree prune` skip locked entries, so the lock
+    // has to go first or the stale registration outlives every cleanup attempt.
+    let _ = git::run_git(
+        &git::SystemGit,
+        &repository.path,
+        &[
+            OsString::from("worktree"),
+            OsString::from("unlock"),
+            destination.as_os_str().to_owned(),
+        ],
+    );
     let _ = git::run_git(
         &git::SystemGit,
         &repository.path,
@@ -327,6 +344,71 @@ fn cleanup_owned_incomplete_worktree(repository: &RepositoryConfig, destination:
             OsString::from("--expire=now"),
         ],
     );
+}
+
+fn staging_worktree_name(path: &Path) -> Option<&str> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| name.starts_with(STAGING_WORKTREE_PREFIX))
+}
+
+/// Drops staging worktrees left behind by a materialization that died before it
+/// could move its worktree into place.
+///
+/// A staging entry whose directory still exists and is still locked may belong
+/// to a `git worktree add` running right now in another process, so it is left
+/// alone. Every other staging entry is abandoned: either the add was killed
+/// part way through and took the directory with it, or the add finished and the
+/// move never ran.
+/// Returns whether anything was swept.
+pub fn sweep_abandoned_staging_worktrees(
+    runner: &dyn GitRunner,
+    repository: &RepositoryConfig,
+) -> bool {
+    let Ok(worktrees) = operations::list(runner, repository) else {
+        return false;
+    };
+    let mut swept = false;
+    for worktree in worktrees
+        .iter()
+        .filter(|worktree| staging_worktree_name(&worktree.path).is_some())
+    {
+        let path = worktree.path.as_os_str().to_owned();
+        if worktree.path.exists() {
+            if worktree.locked.is_some() {
+                continue;
+            }
+            let _ = git::run_git(
+                runner,
+                &repository.path,
+                &[
+                    OsString::from("worktree"),
+                    OsString::from("remove"),
+                    OsString::from("--force"),
+                    path,
+                ],
+            );
+        } else {
+            let _ = git::run_git(
+                runner,
+                &repository.path,
+                &[OsString::from("worktree"), OsString::from("unlock"), path],
+            );
+        }
+        swept = true;
+    }
+    if swept {
+        let _ = git::run_git(
+            runner,
+            &repository.path,
+            &[
+                OsString::from("worktree"),
+                OsString::from("prune"),
+                OsString::from("--expire=now"),
+            ],
+        );
+    }
+    swept
 }
 
 fn repository_identity(
@@ -762,6 +844,97 @@ mod tests {
                 && value.to_string_lossy()
                     == "Authorization: Basic eC1hY2Nlc3MtdG9rZW46cmVjb2duaXphYmxlLXNlY3JldA=="
         }));
+    }
+
+    /// Reproduces the corruption seen after cancelling a slow materialization:
+    /// `git worktree add` locks the staging entry with the reason
+    /// "initializing" while it checks files out, and killing it leaves that
+    /// lock behind. A locked entry is skipped by both `worktree remove` and
+    /// `worktree prune`, so the dead registration used to survive forever.
+    #[test]
+    fn sweeps_staging_worktrees_left_locked_by_an_interrupted_checkout() {
+        let fixture = Fixture::new();
+        let repository = fixture.local_repository(true);
+        git(
+            &repository.path,
+            &["fetch", "fork", "+refs/heads/*:refs/heads/*"],
+        );
+        let staging = fixture
+            .repository_root
+            .join(".wt-incomplete-worktree-abc123");
+        git(
+            &repository.path,
+            &["worktree", "add", staging.to_str().unwrap(), "safe"],
+        );
+        git(
+            &repository.path,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "initializing",
+                staging.to_str().unwrap(),
+            ],
+        );
+        fs::remove_dir_all(&staging).unwrap();
+        assert!(
+            git_stdout(&repository.path, &["worktree", "list"])
+                .contains(".wt-incomplete-worktree-abc123")
+        );
+        // A locked entry defeats a plain prune, which is how the state persisted.
+        git(&repository.path, &["worktree", "prune", "--expire=now"]);
+        assert!(
+            git_stdout(&repository.path, &["worktree", "list"])
+                .contains(".wt-incomplete-worktree-abc123")
+        );
+
+        assert!(sweep_abandoned_staging_worktrees(&SystemGit, &repository));
+
+        assert!(
+            !git_stdout(&repository.path, &["worktree", "list"])
+                .contains(".wt-incomplete-worktree-")
+        );
+        // Sweeping a clean repository reports nothing and touches nothing.
+        assert!(!sweep_abandoned_staging_worktrees(&SystemGit, &repository));
+    }
+
+    /// A staging worktree whose checkout finished but whose move never ran is
+    /// unlocked, so it is abandoned garbage; one that is still locked may be a
+    /// live `git worktree add` in another process and must survive.
+    #[test]
+    fn sweeps_completed_staging_worktrees_but_spares_in_flight_ones() {
+        let fixture = Fixture::new();
+        let repository = fixture.local_repository(true);
+        git(
+            &repository.path,
+            &["fetch", "fork", "+refs/heads/*:refs/heads/*"],
+        );
+        let abandoned = fixture.repository_root.join(".wt-incomplete-worktree-done");
+        let in_flight = fixture.repository_root.join(".wt-incomplete-worktree-live");
+        for (path, branch) in [(&abandoned, "safe"), (&in_flight, "claimed")] {
+            git(
+                &repository.path,
+                &["worktree", "add", path.to_str().unwrap(), branch],
+            );
+        }
+        git(
+            &repository.path,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "initializing",
+                in_flight.to_str().unwrap(),
+            ],
+        );
+
+        assert!(sweep_abandoned_staging_worktrees(&SystemGit, &repository));
+
+        let listed = git_stdout(&repository.path, &["worktree", "list"]);
+        assert!(!listed.contains(".wt-incomplete-worktree-done"));
+        assert!(listed.contains(".wt-incomplete-worktree-live"));
+        assert!(!abandoned.exists());
+        assert!(in_flight.exists());
     }
 
     #[test]

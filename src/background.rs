@@ -287,10 +287,23 @@ impl CancellableGitRunner {
                     .any(|value| value.to_string_lossy().contains(".wt-pr")))
         {
             self.context.progress("preparing pull request branch");
-        } else if argument(0) == Some(OsStr::new("worktree"))
-            && matches!(argument(1), Some(value) if value == OsStr::new("add") || value == OsStr::new("move"))
-        {
-            self.context.progress("creating linked worktree");
+        } else if argument(0) == Some(OsStr::new("worktree")) {
+            match argument(1) {
+                Some(value) if value == OsStr::new("add") => self
+                    .context
+                    .progress("creating linked worktree: checking out files"),
+                Some(value) if value == OsStr::new("move") => {
+                    self.context.progress("moving worktree into place")
+                }
+                Some(value)
+                    if value == OsStr::new("unlock")
+                        || value == OsStr::new("remove")
+                        || value == OsStr::new("prune") =>
+                {
+                    self.context.progress("clearing interrupted worktrees")
+                }
+                _ => {}
+            }
         }
     }
 }

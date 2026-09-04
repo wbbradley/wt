@@ -28,6 +28,8 @@ use crate::ui;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
+/// A materialization phase only reports its age once it looks slow.
+const MATERIALIZATION_ELAPSED_THRESHOLD: Duration = Duration::from_secs(3);
 const LOCAL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const MIN_GITHUB_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -191,6 +193,9 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
     terminal
         .terminal_mut()
         .draw(|frame| ui::render(frame, &mut controller.app))?;
+    if controller.sweep_abandoned_staging_worktrees() {
+        controller.reload_catalog_and_worktrees()?;
+    }
     controller.start_status_refresh(true);
     controller.request_github_refresh();
     terminal
@@ -209,8 +214,13 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
             return Ok(Some(selection));
         }
         if !event::poll(EVENT_POLL_INTERVAL)? {
-            if controller.app.has_github_network_activity() && Instant::now() >= next_animation {
+            let animating = controller.app.has_github_network_activity()
+                || controller.materialization_job.is_some();
+            if animating && Instant::now() >= next_animation {
                 controller.app.advance_github_spinner();
+                if controller.materialization_job.is_some() {
+                    controller.publish_materialization_progress();
+                }
                 terminal
                     .terminal_mut()
                     .draw(|frame| ui::render(frame, &mut controller.app))?;
@@ -357,6 +367,7 @@ struct Controller {
     pending_action: Option<PendingAction>,
     materialization_job: Option<BackgroundJob<MaterializationOutcome>>,
     materialization_progress: Option<String>,
+    materialization_phase_started: Option<Instant>,
     completed_materialization: Option<PathBuf>,
     completed_creation: Option<PathBuf>,
     url_opener: Arc<dyn UrlOpener>,
@@ -406,6 +417,7 @@ impl Controller {
             pending_action: None,
             materialization_job: None,
             materialization_progress: None,
+            materialization_phase_started: None,
             completed_materialization: None,
             completed_creation: None,
             url_opener: Arc::new(SystemUrlOpener),
@@ -1668,6 +1680,34 @@ impl Controller {
         }
     }
 
+    /// Sweeps every catalogued repository for staging worktrees abandoned by an
+    /// interrupted materialization. Returns whether anything was swept.
+    fn sweep_abandoned_staging_worktrees(&self) -> bool {
+        let mut swept = false;
+        for repository in &self.catalog.repositories {
+            // Every repository is swept; `any` would stop at the first hit.
+            swept |= crate::materialize::sweep_abandoned_staging_worktrees(&SystemGit, repository);
+        }
+        swept
+    }
+
+    /// Renders the current materialization phase with a spinner and the time
+    /// spent in it, so a slow fetch or checkout still looks alive.
+    fn publish_materialization_progress(&mut self) {
+        self.app.progress = self.materialization_progress.as_ref().map(|message| {
+            let spinner = ui::spinner_frame(self.app.github_spinner_frame());
+            match self
+                .materialization_phase_started
+                .map(|started| started.elapsed())
+            {
+                Some(elapsed) if elapsed >= MATERIALIZATION_ELAPSED_THRESHOLD => {
+                    format!("{spinner} {message} ({}s)", elapsed.as_secs())
+                }
+                _ => format!("{spinner} {message}"),
+            }
+        });
+    }
+
     fn pump_materialization(&mut self) -> bool {
         let mut messages = Vec::new();
         if let Some(job) = self.materialization_job.as_ref() {
@@ -1677,7 +1717,7 @@ impl Controller {
         }
         if messages.is_empty() {
             if self.materialization_job.is_some() {
-                self.app.progress = self.materialization_progress.clone();
+                self.publish_materialization_progress();
             }
             return false;
         }
@@ -1685,6 +1725,9 @@ impl Controller {
         for message in messages {
             match message {
                 JobMessage::Progress(progress) => {
+                    if self.materialization_progress.as_deref() != Some(progress.as_str()) {
+                        self.materialization_phase_started = Some(Instant::now());
+                    }
                     self.materialization_progress = Some(progress);
                     changed = true;
                 }
@@ -1693,6 +1736,7 @@ impl Controller {
                         job.join();
                     }
                     self.materialization_progress = None;
+                    self.materialization_phase_started = None;
                     self.app.progress = None;
                     match result {
                         Ok(outcome) => {
@@ -1728,7 +1772,7 @@ impl Controller {
             }
         }
         if self.materialization_job.is_some() {
-            self.app.progress = self.materialization_progress.clone();
+            self.publish_materialization_progress();
         }
         changed
     }
@@ -1860,8 +1904,9 @@ impl Controller {
             })
         })?;
         self.materialization_progress = Some("refreshing selected pull request".to_owned());
-        self.app.progress = self.materialization_progress.clone();
+        self.materialization_phase_started = Some(Instant::now());
         self.materialization_job = Some(job);
+        self.publish_materialization_progress();
         Ok(())
     }
 
@@ -1870,7 +1915,8 @@ impl Controller {
             job.cancel();
             self.materialization_progress =
                 Some("cancelling pull request materialization".to_owned());
-            self.app.progress = self.materialization_progress.clone();
+            self.materialization_phase_started = Some(Instant::now());
+            self.publish_materialization_progress();
         }
     }
 }
@@ -3105,6 +3151,41 @@ mod tests {
         }
         assert_eq!(controller.completed_materialization, Some(path));
         assert!(!controller.github_in_flight);
+    }
+
+    #[test]
+    fn materialization_progress_spins_and_ages_a_slow_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            App::new(Vec::new(), directory.path().to_owned()),
+        );
+        controller.materialization_progress =
+            Some("creating linked worktree: checking out files".to_owned());
+
+        controller.materialization_phase_started = Some(Instant::now());
+        controller.publish_materialization_progress();
+        let fresh = controller.app.progress.clone().unwrap();
+        assert!(
+            fresh.ends_with("creating linked worktree: checking out files"),
+            "{fresh}"
+        );
+        assert!(!fresh.contains('('), "{fresh}");
+
+        controller.materialization_phase_started = Some(Instant::now() - Duration::from_secs(45));
+        controller.publish_materialization_progress();
+        let aged = controller.app.progress.clone().unwrap();
+        assert!(aged.ends_with("checking out files (45s)"), "{aged}");
+
+        // The spinner advances so a stalled-looking phase still reads as alive.
+        controller.app.advance_github_spinner();
+        controller.publish_materialization_progress();
+        assert_ne!(controller.app.progress.as_deref(), Some(aged.as_str()));
+
+        controller.materialization_progress = None;
+        controller.publish_materialization_progress();
+        assert_eq!(controller.app.progress, None);
     }
 
     #[test]
