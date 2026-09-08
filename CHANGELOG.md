@@ -1,11 +1,44 @@
 # Changelog
 
+## [0.3.0] - 2026-09-08
+
+### Breaking Changes
+
+- Derive worktree stacking only from explicit pull-request base/head metadata; ordinary local worktrees are flat siblings and no longer nested by local commit ancestry. Open a pull request with the intended base to restore a stack.
+- Replace the copied prompt's comment/review ID lists and reusable `gh api` investigation commands with complete sanitized comment and review bodies, authors, paths, and URLs. Update agent workflows that parsed the ID lists or the `gh api` block.
+
+### Added
+
+- Add an `f` focus mode that solos a selected repository, virtual repository, Backburner group, branch, or pull request, names the focused target in the list title, and can be pressed again to narrow the current focus.
+- Persist focus across restarts in `state.json` and scope search, folds, and navigation to the focused subtree.
+- Show repository and linked-worktree filesystem paths on repository and local branch rows, abbreviating the home directory to `~`.
+- Stream Git's own progress lines, such as `Receiving objects` and `Updating files`, into the materialization header, with a spinner and the phase age once a phase runs past three seconds.
+
+### Changed
+
+- Split materialization Git phases into distinct labels and keep the animation ticking during a materialization instead of only during GitHub network activity.
+- Pass `--progress` to fetch and clone, and create worktrees as `worktree add --no-checkout` followed by `checkout --progress --force` so the checkout reports progress and holds the `initializing` lock only briefly.
+- Scrub the HTTPS token and its base64 `x-access-token` transport form out of every streamed Git progress line while keeping full stderr for error messages.
+- Press `Esc` to leave focus mode before it clears a search or exits the TUI.
+- Report unreadable persisted UI state as `UI state ignored` rather than `Backburner state ignored`.
+
+### Fixed
+
+- Clear worktrees abandoned by an interrupted materialization: unlock stale `initializing` entries before removing or pruning them, and sweep abandoned staging worktrees at TUI startup and at the start of every materialization.
+- Discard the worktree registration when a creation checkout fails or is cancelled instead of reporting success.
+- Preserve comment line structure and full bodies in copied agent prompts instead of truncating each to a 100-character bullet-joined excerpt.
+- Persist focus mode by stable repository, worktree, or canonical pull-request identity and avoid positional selection fallback during refreshes.
+
+### Removed
+
+- Remove local commit-ancestry worktree parent inference and the `Stacked worktrees` grouping for worktrees without pull-request metadata.
+- Remove the `gh api` comment and review investigation commands from copied prompts.
+
 ## [0.2.3] - 2026-08-18
 
 ### Added
 
 - Add a release-mode regression benchmark and profiling guide for keeping cursor navigation and redraw latency below one 60 Hz frame on large trees.
-- Add an `f` focus mode that solos a selected repository, Backburner group, or owning branch and identifies the focused target in the list title.
 
 ### Changed
 
@@ -13,8 +46,6 @@
 
 ### Fixed
 
-- Persist focus mode by stable repository, worktree, or canonical pull-request identity and avoid positional selection fallback during refreshes.
-- Bind focus to lowercase `f`, allow it to narrow the current focus, and use `Esc` to restore the full tree.
 - Prevent periodic background status refreshes from flashing loading states or redrawing when visible status and progress are unchanged.
 - Preserve selection visibility, scrolling, tree connectors, current-worktree markers, and selected-row actions with optimized viewport rendering.
 
