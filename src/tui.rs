@@ -11,7 +11,9 @@ use crossterm::event::{self, Event, KeyEventKind};
 use thiserror::Error;
 
 use crate::app::{Action, App, FormField, Intent, RepositoryView};
-use crate::background::{BackgroundJob, JobError, JobMessage, StatusPool, StatusTask};
+use crate::background::{
+    BackgroundJob, JobError, JobMessage, ProgressUpdate, StatusPool, StatusTask,
+};
 use crate::bootstrap;
 use crate::cache;
 use crate::config;
@@ -368,6 +370,9 @@ struct Controller {
     materialization_job: Option<BackgroundJob<MaterializationOutcome>>,
     materialization_progress: Option<String>,
     materialization_phase_started: Option<Instant>,
+    /// One line of the running Git command's own progress output, shown inside
+    /// the current phase.
+    materialization_detail: Option<String>,
     completed_materialization: Option<PathBuf>,
     completed_creation: Option<PathBuf>,
     url_opener: Arc<dyn UrlOpener>,
@@ -418,6 +423,7 @@ impl Controller {
             materialization_job: None,
             materialization_progress: None,
             materialization_phase_started: None,
+            materialization_detail: None,
             completed_materialization: None,
             completed_creation: None,
             url_opener: Arc::new(SystemUrlOpener),
@@ -1691,11 +1697,16 @@ impl Controller {
         swept
     }
 
-    /// Renders the current materialization phase with a spinner and the time
-    /// spent in it, so a slow fetch or checkout still looks alive.
+    /// Renders the current materialization phase with a spinner, whatever Git
+    /// last said about its own progress, and the time spent in the phase, so a
+    /// slow fetch or checkout both looks alive and says how far along it is.
     fn publish_materialization_progress(&mut self) {
-        self.app.progress = self.materialization_progress.as_ref().map(|message| {
+        self.app.progress = self.materialization_progress.as_ref().map(|phase| {
             let spinner = ui::spinner_frame(self.app.github_spinner_frame());
+            let message = match self.materialization_detail.as_deref() {
+                Some(detail) => format!("{phase}: {detail}"),
+                None => phase.clone(),
+            };
             match self
                 .materialization_phase_started
                 .map(|started| started.elapsed())
@@ -1706,6 +1717,32 @@ impl Controller {
                 _ => format!("{spinner} {message}"),
             }
         });
+    }
+
+    /// Applies one progress message. A phase replaces the label and restarts
+    /// the clock that proves the job is alive; a detail is Git's own progress
+    /// output inside that phase, so it refines the label and deliberately
+    /// leaves the clock alone. Returns whether anything changed.
+    fn apply_materialization_progress(&mut self, update: ProgressUpdate) -> bool {
+        match update {
+            ProgressUpdate::Phase(phase) => {
+                if self.materialization_progress.as_deref() != Some(phase.as_str()) {
+                    self.materialization_phase_started = Some(Instant::now());
+                    self.materialization_detail = None;
+                }
+                self.materialization_progress = Some(phase);
+                true
+            }
+            ProgressUpdate::Detail(detail) => {
+                if self.materialization_progress.is_none()
+                    || self.materialization_detail.as_deref() == Some(detail.as_str())
+                {
+                    return false;
+                }
+                self.materialization_detail = Some(detail);
+                true
+            }
+        }
     }
 
     fn pump_materialization(&mut self) -> bool {
@@ -1724,12 +1761,8 @@ impl Controller {
         let mut changed = false;
         for message in messages {
             match message {
-                JobMessage::Progress(progress) => {
-                    if self.materialization_progress.as_deref() != Some(progress.as_str()) {
-                        self.materialization_phase_started = Some(Instant::now());
-                    }
-                    self.materialization_progress = Some(progress);
-                    changed = true;
+                JobMessage::Progress(update) => {
+                    changed |= self.apply_materialization_progress(update);
                 }
                 JobMessage::Finished(result) => {
                     if let Some(mut job) = self.materialization_job.take() {
@@ -1737,6 +1770,7 @@ impl Controller {
                     }
                     self.materialization_progress = None;
                     self.materialization_phase_started = None;
+                    self.materialization_detail = None;
                     self.app.progress = None;
                     match result {
                         Ok(outcome) => {
@@ -1864,7 +1898,7 @@ impl Controller {
             let mut catalog = config::load(&catalog_path).map_err(|error| error.to_string())?;
             let repository_root =
                 config::repository_root(&catalog).map_err(|error| error.to_string())?;
-            let runner = context.git_runner();
+            let runner = context.git_runner(Some(&token));
             let result = bootstrap::bootstrap_repository(
                 &runner,
                 &runner,
@@ -1905,6 +1939,7 @@ impl Controller {
         })?;
         self.materialization_progress = Some("refreshing selected pull request".to_owned());
         self.materialization_phase_started = Some(Instant::now());
+        self.materialization_detail = None;
         self.materialization_job = Some(job);
         self.publish_materialization_progress();
         Ok(())
@@ -1916,6 +1951,7 @@ impl Controller {
             self.materialization_progress =
                 Some("cancelling pull request materialization".to_owned());
             self.materialization_phase_started = Some(Instant::now());
+            self.materialization_detail = None;
             self.publish_materialization_progress();
         }
     }
@@ -3161,16 +3197,12 @@ mod tests {
             Catalog::default(),
             App::new(Vec::new(), directory.path().to_owned()),
         );
-        controller.materialization_progress =
-            Some("creating linked worktree: checking out files".to_owned());
+        controller.materialization_progress = Some("checking out files".to_owned());
 
         controller.materialization_phase_started = Some(Instant::now());
         controller.publish_materialization_progress();
         let fresh = controller.app.progress.clone().unwrap();
-        assert!(
-            fresh.ends_with("creating linked worktree: checking out files"),
-            "{fresh}"
-        );
+        assert!(fresh.ends_with("checking out files"), "{fresh}");
         assert!(!fresh.contains('('), "{fresh}");
 
         controller.materialization_phase_started = Some(Instant::now() - Duration::from_secs(45));
@@ -3186,6 +3218,68 @@ mod tests {
         controller.materialization_progress = None;
         controller.publish_materialization_progress();
         assert_eq!(controller.app.progress, None);
+    }
+
+    /// Git's own progress lines refine the current phase: they are shown after
+    /// it, they do not restart the elapsed clock that proves the app is alive,
+    /// and a new phase drops the stale detail.
+    #[test]
+    fn git_progress_details_refine_the_phase_without_restarting_its_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            App::new(Vec::new(), directory.path().to_owned()),
+        );
+        controller.materialization_job = Some(
+            BackgroundJob::spawn("controller-detail-test", |context| {
+                context.progress("fetching pull request head");
+                context.detail("Receiving objects:  43% (43/100)");
+                while !context.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(MaterializationOutcome {
+                    path: PathBuf::new(),
+                })
+            })
+            .unwrap(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.materialization_detail.is_none() {
+            assert!(Instant::now() < deadline, "no detail was published");
+            controller.pump_materialization();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            controller.materialization_progress.as_deref(),
+            Some("fetching pull request head")
+        );
+
+        // The detail arrived after the phase, so the phase clock is untouched.
+        controller.materialization_phase_started = Some(Instant::now() - Duration::from_secs(12));
+        controller.publish_materialization_progress();
+        let rendered = controller.app.progress.clone().unwrap();
+        assert!(
+            rendered
+                .ends_with("fetching pull request head: Receiving objects:  43% (43/100) (12s)"),
+            "{rendered}"
+        );
+
+        // A new phase invalidates the previous phase's detail.
+        controller
+            .apply_materialization_progress(ProgressUpdate::Phase("checking out files".to_owned()));
+        assert_eq!(controller.materialization_detail, None);
+        controller.publish_materialization_progress();
+        let rendered = controller.app.progress.clone().unwrap();
+        assert!(rendered.ends_with("checking out files"), "{rendered}");
+
+        controller.cancel_materialization();
+        while controller.materialization_job.is_some() {
+            assert!(Instant::now() < deadline + Duration::from_secs(2));
+            controller.pump_materialization();
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

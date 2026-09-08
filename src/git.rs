@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use base64::Engine;
 use thiserror::Error;
 
 use crate::model::{
@@ -135,6 +136,23 @@ fn run_checked(
             message
         },
     })
+}
+
+/// Scrubs an HTTPS credential out of Git output before it is shown, logged, or
+/// published as progress. Both the raw token and the base64
+/// `x-access-token:` transport form Git puts in an `Authorization` header can
+/// appear in stderr, so both are replaced.
+pub fn redact_secret(message: &str, secret: Option<&str>) -> String {
+    secret
+        .filter(|secret| !secret.is_empty())
+        .map(|secret| {
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(format!("x-access-token:{secret}"));
+            message
+                .replace(secret, "[REDACTED]")
+                .replace(&encoded, "[REDACTED]")
+        })
+        .unwrap_or_else(|| message.to_owned())
 }
 
 pub fn run_git(

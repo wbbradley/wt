@@ -272,8 +272,9 @@ fn clone_repository(
         last_error = output.stderr;
     }
     if !success {
-        let token = https_token
-            .ok_or_else(|| BootstrapError::MissingHttpsCredential(redact(&last_error, None)))?;
+        let token = https_token.ok_or_else(|| {
+            BootstrapError::MissingHttpsCredential(git::redact_secret(&last_error, None))
+        })?;
         clean_clone_path(&clone_path, staging.path())?;
         let https_url = format!(
             "https://{}/{}/{}.git",
@@ -298,7 +299,7 @@ fn clone_repository(
         }
     }
     if !success {
-        return Err(BootstrapError::Clone(redact(
+        return Err(BootstrapError::Clone(git::redact_secret(
             &last_error,
             https_token.map(ResolvedToken::expose),
         )));
@@ -326,6 +327,9 @@ fn clone_request(
     let mut arguments = vec![
         OsString::from("clone"),
         OsString::from("--bare"),
+        // Git only draws progress on a tty unless it is asked to; the runner
+        // reads stderr through a pipe.
+        OsString::from("--progress"),
         OsString::from("--origin"),
         OsString::from("origin"),
         OsString::from("--single-branch"),
@@ -380,7 +384,7 @@ fn run_clone(
     runner
         .run(request)
         .map(|mut output| {
-            output.stderr = redact(&output.stderr, token.map(ResolvedToken::expose));
+            output.stderr = git::redact_secret(&output.stderr, token.map(ResolvedToken::expose));
             output
         })
         .map_err(BootstrapError::CloneLaunch)
@@ -438,19 +442,6 @@ fn filter_unsupported(stderr: &str) -> bool {
         || message.contains("does not support filter")
         || message.contains("filter-spec")
         || message.contains("unsupported filter")
-}
-
-fn redact(message: &str, secret: Option<&str>) -> String {
-    secret
-        .filter(|secret| !secret.is_empty())
-        .map(|secret| {
-            let encoded = base64::engine::general_purpose::STANDARD
-                .encode(format!("x-access-token:{secret}"));
-            message
-                .replace(secret, "[REDACTED]")
-                .replace(&encoded, "[REDACTED]")
-        })
-        .unwrap_or_else(|| message.to_owned())
 }
 
 fn filesystem_component(value: &str) -> String {
@@ -714,6 +705,8 @@ mod tests {
                 .any(|value| value == "--filter=blob:none")
         );
         for request in requests.iter() {
+            // Git stays silent about progress on a pipe unless it is asked.
+            assert!(request.arguments.iter().any(|value| value == "--progress"));
             assert!(
                 request
                     .arguments

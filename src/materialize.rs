@@ -452,6 +452,9 @@ fn fetch_ref(
         arguments: vec![
             OsString::from("fetch"),
             OsString::from("--no-tags"),
+            // Git only draws progress on a tty unless it is asked to; the
+            // runner reads stderr through a pipe.
+            OsString::from("--progress"),
             OsString::from(remote),
             OsString::from(refspec),
         ],
@@ -463,7 +466,7 @@ fn fetch_ref(
     if output.success {
         Ok(())
     } else {
-        Err(MaterializeError::Fetch(redact(
+        Err(MaterializeError::Fetch(git::redact_secret(
             &output.stderr,
             token.map(ResolvedToken::expose),
         )))
@@ -530,19 +533,6 @@ fn git_transport_environment(token: Option<&ResolvedToken>) -> Vec<(OsString, Os
         ]);
     }
     environment
-}
-
-fn redact(message: &str, secret: Option<&str>) -> String {
-    secret
-        .filter(|secret| !secret.is_empty())
-        .map(|secret| {
-            let encoded = base64::engine::general_purpose::STANDARD
-                .encode(format!("x-access-token:{secret}"));
-            message
-                .replace(secret, "[REDACTED]")
-                .replace(&encoded, "[REDACTED]")
-        })
-        .unwrap_or_else(|| message.to_owned())
 }
 
 fn resolve_commit(
@@ -822,7 +812,7 @@ mod tests {
             request: Mutex::new(None),
             output: FetchOutput {
                 success: false,
-                stderr: "server echoed recognizable-secret and eC1hY2Nlc3MtdG9rZW46cmVjb2duaXphYmxlLXNlY3JldA==".to_owned(),
+                stderr: "remote: preparing\nserver echoed recognizable-secret and eC1hY2Nlc3MtdG9rZW46cmVjb2duaXphYmxlLXNlY3JldA==\nfatal: refusing".to_owned(),
             },
         };
         let token = ResolvedToken::for_test("recognizable-secret");
@@ -836,7 +826,17 @@ mod tests {
         .unwrap_err();
         assert!(!error.to_string().contains("recognizable-secret"));
         assert!(error.to_string().contains("[REDACTED]"));
+        // Streaming stderr must not cost the error message its earlier lines.
+        assert!(error.to_string().contains("remote: preparing"));
+        assert!(error.to_string().contains("fatal: refusing"));
         let request = runner.request.lock().unwrap().clone().unwrap();
+        // Git stays silent about progress on a pipe unless it is asked.
+        assert!(
+            request
+                .arguments
+                .iter()
+                .any(|argument| argument == "--progress")
+        );
         assert!(!format!("{:?}", request.arguments).contains("recognizable-secret"));
         assert!(!format!("{request:?}").contains("recognizable-secret"));
         assert!(request.environment.iter().any(|(key, value)| {
@@ -896,6 +896,45 @@ mod tests {
         );
         // Sweeping a clean repository reports nothing and touches nothing.
         assert!(!sweep_abandoned_staging_worktrees(&SystemGit, &repository));
+    }
+
+    /// Splitting the registration from the checkout adds a new abandoned shape:
+    /// a staging entry that exists, holds no files, and is unlocked because the
+    /// fast `--no-checkout` add already released its lock.
+    #[test]
+    fn sweeps_staging_worktrees_registered_without_a_checkout() {
+        let fixture = Fixture::new();
+        let repository = fixture.local_repository(true);
+        git(
+            &repository.path,
+            &["fetch", "fork", "+refs/heads/*:refs/heads/*"],
+        );
+        let staging = fixture
+            .repository_root
+            .join(".wt-incomplete-worktree-nocheckout");
+        git(
+            &repository.path,
+            &[
+                "worktree",
+                "add",
+                "--no-checkout",
+                staging.to_str().unwrap(),
+                "safe",
+            ],
+        );
+        assert!(staging.exists());
+        assert!(
+            git_stdout(&repository.path, &["worktree", "list"])
+                .contains(".wt-incomplete-worktree-nocheckout")
+        );
+
+        assert!(sweep_abandoned_staging_worktrees(&SystemGit, &repository));
+
+        assert!(
+            !git_stdout(&repository.path, &["worktree", "list"])
+                .contains(".wt-incomplete-worktree-")
+        );
+        assert!(!staging.exists());
     }
 
     /// A staging worktree whose checkout finished but whose move never ran is

@@ -11,6 +11,7 @@ use std::time::Duration;
 use crate::app::StatusUpdate;
 use crate::bootstrap::{CloneOutput, CloneRequest, CloneRunner};
 use crate::git::{self, SystemGit};
+use crate::github::ResolvedToken;
 use crate::materialize::{FetchOutput, FetchRequest, FetchRunner};
 use crate::model::WorktreeStatus;
 
@@ -114,14 +115,22 @@ pub enum JobError {
     Failed(String),
 }
 
+/// A phase names the coarse step a job is in; a detail is one line of the
+/// underlying command's own progress output, reported inside that phase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProgressUpdate {
+    Phase(String),
+    Detail(String),
+}
+
 pub enum JobMessage<T> {
-    Progress(String),
+    Progress(ProgressUpdate),
     Finished(Result<T, JobError>),
 }
 
 pub struct BackgroundJob<T> {
     cancelled: Arc<AtomicBool>,
-    progress_receiver: Receiver<String>,
+    progress_receiver: Receiver<ProgressUpdate>,
     result_receiver: Receiver<Result<T, JobError>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -193,22 +202,37 @@ impl<T> Drop for BackgroundJob<T> {
 #[derive(Clone)]
 pub struct JobContext {
     cancelled: Arc<AtomicBool>,
-    progress_sender: mpsc::Sender<String>,
+    progress_sender: mpsc::Sender<ProgressUpdate>,
 }
 
 impl JobContext {
     pub fn progress(&self, message: impl Into<String>) {
-        let _ = self.progress_sender.send(message.into());
+        let _ = self
+            .progress_sender
+            .send(ProgressUpdate::Phase(message.into()));
+    }
+
+    /// Reports one line of the running command's own progress output. Details
+    /// refine the current phase rather than replacing it.
+    pub fn detail(&self, message: impl Into<String>) {
+        let _ = self
+            .progress_sender
+            .send(ProgressUpdate::Detail(message.into()));
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    pub fn git_runner(&self) -> CancellableGitRunner {
+    /// Builds a runner that scrubs `token` out of every stderr line before it
+    /// is published as progress. Fetch and clone stderr can echo the URL or the
+    /// credential itself, so a runner that streams progress must know the
+    /// secret in order to hide it.
+    pub fn git_runner(&self, token: Option<&ResolvedToken>) -> CancellableGitRunner {
         CancellableGitRunner {
             executable: OsString::from("git"),
             context: self.clone(),
+            secret: token.map(|token| token.expose().to_owned()),
         }
     }
 }
@@ -217,6 +241,7 @@ impl JobContext {
 pub struct CancellableGitRunner {
     executable: OsString,
     context: JobContext,
+    secret: Option<String>,
 }
 
 impl CancellableGitRunner {
@@ -225,7 +250,14 @@ impl CancellableGitRunner {
         Self {
             executable: executable.into(),
             context,
+            secret: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_secret(mut self, secret: impl Into<String>) -> Self {
+        self.secret = Some(secret.into());
+        self
     }
 
     fn execute(
@@ -252,7 +284,17 @@ impl CancellableGitRunner {
         let stdout = child.stdout.take().expect("piped stdout is available");
         let stderr = child.stderr.take().expect("piped stderr is available");
         let stdout_reader = thread::spawn(move || read_pipe(stdout));
-        let stderr_reader = thread::spawn(move || read_pipe(stderr));
+        // Only stderr is streamed. Stdout is parsed by callers (porcelain
+        // listings, rev-parse output) and must stay whole and untouched.
+        let stderr_reader = {
+            let context = self.context.clone();
+            let secret = self.secret.clone();
+            thread::spawn(move || {
+                read_pipe_lines(stderr, |line| {
+                    context.detail(git::redact_secret(line, secret.as_deref()));
+                })
+            })
+        };
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -287,11 +329,13 @@ impl CancellableGitRunner {
                     .any(|value| value.to_string_lossy().contains(".wt-pr")))
         {
             self.context.progress("preparing pull request branch");
+        } else if argument(0) == Some(OsStr::new("checkout")) {
+            self.context.progress("checking out files");
         } else if argument(0) == Some(OsStr::new("worktree")) {
             match argument(1) {
-                Some(value) if value == OsStr::new("add") => self
-                    .context
-                    .progress("creating linked worktree: checking out files"),
+                Some(value) if value == OsStr::new("add") => {
+                    self.context.progress("creating linked worktree")
+                }
                 Some(value) if value == OsStr::new("move") => {
                     self.context.progress("moving worktree into place")
                 }
@@ -332,6 +376,45 @@ struct ProcessOutput {
 fn read_pipe(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Reads `pipe` incrementally, handing each completed line to `sink` as it
+/// arrives while still accumulating the complete byte stream for the caller.
+///
+/// Lines end at either `\n` or `\r`: Git redraws progress in place with
+/// carriage returns, so a reader that only honors `\n` would see one enormous
+/// line and emit nothing until the phase ended.
+fn read_pipe_lines(mut pipe: impl Read, mut sink: impl FnMut(&str)) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut line = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let flush = |line: &mut Vec<u8>, sink: &mut dyn FnMut(&str)| {
+        if line.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(line);
+        let text = text.trim();
+        if !text.is_empty() {
+            sink(text);
+        }
+        line.clear();
+    };
+    loop {
+        let read = pipe.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        for &byte in &chunk[..read] {
+            if byte == b'\n' || byte == b'\r' {
+                flush(&mut line, &mut sink);
+            } else {
+                line.push(byte);
+            }
+        }
+    }
+    flush(&mut line, &mut sink);
     Ok(bytes)
 }
 
@@ -457,7 +540,8 @@ mod tests {
         while Instant::now() < deadline && !saw_waiting {
             saw_waiting = matches!(
                 job.try_recv(),
-                Some(JobMessage::Progress(message)) if message == "waiting for catalog lock"
+                Some(JobMessage::Progress(ProgressUpdate::Phase(message)))
+                    if message == "waiting for catalog lock"
             );
             thread::sleep(Duration::from_millis(10));
         }
@@ -472,6 +556,133 @@ mod tests {
         };
         assert_eq!(result, Err(JobError::Cancelled));
         job.join();
+    }
+
+    #[cfg(unix)]
+    fn executable_script(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, body).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    /// Collects every published detail line, reporting whether the job also
+    /// finished; the result message shares the queue and must not be dropped.
+    fn drain_details(job: &BackgroundJob<()>, details: &mut Vec<String>) -> bool {
+        let mut finished = false;
+        while let Some(message) = job.try_recv() {
+            match message {
+                JobMessage::Progress(ProgressUpdate::Detail(detail)) => details.push(detail),
+                JobMessage::Progress(ProgressUpdate::Phase(_)) => {}
+                JobMessage::Finished(_) => finished = true,
+            }
+        }
+        finished
+    }
+
+    /// Git redraws progress with carriage returns and only flushes stderr as it
+    /// goes, so the runner has to publish lines while the child is still
+    /// running rather than after it exits.
+    #[cfg(unix)]
+    #[test]
+    fn stderr_progress_lines_are_published_before_the_child_exits() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("progress-git");
+        executable_script(
+            &script,
+            "#!/bin/sh\nprintf 'Updating files:  20%%\\rUpdating files:  61%%\\r' >&2\nsleep 30\n",
+        );
+        let work = directory.path().to_owned();
+        let executable = script.into_os_string();
+        let mut job = BackgroundJob::<()>::spawn("stream-progress-test", move |context| {
+            let runner = CancellableGitRunner::with_executable(context, executable);
+            crate::git::GitRunner::run(&runner, &work, &[OsString::from("checkout")])
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut details = Vec::new();
+        while !details
+            .iter()
+            .any(|detail| detail == "Updating files:  61%")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "no progress arrived while the child was running: {details:?}"
+            );
+            drain_details(&job, &mut details);
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Both carriage-return-separated redraws surfaced as their own lines.
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail == "Updating files:  20%")
+        );
+        job.cancel();
+        job.join();
+    }
+
+    /// Streamed stderr can echo the HTTPS credential, so every published line
+    /// goes through redaction while the error path keeps the complete text.
+    #[cfg(unix)]
+    #[test]
+    fn published_progress_lines_are_redacted_but_stderr_stays_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("leaky-git");
+        executable_script(
+            &script,
+            "#!/bin/sh\nprintf 'remote: using recognizable-secret\\n' >&2\nprintf 'header eC1hY2Nlc3MtdG9rZW46cmVjb2duaXphYmxlLXNlY3JldA==\\n' >&2\nprintf 'fatal: no\\n' >&2\nexit 1\n",
+        );
+        let work = directory.path().to_owned();
+        let executable = script.into_os_string();
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        let mut job = BackgroundJob::<()>::spawn("redaction-test", move |context| {
+            let runner = CancellableGitRunner::with_executable(context, executable)
+                .with_secret("recognizable-secret");
+            let output = crate::git::GitRunner::run(&runner, &work, &[OsString::from("fetch")])
+                .map_err(|error| error.to_string())?;
+            *sink.lock().unwrap() = Some(String::from_utf8_lossy(&output.stderr).into_owned());
+            Ok(())
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut details = Vec::new();
+        while !drain_details(&job, &mut details) {
+            assert!(Instant::now() < deadline, "job never finished");
+            thread::sleep(Duration::from_millis(10));
+        }
+        job.join();
+        assert!(!details.is_empty());
+        for detail in &details {
+            assert!(!detail.contains("recognizable-secret"), "{detail}");
+            assert!(
+                !detail.contains("eC1hY2Nlc3MtdG9rZW46cmVjb2duaXphYmxlLXNlY3JldA=="),
+                "{detail}"
+            );
+        }
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail == "remote: using [REDACTED]"),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().any(|detail| detail == "header [REDACTED]"),
+            "{details:?}"
+        );
+        // The accumulated stderr callers build error messages from keeps every
+        // line, not just the last one.
+        let stderr = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            stderr,
+            "remote: using recognizable-secret\nheader eC1hY2Nlc3MtdG9rZW46cmVjb2duaXphYmxlLXNlY3JldA==\nfatal: no\n"
+        );
     }
 
     #[cfg(unix)]

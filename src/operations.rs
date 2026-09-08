@@ -151,51 +151,84 @@ pub fn create(
 ) -> Result<(), OperationError> {
     validate_create(runner, repository, destination, mode, create_parents)?;
     prepare_destination_parent(repository, destination, create_parents)?;
+    // The registration and the checkout are separate commands on purpose.
+    // `git worktree add` has no `--progress` flag, so its checkout is silent on
+    // a pipe; `git checkout --progress` reports "Updating files: N%". Splitting
+    // them also shortens the "initializing" lock `worktree add` holds for the
+    // whole checkout, which is what used to strand a worktree when a slow
+    // checkout was killed.
+    let mut add = vec![
+        OsString::from("worktree"),
+        OsString::from("add"),
+        OsString::from("--no-checkout"),
+    ];
+    let mut checkout = vec![
+        OsString::from("checkout"),
+        OsString::from("--progress"),
+        OsString::from("--force"),
+    ];
     match mode {
         CreateMode::ExistingBranch(branch) => {
-            git::run_git(
-                runner,
-                &repository.path,
-                &[
-                    OsString::from("worktree"),
-                    OsString::from("add"),
-                    destination.as_os_str().to_owned(),
-                    OsString::from(branch),
-                ],
-            )?;
+            add.push(destination.as_os_str().to_owned());
+            add.push(OsString::from(branch));
+            checkout.push(OsString::from(branch));
         }
         CreateMode::NewBranch {
             branch,
             start_point,
         } => {
-            git::run_git(
-                runner,
-                &repository.path,
-                &[
-                    OsString::from("worktree"),
-                    OsString::from("add"),
-                    OsString::from("-b"),
-                    OsString::from(branch),
-                    destination.as_os_str().to_owned(),
-                    OsString::from(start_point),
-                ],
-            )?;
+            add.push(OsString::from("-b"));
+            add.push(OsString::from(branch));
+            add.push(destination.as_os_str().to_owned());
+            add.push(OsString::from(start_point));
+            checkout.push(OsString::from(branch));
         }
         CreateMode::Detached(commit) => {
-            git::run_git(
-                runner,
-                &repository.path,
-                &[
-                    OsString::from("worktree"),
-                    OsString::from("add"),
-                    OsString::from("--detach"),
-                    destination.as_os_str().to_owned(),
-                    OsString::from(commit),
-                ],
-            )?;
+            add.push(OsString::from("--detach"));
+            add.push(destination.as_os_str().to_owned());
+            add.push(OsString::from(commit));
+            checkout.push(OsString::from("--detach"));
+            checkout.push(OsString::from(commit));
         }
     }
+    git::run_git(runner, &repository.path, &add)?;
+    if let Err(error) = git::run_git(runner, destination, &checkout) {
+        // Step one registered an empty worktree; leaving it behind would look
+        // like a finished worktree with no files in it.
+        discard_registered_worktree(runner, repository, destination);
+        return Err(error.into());
+    }
     Ok(())
+}
+
+/// Best-effort removal of a worktree registration whose checkout never
+/// completed. Failures are ignored: the caller is already returning the real
+/// error, and `materialize::sweep_abandoned_staging_worktrees` collects
+/// anything this could not reach.
+fn discard_registered_worktree(
+    runner: &dyn GitRunner,
+    repository: &RepositoryConfig,
+    destination: &Path,
+) {
+    let _ = git::run_git(
+        runner,
+        &repository.path,
+        &[
+            OsString::from("worktree"),
+            OsString::from("remove"),
+            OsString::from("--force"),
+            destination.as_os_str().to_owned(),
+        ],
+    );
+    let _ = git::run_git(
+        runner,
+        &repository.path,
+        &[
+            OsString::from("worktree"),
+            OsString::from("prune"),
+            OsString::from("--expire=now"),
+        ],
+    );
 }
 
 pub fn create_tracking(
@@ -881,6 +914,193 @@ mod tests {
             validate_destination_parent(&unconfigured, Path::new("/trees/topic"), true).is_ok(),
             "--create-parents still covers unmanaged destinations"
         );
+    }
+
+    /// A runner that records every command and can be told to fail one of them.
+    struct RecordingRunner {
+        inner: git::SystemGit,
+        commands: std::sync::Mutex<Vec<Vec<String>>>,
+        fail_when_first_argument_is: Option<&'static str>,
+    }
+
+    impl RecordingRunner {
+        fn new(fail_when_first_argument_is: Option<&'static str>) -> Self {
+            Self {
+                inner: git::SystemGit,
+                commands: std::sync::Mutex::new(Vec::new()),
+                fail_when_first_argument_is,
+            }
+        }
+
+        fn commands(&self) -> Vec<Vec<String>> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    impl GitRunner for RecordingRunner {
+        fn run(
+            &self,
+            directory: &Path,
+            arguments: &[OsString],
+        ) -> Result<git::CommandOutput, git::GitError> {
+            let recorded: Vec<String> = arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect();
+            self.commands.lock().unwrap().push(recorded.clone());
+            if self
+                .fail_when_first_argument_is
+                .is_some_and(|first| recorded.first().map(String::as_str) == Some(first))
+            {
+                return Ok(git::CommandOutput {
+                    stdout: Vec::new(),
+                    stderr: b"fatal: simulated checkout failure\n".to_vec(),
+                    success: false,
+                });
+            }
+            self.inner.run(directory, arguments)
+        }
+    }
+
+    fn seeded_repository(root: &Path) -> RepositoryConfig {
+        let path = root.join("project");
+        let git = |directory: &Path, arguments: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(directory)
+                .args(arguments)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {arguments:?} failed");
+        };
+        git(root, &["init", path.to_str().unwrap()]);
+        git(&path, &["config", "user.email", "test@example.com"]);
+        git(&path, &["config", "user.name", "Test User"]);
+        fs::write(path.join("file.txt"), "contents\n").unwrap();
+        git(&path, &["add", "file.txt"]);
+        git(&path, &["commit", "-m", "initial"]);
+        git(&path, &["branch", "topic"]);
+        RepositoryConfig {
+            path,
+            label: None,
+            worktree_root: Some(root.join("trees")),
+            github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
+        }
+    }
+
+    /// `git worktree add` has no `--progress` flag, so the checkout it would do
+    /// silently is run as a separate reporting `git checkout` instead. Every
+    /// mode must still land a populated worktree at the right revision.
+    #[test]
+    fn create_registers_without_checkout_then_checks_out_with_progress() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = seeded_repository(temporary.path());
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository.path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let cases = [
+            (
+                "existing",
+                CreateMode::ExistingBranch("topic".to_owned()),
+                vec!["--no-checkout"],
+            ),
+            (
+                "fresh",
+                CreateMode::NewBranch {
+                    branch: "fresh".to_owned(),
+                    start_point: "topic".to_owned(),
+                },
+                vec!["--no-checkout", "-b"],
+            ),
+            (
+                "detached",
+                CreateMode::Detached(head.clone()),
+                vec!["--no-checkout", "--detach"],
+            ),
+        ];
+        for (name, mode, expected_add_flags) in cases {
+            let runner = RecordingRunner::new(None);
+            let destination = repository.worktree_root.clone().unwrap().join(name);
+            create(&runner, &repository, &destination, &mode, false).unwrap();
+
+            assert_eq!(
+                fs::read_to_string(destination.join("file.txt")).unwrap(),
+                "contents\n",
+                "{name} was not populated"
+            );
+            let commands = runner.commands();
+            let add = commands
+                .iter()
+                .find(|command| {
+                    command.first().map(String::as_str) == Some("worktree")
+                        && command.get(1).map(String::as_str) == Some("add")
+                })
+                .unwrap_or_else(|| panic!("{name} never registered a worktree"));
+            for flag in expected_add_flags {
+                assert!(
+                    add.iter().any(|argument| argument == flag),
+                    "{name}: {add:?}"
+                );
+            }
+            let checkout = commands
+                .iter()
+                .find(|command| command.first().map(String::as_str) == Some("checkout"))
+                .unwrap_or_else(|| panic!("{name} never ran a reporting checkout"));
+            assert!(
+                checkout.iter().any(|argument| argument == "--progress"),
+                "{name}: {checkout:?}"
+            );
+            assert!(
+                checkout.iter().any(|argument| argument == "--force"),
+                "{name}: {checkout:?}"
+            );
+        }
+    }
+
+    /// Only the registration landing is not success: a worktree with no files
+    /// in it must not survive as if it were finished.
+    #[test]
+    fn create_reports_a_failed_checkout_and_leaves_nothing_registered() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = seeded_repository(temporary.path());
+        let runner = RecordingRunner::new(Some("checkout"));
+        let destination = repository.worktree_root.clone().unwrap().join("doomed");
+
+        let error = create(
+            &runner,
+            &repository,
+            &destination,
+            &CreateMode::ExistingBranch("topic".to_owned()),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("simulated checkout failure"),
+            "{error}"
+        );
+        let listed = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository.path)
+                .args(["worktree", "list"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(!listed.contains("doomed"), "{listed}");
     }
 
     #[test]
