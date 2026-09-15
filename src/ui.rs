@@ -370,6 +370,10 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, rows: &[VisibleRow], area: 
                         Style::default().fg(DANGER),
                     ));
                 }
+                apply_deleting_style(
+                    &mut spans,
+                    singleton.is_some_and(|worktree| app.is_deleting(&worktree.path)),
+                );
                 single_line_tree_item(
                     highlight_search_matches(spans, search_query.as_ref()),
                     line_width,
@@ -457,6 +461,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, rows: &[VisibleRow], area: 
                         span.style = span.style.add_modifier(Modifier::DIM);
                     }
                 }
+                apply_deleting_style(&mut spans, app.is_deleting(&worktree.path));
                 single_line_tree_item(
                     highlight_search_matches(spans, search_query.as_ref()),
                     line_width,
@@ -1193,6 +1198,19 @@ fn local_state_spans(
         spans.push(tree_label("prunable", Color::Yellow));
     }
     spans
+}
+
+/// Marks a row whose worktree is being removed in the background. The label is
+/// carried alongside the styling because italics are silently dropped by some
+/// terminals, and a row that only lost its emphasis reads as an ordinary row.
+fn apply_deleting_style(spans: &mut Vec<Span<'static>>, deleting: bool) {
+    if !deleting {
+        return;
+    }
+    spans.push(tree_label("deleting", MUTED));
+    for span in spans.iter_mut().skip(2) {
+        span.style = span.style.add_modifier(Modifier::DIM | Modifier::ITALIC);
+    }
 }
 
 fn tree_label(text: &str, color: Color) -> Span<'static> {
@@ -2362,6 +2380,82 @@ mod tests {
                 .iter()
                 .all(|cell| cell.fg == MUTED && !cell.modifier.contains(Modifier::DIM))
         );
+    }
+
+    #[test]
+    fn a_worktree_being_removed_renders_dimmed_italic_until_the_job_ends() {
+        let repository = RepositoryView {
+            config: RepositoryConfig {
+                path: PathBuf::from("/repo"),
+                label: Some("project".to_owned()),
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            },
+            session_only: false,
+            stale_error: None,
+            expanded: true,
+            worktrees: vec![
+                Worktree {
+                    path: PathBuf::from("/repo"),
+                    head: Some("1234567890".to_owned()),
+                    branch: Some("refs/heads/main".to_owned()),
+                    detached: false,
+                    bare: false,
+                    locked: None,
+                    prunable: None,
+                },
+                Worktree {
+                    path: PathBuf::from("/repo-topic"),
+                    head: Some("abcdef123456".to_owned()),
+                    branch: Some("refs/heads/topic".to_owned()),
+                    detached: false,
+                    bare: false,
+                    locked: None,
+                    prunable: None,
+                },
+            ],
+        };
+        let mut app = App::new(vec![repository], PathBuf::from("/elsewhere"));
+        app.deleting.insert(PathBuf::from("/repo-topic"));
+        let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let row = (0..buffer.area.height)
+            .find(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains("topic")
+            })
+            .expect("the worktree row is rendered");
+        let line = (0..buffer.area.width)
+            .map(|x| buffer[(x, row)].symbol())
+            .collect::<String>();
+        assert!(line.contains("deleting"), "{line}");
+        let branch = (0..buffer.area.width)
+            .map(|x| &buffer[(x, row)])
+            .find(|cell| cell.fg == BRANCH)
+            .expect("the branch label is rendered");
+        assert!(branch.modifier.contains(Modifier::DIM));
+        assert!(branch.modifier.contains(Modifier::ITALIC));
+
+        app.deleting.clear();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let cleared = terminal.backend().buffer().clone();
+        let line = (0..cleared.area.width)
+            .map(|x| cleared[(x, row)].symbol())
+            .collect::<String>();
+        assert!(!line.contains("deleting"), "{line}");
+        let branch = (0..cleared.area.width)
+            .map(|x| &cleared[(x, row)])
+            .find(|cell| cell.fg == BRANCH)
+            .expect("the branch label is rendered");
+        assert!(!branch.modifier.contains(Modifier::DIM));
+        assert!(!branch.modifier.contains(Modifier::ITALIC));
     }
 
     #[test]

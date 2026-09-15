@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Remove worktrees (`d`) on a background thread instead of inline, so the interface keeps rendering and responding while Git works. The worktree renders dimmed and italicized with a `deleting` marker until the removal finishes, several removals can run at once, and the header reports the removal with a spinner and its age.
+
+### Fixed
+
+- Stop the TUI from hanging after a removal is confirmed.
+- Refuse worktree actions and navigation on a worktree that is being removed, and skip its status refresh, rather than acting on a half-deleted checkout. A failed removal restores the row's normal rendering and reports the reason.
+
 ## [0.3.0] - 2026-09-08
 
 ### Breaking Changes

@@ -467,6 +467,9 @@ pub struct App {
     pub inline_error: Option<String>,
     pub progress: Option<String>,
     pub statuses: HashMap<PathBuf, StatusState>,
+    /// Worktrees whose removal is running in the background. Keyed by path
+    /// because a refresh reshuffles row indices underneath an in-flight job.
+    pub deleting: HashSet<PathBuf>,
     pub github: HashMap<PathBuf, GitHubState>,
     pub github_generation: u64,
     pub github_loading: bool,
@@ -509,6 +512,7 @@ impl App {
             inline_error: None,
             progress: None,
             statuses: HashMap::new(),
+            deleting: HashSet::new(),
             github: HashMap::new(),
             github_generation: 0,
             github_loading: false,
@@ -534,6 +538,12 @@ impl App {
         app.refresh_current_worktree();
         app.select_initial();
         app
+    }
+
+    /// Whether `path` is being removed by a background job. Rows for such a
+    /// worktree render dimmed and refuse worktree actions until the job ends.
+    pub fn is_deleting(&self, path: &Path) -> bool {
+        self.deleting.contains(path)
     }
 
     pub fn minutes_since_last_refresh(&self) -> Option<u64> {
@@ -2775,6 +2785,9 @@ impl App {
                 if worktree.bare {
                     return disabled("the bare anchor is not a checkout");
                 }
+                if self.is_deleting(&worktree.path) {
+                    return disabled("worktree is being removed");
+                }
                 if worktree_index == 0
                     && matches!(
                         action,
@@ -3858,20 +3871,32 @@ impl App {
         }
     }
 
+    /// Resolves Enter on a worktree row. A worktree whose removal is still
+    /// running is refused rather than navigated into, because its directory is
+    /// being deleted out from under the shell that would land there.
+    fn accept_worktree(&mut self, path: PathBuf, navigable: bool) -> Intent {
+        if self.is_deleting(&path) {
+            self.inline_error = Some("worktree is being removed".to_owned());
+            return Intent::None;
+        }
+        if navigable && path.exists() {
+            Intent::Accept(path)
+        } else {
+            self.inline_error = Some("this row is not a navigable checkout".to_owned());
+            Intent::None
+        }
+    }
+
     fn accept_or_toggle(&mut self) -> Intent {
         match self.selected_row() {
             Some(VisibleRow::Repository {
                 repository_index, ..
             }) => {
-                if let Some((_, worktree)) =
-                    self.repositories[repository_index].singleton_worktree()
+                if let Some((path, navigable)) = self.repositories[repository_index]
+                    .singleton_worktree()
+                    .map(|(_, worktree)| (worktree.path.clone(), worktree.navigable()))
                 {
-                    return if worktree.navigable() && worktree.path.exists() {
-                        Intent::Accept(worktree.path.clone())
-                    } else {
-                        self.inline_error = Some("this row is not a navigable checkout".to_owned());
-                        Intent::None
-                    };
+                    return self.accept_worktree(path, navigable);
                 }
                 let path = self.repositories[repository_index].config.path.clone();
                 let expanded = self.displayed_disclosure_expanded(
@@ -3887,12 +3912,8 @@ impl App {
                 ..
             }) => {
                 let worktree = &self.repositories[repository_index].worktrees[worktree_index];
-                if worktree.navigable() && worktree.path.exists() {
-                    Intent::Accept(worktree.path.clone())
-                } else {
-                    self.inline_error = Some("this row is not a navigable checkout".to_owned());
-                    Intent::None
-                }
+                let (path, navigable) = (worktree.path.clone(), worktree.navigable());
+                self.accept_worktree(path, navigable)
             }
             Some(VisibleRow::VirtualRepository {
                 virtual_repository_index,
@@ -8026,6 +8047,32 @@ mod tests {
             }),
         );
         assert!(!app.action_availability(Action::Remove).enabled);
+    }
+
+    #[test]
+    fn a_worktree_being_removed_refuses_worktree_actions_and_navigation() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let topic = PathBuf::from("/repo-topic");
+        app.statuses
+            .insert(topic.clone(), StatusState::Ready(WorktreeStatus::default()));
+        app.selected = Some(RowId::Worktree(topic.clone()));
+        assert!(app.action_availability(Action::Remove).enabled);
+
+        app.deleting.insert(topic.clone());
+
+        for action in [Action::Remove, Action::Move, Action::Lock, Action::Unlock] {
+            let availability = app.action_availability(action);
+            assert!(!availability.enabled, "{action:?} stayed enabled");
+            assert_eq!(
+                availability.reason.as_deref(),
+                Some("worktree is being removed")
+            );
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Intent::None);
+        assert_eq!(
+            app.inline_error.as_deref(),
+            Some("worktree is being removed")
+        );
     }
 
     #[test]

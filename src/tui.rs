@@ -217,11 +217,14 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
         }
         if !event::poll(EVENT_POLL_INTERVAL)? {
             let animating = controller.app.has_github_network_activity()
-                || controller.materialization_job.is_some();
+                || controller.materialization_job.is_some()
+                || !controller.deletions.is_empty();
             if animating && Instant::now() >= next_animation {
                 controller.app.advance_github_spinner();
                 if controller.materialization_job.is_some() {
                     controller.publish_materialization_progress();
+                } else {
+                    controller.publish_deletion_progress();
                 }
                 terminal
                     .terminal_mut()
@@ -345,6 +348,19 @@ struct MaterializationOutcome {
     path: PathBuf,
 }
 
+/// One worktree removal running off the UI thread. Removing a large checkout
+/// takes long enough that doing it inline freezes the interface, so the row
+/// stays on screen, dimmed, while this job runs.
+struct Deletion {
+    worktree: PathBuf,
+    label: String,
+    job: BackgroundJob<()>,
+    started: Instant,
+    /// One line of the running Git command's own progress output, if it said
+    /// anything; `git worktree remove` is usually silent.
+    detail: Option<String>,
+}
+
 struct Controller {
     catalog_path: PathBuf,
     remote_cache_path: PathBuf,
@@ -368,6 +384,7 @@ struct Controller {
     discover_authored_pull_requests: bool,
     pending_action: Option<PendingAction>,
     materialization_job: Option<BackgroundJob<MaterializationOutcome>>,
+    deletions: Vec<Deletion>,
     materialization_progress: Option<String>,
     materialization_phase_started: Option<Instant>,
     /// One line of the running Git command's own progress output, shown inside
@@ -421,6 +438,7 @@ impl Controller {
             discover_authored_pull_requests: true,
             pending_action: None,
             materialization_job: None,
+            deletions: Vec::new(),
             materialization_progress: None,
             materialization_phase_started: None,
             materialization_detail: None,
@@ -1082,13 +1100,7 @@ impl Controller {
                 repository,
                 worktree,
             } => {
-                let repository = self.repository(&repository)?.clone();
-                operations::remove(
-                    &SystemGit,
-                    &repository,
-                    &worktree.to_string_lossy(),
-                    &self.app.current_directory,
-                )?;
+                self.start_worktree_deletion(&repository, worktree)?;
             }
             PendingAction::Repair { repository, path } => {
                 let repository = self.repository(&repository)?.clone();
@@ -1282,6 +1294,9 @@ impl Controller {
             .flat_map(|repository| repository.worktrees.iter())
             .filter(|worktree| worktree.navigable() && worktree.path.exists())
             .map(|worktree| worktree.path.clone())
+            // A worktree being removed is half deleted by definition; asking Git
+            // for its status only produces an error flash before the row goes.
+            .filter(|path| !self.app.is_deleting(path))
             .collect();
         let generation = self.app.begin_status_refresh(&paths, show_progress);
         self.status_backlog = paths
@@ -1634,6 +1649,7 @@ impl Controller {
             changed = true;
         }
         changed |= self.pump_materialization();
+        changed |= self.pump_deletions();
         if !self.github_in_flight && Instant::now() >= self.next_github_refresh {
             self.request_github_refresh();
             changed |= self.app.github_loading;
@@ -1695,6 +1711,133 @@ impl Controller {
             swept |= crate::materialize::sweep_abandoned_staging_worktrees(&SystemGit, repository);
         }
         swept
+    }
+
+    /// Starts removing `worktree` on a background thread. Removal used to run
+    /// inline, which stopped the render loop until Git finished; the row now
+    /// stays on screen, dimmed, and the interface keeps responding.
+    fn start_worktree_deletion(
+        &mut self,
+        repository: &Path,
+        worktree: PathBuf,
+    ) -> Result<(), TuiError> {
+        let config = self.repository(repository)?.clone();
+        let current_directory = self.app.current_directory.clone();
+        let label = worktree_label(&worktree);
+        let target = worktree.clone();
+        let job = BackgroundJob::spawn("wt-worktree-remove", move |context| {
+            let runner = context.git_runner(None);
+            // `remove` re-runs the removal preview inside the job, so the dirty,
+            // locked, main-worktree and current-directory checks still guard the
+            // deletion at the moment it actually happens.
+            operations::remove(
+                &runner,
+                &config,
+                &target.to_string_lossy(),
+                &current_directory,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        })?;
+        self.app.deleting.insert(worktree.clone());
+        self.deletions.push(Deletion {
+            worktree,
+            label,
+            job,
+            started: Instant::now(),
+            detail: None,
+        });
+        self.publish_deletion_progress();
+        Ok(())
+    }
+
+    /// Reports the removals still running. Materialization owns the progress
+    /// line outright while it runs, so this defers to it rather than fighting
+    /// over the same field.
+    fn publish_deletion_progress(&mut self) {
+        if self.materialization_job.is_some() {
+            return;
+        }
+        let Some(first) = self.deletions.first() else {
+            return;
+        };
+        let spinner = ui::spinner_frame(self.app.github_spinner_frame());
+        let message = if self.deletions.len() > 1 {
+            format!("removing {} worktrees", self.deletions.len())
+        } else {
+            match first.detail.as_deref() {
+                Some(detail) => format!("removing {}: {detail}", first.label),
+                None => format!("removing {}", first.label),
+            }
+        };
+        let elapsed = first.started.elapsed();
+        self.app.progress = Some(if elapsed >= MATERIALIZATION_ELAPSED_THRESHOLD {
+            format!("{spinner} {message} ({}s)", elapsed.as_secs())
+        } else {
+            format!("{spinner} {message}")
+        });
+    }
+
+    /// Drains every in-flight removal. Finished jobs release their row and
+    /// trigger a refresh so a removed worktree disappears and a failed one
+    /// returns to its normal, undimmed rendering. Returns whether anything
+    /// changed.
+    fn pump_deletions(&mut self) -> bool {
+        let mut changed = false;
+        let mut finished = Vec::new();
+        for (index, deletion) in self.deletions.iter_mut().enumerate() {
+            while let Some(message) = deletion.job.try_recv() {
+                match message {
+                    // The phase Git's runner reports for `worktree remove` is
+                    // worded for the interrupted-materialization sweep, so only
+                    // the command's own output is worth showing here.
+                    JobMessage::Progress(ProgressUpdate::Phase(_)) => {}
+                    JobMessage::Progress(ProgressUpdate::Detail(detail)) => {
+                        if deletion.detail.as_deref() != Some(detail.as_str()) {
+                            deletion.detail = Some(detail);
+                            changed = true;
+                        }
+                    }
+                    JobMessage::Finished(result) => {
+                        finished.push((index, result));
+                        break;
+                    }
+                }
+            }
+        }
+        for (index, result) in finished.into_iter().rev() {
+            let mut deletion = self.deletions.remove(index);
+            deletion.job.join();
+            self.app.deleting.remove(&deletion.worktree);
+            let label = deletion.label;
+            let failure = match result {
+                Ok(_) => None,
+                Err(JobError::Cancelled) => Some(format!(
+                    "removal of {label} was cancelled; run prune if a stale record remains"
+                )),
+                Err(JobError::Failed(error)) => Some(format!("unable to remove {label}: {error}")),
+            };
+            // The refresh runs either way: it drops a removed worktree from the
+            // listing, and restores a failed one to its normal rendering.
+            let refresh = self.refresh_local();
+            self.app.inline_error = match (failure, refresh) {
+                (Some(failure), Ok(())) => Some(failure),
+                (Some(failure), Err(error)) => {
+                    Some(format!("{failure}; refresh also failed: {error}"))
+                }
+                (None, Ok(())) => self.app.inline_error.take(),
+                (None, Err(error)) => Some(format!("removed {label}; refresh failed: {error}")),
+            };
+            changed = true;
+        }
+        if self.deletions.is_empty() {
+            if changed {
+                self.app.progress = None;
+            }
+        } else {
+            self.publish_deletion_progress();
+        }
+        changed
     }
 
     /// Renders the current materialization phase with a spinner, whatever Git
@@ -2006,6 +2149,14 @@ fn github_inputs_for_repositories(repositories: &[RepositoryView]) -> Vec<Reposi
             worktrees: repository.worktrees.clone(),
         })
         .collect()
+}
+
+/// Names a worktree for a status message: its directory name, falling back to
+/// the whole path when there is no final component.
+fn worktree_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn github_refresh_interval(catalog: &Catalog) -> Duration {
@@ -3114,6 +3265,144 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(all_virtual_rows, vec![(33580, 1), (33902, 3)]);
+    }
+
+    fn deletion_controller(directory: &std::path::Path) -> Controller {
+        let mut controller = Controller::new(
+            directory.join("wt.json"),
+            Catalog::default(),
+            App::new(Vec::new(), directory.to_owned()),
+        );
+        controller.discover_authored_pull_requests = false;
+        controller
+    }
+
+    fn install_deletion(
+        controller: &mut Controller,
+        worktree: PathBuf,
+        result: Result<(), String>,
+    ) {
+        let label = worktree_label(&worktree);
+        let job = BackgroundJob::spawn("deletion-test", move |_context| result).unwrap();
+        controller.app.deleting.insert(worktree.clone());
+        controller.deletions.push(Deletion {
+            worktree,
+            label,
+            job,
+            started: Instant::now(),
+            detail: None,
+        });
+    }
+
+    fn drain_deletions(controller: &mut Controller) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !controller.deletions.is_empty() {
+            assert!(Instant::now() < deadline, "deletions never finished");
+            controller.pump_deletions();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_successful_background_removal_releases_the_row_without_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = deletion_controller(directory.path());
+        let worktree = directory.path().join("topic");
+        install_deletion(&mut controller, worktree.clone(), Ok(()));
+        assert!(controller.app.is_deleting(&worktree));
+
+        drain_deletions(&mut controller);
+
+        assert!(!controller.app.is_deleting(&worktree));
+        assert_eq!(controller.app.inline_error, None);
+        assert_eq!(controller.app.progress, None);
+    }
+
+    #[test]
+    fn a_failed_background_removal_reports_the_reason_and_undims_the_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = deletion_controller(directory.path());
+        let worktree = directory.path().join("topic");
+        install_deletion(
+            &mut controller,
+            worktree.clone(),
+            Err("worktree is dirty".to_owned()),
+        );
+
+        drain_deletions(&mut controller);
+
+        assert!(!controller.app.is_deleting(&worktree));
+        let message = controller.app.inline_error.as_deref().unwrap();
+        assert!(message.contains("unable to remove topic"), "{message}");
+        assert!(message.contains("worktree is dirty"), "{message}");
+    }
+
+    #[test]
+    fn two_removals_run_and_finish_independently() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = deletion_controller(directory.path());
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        install_deletion(&mut controller, first.clone(), Ok(()));
+        install_deletion(
+            &mut controller,
+            second.clone(),
+            Err("still locked".to_owned()),
+        );
+        assert_eq!(controller.deletions.len(), 2);
+
+        drain_deletions(&mut controller);
+
+        assert!(!controller.app.is_deleting(&first));
+        assert!(!controller.app.is_deleting(&second));
+        assert!(
+            controller
+                .app
+                .inline_error
+                .as_deref()
+                .is_some_and(|message| message.contains("still locked"))
+        );
+    }
+
+    #[test]
+    fn removal_progress_spins_and_ages_while_the_job_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = deletion_controller(directory.path());
+        install_deletion(&mut controller, directory.path().join("topic"), Ok(()));
+        controller.publish_deletion_progress();
+        let fresh = controller.app.progress.clone().unwrap();
+        assert!(fresh.contains("removing topic"), "{fresh}");
+        assert!(!fresh.contains("(0s)"), "{fresh}");
+
+        controller.deletions[0].started =
+            Instant::now() - MATERIALIZATION_ELAPSED_THRESHOLD - Duration::from_secs(1);
+        controller.publish_deletion_progress();
+        let aged = controller.app.progress.clone().unwrap();
+        assert!(aged.contains("removing topic"), "{aged}");
+        assert!(aged.contains("s)"), "{aged}");
+    }
+
+    #[test]
+    fn materialization_keeps_the_progress_line_while_a_removal_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = deletion_controller(directory.path());
+        install_deletion(&mut controller, directory.path().join("topic"), Ok(()));
+        controller.materialization_job = Some(
+            BackgroundJob::spawn("deletion-progress-test", |context| {
+                while !context.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(MaterializationOutcome {
+                    path: PathBuf::new(),
+                })
+            })
+            .unwrap(),
+        );
+        controller.app.progress = Some("materializing".to_owned());
+
+        controller.publish_deletion_progress();
+
+        assert_eq!(controller.app.progress.as_deref(), Some("materializing"));
     }
 
     #[test]
