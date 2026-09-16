@@ -300,10 +300,7 @@ impl Clipboard for SystemClipboard {
             command
         };
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let mut child = {
-            let mut command = Command::new("wl-copy");
-            command
-        };
+        let mut child = Command::new("wl-copy");
         let mut child = child
             .stdin(Stdio::piped())
             .spawn()
