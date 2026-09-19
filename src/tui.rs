@@ -1387,6 +1387,17 @@ impl Controller {
                         }
                     }
                     cache_updates = catalog.repositories.clone();
+                    cache_updates.extend(
+                        inputs
+                            .iter()
+                            .filter(|input| {
+                                !catalog
+                                    .repositories
+                                    .iter()
+                                    .any(|repository| repository.path == input.repository.path)
+                            })
+                            .map(|input| input.repository.clone()),
+                    );
                     catalog
                 }
                 Err(error) => {
@@ -1968,8 +1979,18 @@ impl Controller {
                 })
             })
             .collect();
+        // Session-only repositories are local mapping candidates too. Append them
+        // so registered repositories retain their existing priority.
+        let mut mapping_catalog = self.catalog.clone();
+        mapping_catalog.repositories.extend(
+            self.app
+                .repositories
+                .iter()
+                .filter(|repository| repository.session_only)
+                .map(|repository| repository.config.clone()),
+        );
         self.app.authored_mappings = crate::github::map_pull_request_identities(
-            &self.catalog,
+            &mapping_catalog,
             self.app.authored_pull_requests.identities(),
             &self.app.active_pull_requests,
             |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
@@ -2191,7 +2212,7 @@ fn load_repository_views(catalog: &Catalog, current_directory: &Path) -> Vec<Rep
                 .is_ok_and(|existing| existing.common_git_dir == identity.common_git_dir)
         });
         if !registered {
-            let config = RepositoryConfig {
+            let mut config = RepositoryConfig {
                 path: identity.anchor.clone(),
                 label: None,
                 worktree_root: None,
@@ -2199,6 +2220,9 @@ fn load_repository_views(catalog: &Catalog, current_directory: &Path) -> Vec<Rep
                 github_remotes: Default::default(),
                 github_preferred_remote: None,
             };
+            // These identities are not persisted in the catalog, so rediscover
+            // them on local reloads to preserve branch bindings and cached PRs.
+            let _ = crate::github::refresh_repository_remote_identities(&SystemGit, &mut config);
             let session = match git::discover_worktrees(&SystemGit, &identity.anchor) {
                 Ok(worktrees) => RepositoryView {
                     config,
@@ -2613,6 +2637,124 @@ mod tests {
             views[0].config.path,
             std::fs::canonicalize(repository).unwrap()
         );
+    }
+
+    #[test]
+    fn session_only_worktree_retains_pr_mapping_across_refresh_and_reload() {
+        use crate::model::GitHubBranchData;
+
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("project");
+        let worktree = directory.path().join("topic");
+        run_git_command(directory.path(), &["init", repository.to_str().unwrap()]);
+        run_git_command(
+            &repository,
+            &["remote", "add", "origin", "git@github.com:team/project"],
+        );
+        run_git_command(
+            &repository,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        run_git_command(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "viewer/topic",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let repository = std::fs::canonicalize(repository).unwrap();
+        let worktree = std::fs::canonicalize(worktree).unwrap();
+        let catalog = Catalog::default();
+        let catalog_path = directory.path().join("wt.json");
+        config::save(&catalog_path, &catalog).unwrap();
+        let mut app = App::new(load_repository_views(&catalog, &worktree), worktree.clone());
+        let authored = test_authored_pull_request("viewer");
+        assert_eq!(
+            app.repositories[0].config.github_remotes["origin"],
+            authored.identity.repository
+        );
+        app.authored_pull_requests.hydrate(vec![authored.clone()]);
+        let mut controller = Controller::new(catalog_path.clone(), catalog, app);
+        controller.next_github_refresh = Instant::now() + Duration::from_secs(300);
+        controller.refresh_authored_mappings();
+        assert_eq!(
+            controller.app.authored_mappings[0]
+                .mapped_repository
+                .as_ref(),
+            Some(&repository)
+        );
+
+        let inputs = controller.github_inputs();
+        let generation = controller
+            .app
+            .begin_github_refresh(std::slice::from_ref(&worktree));
+        let mut refresh = GitHubRefresh::default();
+        refresh.branches.insert(
+            worktree.clone(),
+            Ok(GitHubBranchData {
+                pull_request: Some(authored.pull_request.clone()),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+        // Simulate an identity discovered by the worker after the UI snapshot.
+        controller.app.repositories[0].config.github_remotes.clear();
+        controller
+            .github_sender
+            .send(GitHubMessage::Branches {
+                generation,
+                paths: vec![worktree.clone()],
+                bindings: github_bindings(&inputs),
+                refresh,
+                cache_updates: inputs.into_iter().map(|input| input.repository).collect(),
+                warnings: Vec::new(),
+            })
+            .unwrap();
+        controller.pump_background_results();
+        assert!(
+            controller
+                .app
+                .active_pull_requests
+                .contains(&authored.identity)
+        );
+        assert!(controller.app.authored_mappings.is_empty());
+        assert!(
+            controller.app.github[&worktree]
+                .data()
+                .unwrap()
+                .pull_request
+                .is_some()
+        );
+
+        controller.reload_catalog_and_worktrees().unwrap();
+        assert!(
+            controller
+                .app
+                .active_pull_requests
+                .contains(&authored.identity)
+        );
+        assert!(
+            controller.app.github[&worktree]
+                .data()
+                .unwrap()
+                .pull_request
+                .is_some()
+        );
+        assert!(controller.app.repositories[0].session_only);
+        assert!(controller.catalog.repositories.is_empty());
+        assert!(config::load(&catalog_path).unwrap().repositories.is_empty());
     }
 
     #[test]
