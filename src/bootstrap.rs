@@ -395,7 +395,7 @@ fn repository_matches(
     path: &Path,
     expected: &GitHubRepositoryIdentity,
 ) -> bool {
-    if !git::resolve_repository(runner, path).is_ok_and(|identity| identity.bare) {
+    if git::resolve_repository(runner, path).is_err() {
         return false;
     }
     let mut repository = RepositoryConfig {
@@ -536,6 +536,15 @@ mod tests {
 
     #[test]
     fn mapped_repository_path_is_resolved_and_validated_against_fresh_catalog() {
+        assert_mapped_repository_is_reused(true);
+    }
+
+    #[test]
+    fn mapped_normal_checkout_is_reused_without_creating_a_bare_clone() {
+        assert_mapped_repository_is_reused(false);
+    }
+
+    fn assert_mapped_repository_is_reused(bare: bool) {
         let directory = tempfile::tempdir().unwrap();
         let unrelated = directory.path().join("unrelated.git");
         let mapped = directory.path().join("mapped.git");
@@ -545,7 +554,11 @@ mod tests {
         ] {
             assert!(
                 Command::new("git")
-                    .args(["init", "--bare"])
+                    .args(if bare {
+                        vec!["init", "--bare"]
+                    } else {
+                        vec!["init"]
+                    })
                     .arg(path)
                     .status()
                     .unwrap()
@@ -590,6 +603,9 @@ mod tests {
 
         assert_eq!(result.repository_index, 1);
         assert_eq!(result.repository.path, mapped);
+        assert!(!result.created);
+        assert_eq!(catalog.repositories.len(), 2);
+        assert!(!directory.path().join("repositories").exists());
 
         let clone_runner = FixtureCloneRunner::new(vec![success()]);
         let result = bootstrap_repository(
