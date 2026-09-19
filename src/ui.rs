@@ -840,7 +840,13 @@ fn inline_row_spans(
         InlineRowKind::Reviewer => append_reviewer_spans(&mut spans, text),
         InlineRowKind::OpenComment => {
             append_open_comment_spans(&mut spans, text);
-            return truncate_spans(spans, line_width);
+            let mut spans = truncate_spans(spans, line_width);
+            if text.ends_with(" [outdated]") {
+                for span in spans.iter_mut().skip(1) {
+                    span.style = span.style.add_modifier(Modifier::DIM | Modifier::ITALIC);
+                }
+            }
+            return spans;
         }
         InlineRowKind::Section => unreachable!("handled above"),
     }
@@ -2636,6 +2642,28 @@ mod tests {
         let line = Line::from(narrow.clone());
         assert_eq!(line.width(), 24);
         assert_eq!(narrow.last().unwrap().content.as_ref(), "…");
+        for spans in [&full, &narrow] {
+            assert!(spans.iter().skip(1).all(|span| {
+                span.style
+                    .add_modifier
+                    .contains(Modifier::DIM | Modifier::ITALIC)
+            }));
+        }
+
+        let current = inline_row_spans(
+            InlineRowKind::OpenComment,
+            InlineSection::OpenComments,
+            "@Reviewer please inspect 🧪 unicode (src/lib.rs)",
+            None,
+            "└─ ".to_owned(),
+            80,
+        );
+        assert!(current.iter().all(|span| {
+            !span
+                .style
+                .add_modifier
+                .intersects(Modifier::DIM | Modifier::ITALIC)
+        }));
     }
 
     #[test]
