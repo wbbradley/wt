@@ -672,9 +672,9 @@ fn tree_prefixes_from_depths_for_range(
         if index >= start {
             if depth == 0 {
                 prefixes.push(match (seen_root, later_sibling[index]) {
-                    (false, true) => "┌─ ".to_owned(),
-                    (true, true) => "├─ ".to_owned(),
-                    (_, false) => "└─ ".to_owned(),
+                    (false, true) => "┌─".to_owned(),
+                    (true, true) => "├─".to_owned(),
+                    (_, false) => "└─".to_owned(),
                 });
             } else {
                 assert_eq!(
@@ -687,9 +687,9 @@ fn tree_prefixes_from_depths_for_range(
                     prefix.push_str(if *ancestor_has_later { "│  " } else { "   " });
                 }
                 prefix.push_str(if later_sibling[index] {
-                    "├─ "
+                    "├─"
                 } else {
-                    "└─ "
+                    "└─"
                 });
                 prefixes.push(prefix);
             }
@@ -704,8 +704,8 @@ fn tree_prefixes_from_depths_for_range(
 
 fn disclosure_tree_prefix(prefix: String, expanded: bool) -> String {
     let stem = prefix
-        .strip_suffix(' ')
-        .expect("tree row prefix must end in spacing");
+        .strip_suffix('─')
+        .expect("tree row prefix must end in a dash");
     format!("{stem}{}", if expanded { '▾' } else { '▸' })
 }
 
@@ -1923,7 +1923,7 @@ mod tests {
 
         let focused = buffer_text(terminal.backend().buffer());
         assert!(focused.contains("Focus: project: topic"));
-        assert!(focused.contains("└─ topic"));
+        assert!(focused.contains("└─topic"));
         assert!(focused.contains("f focus"));
         assert!(focused.contains("Esc unfocus"));
         assert!(!focused.contains("Repos / Worktrees / PRs"));
@@ -2049,7 +2049,7 @@ mod tests {
             .find(|line| line.contains("project"))
             .unwrap();
         assert!(repository_line.contains("project · /repo (main)"));
-        assert!(repository_line.contains("▶● └─ project · /repo (main)"));
+        assert!(repository_line.contains("▶● └─project · /repo (main)"));
         assert!(!repository_line.contains("●project"));
         assert!(repository_line.contains('●'));
         assert!(!repository_line.contains('▾'));
@@ -2099,9 +2099,9 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
-        assert!(content.contains("└─▾project"));
-        assert!(content.contains("├─ child · /repo-child"));
-        assert!(content.contains("└─ parent · /repo"));
+        assert!(content.contains("└▾project"));
+        assert!(content.contains("├─child · /repo-child"));
+        assert!(content.contains("└─parent · /repo"));
         assert!(!content.contains("Stacked worktrees"));
         assert!(!content.contains("Worktree ·"));
         let muted = colored_text(buffer, MUTED);
@@ -2297,7 +2297,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
-        assert!(content.contains("└─▾feature/compact-attention"));
+        assert!(content.contains("└▾feature/compact-attention"));
         assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
         assert!(content.contains("PR #42"));
         assert!(content.contains("virtual feature"));
@@ -2603,7 +2603,7 @@ mod tests {
             InlineSection::OpenComments,
             "@Reviewer please inspect 🧪 unicode (src/lib.rs) [outdated]",
             None,
-            "└─ ".to_owned(),
+            "└─".to_owned(),
             80,
         );
         assert_eq!(
@@ -2636,7 +2636,7 @@ mod tests {
             InlineSection::OpenComments,
             "@Reviewer please inspect 🧪 unicode (src/lib.rs) [outdated]",
             None,
-            "└─ ".to_owned(),
+            "└─".to_owned(),
             24,
         );
         let line = Line::from(narrow.clone());
@@ -2655,7 +2655,7 @@ mod tests {
             InlineSection::OpenComments,
             "@Reviewer please inspect 🧪 unicode (src/lib.rs)",
             None,
-            "└─ ".to_owned(),
+            "└─".to_owned(),
             80,
         );
         assert!(current.iter().all(|span| {
@@ -2681,7 +2681,7 @@ mod tests {
         let branch_style = Style::default().fg(BRANCH);
         let pr_style = Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD);
         let spans = vec![
-            Span::styled("└─▾", connector_style),
+            Span::styled("└▾", connector_style),
             Span::styled("界界-branch", branch_style),
             Span::styled(" · PR #42", pr_style),
             Span::styled(" · 長い Unicode title", Style::default()),
@@ -2694,9 +2694,9 @@ mod tests {
         assert!(item.width() <= 26);
         assert!(line.width() <= 26);
         assert!(
-            visible.iter().any(|span| {
-                span.content.contains("└─▾") && span.style == connector_style
-            })
+            visible
+                .iter()
+                .any(|span| { span.content.contains("└▾") && span.style == connector_style })
         );
         assert!(
             visible
@@ -2721,7 +2721,7 @@ mod tests {
             InlineSection::Reviewers,
             "審査者審査者審査者 · changes requested · reviewed",
             None,
-            "│  └─ ".to_owned(),
+            "│  └─".to_owned(),
             24,
         );
         let comment = inline_row_spans(
@@ -2729,7 +2729,7 @@ mod tests {
             InlineSection::OpenComments,
             "@審査者審査者 長いコメント本文 🧪 (src/界.rs) [outdated]",
             None,
-            "│  └─ ".to_owned(),
+            "│  └─".to_owned(),
             24,
         );
         for spans in [reviewer, comment] {
@@ -2744,15 +2744,15 @@ mod tests {
     fn tree_prefixes_render_siblings_ancestry_and_roots() {
         assert_eq!(
             tree_prefixes_from_depths(&[0, 1, 2, 1, 0, 1]),
-            ["┌─ ", "│  ├─ ", "│  │  └─ ", "│  └─ ", "└─ ", "   └─ ",]
+            ["┌─", "│  ├─", "│  │  └─", "│  └─", "└─", "   └─",]
         );
-        assert_eq!(tree_prefixes_from_depths(&[0, 0, 0]), ["┌─ ", "├─ ", "└─ "]);
+        assert_eq!(tree_prefixes_from_depths(&[0, 0, 0]), ["┌─", "├─", "└─"]);
         assert_eq!(
             tree_prefixes_from_depths_for_range(&[0, 1, 2, 1, 0, 1], 2..4),
-            ["│  │  └─ ", "│  └─ "]
+            ["│  │  └─", "│  └─"]
         );
-        assert_eq!(disclosure_tree_prefix("├─ ".to_owned(), true), "├─▾");
-        assert_eq!(disclosure_tree_prefix("└─ ".to_owned(), false), "└─▸");
+        assert_eq!(disclosure_tree_prefix("├─".to_owned(), true), "├▾");
+        assert_eq!(disclosure_tree_prefix("└─".to_owned(), false), "└▸");
     }
 
     #[test]
