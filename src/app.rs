@@ -1449,6 +1449,18 @@ impl App {
         if children.is_empty() {
             return;
         }
+        if children.len() == 1 {
+            self.append_branch(
+                rows,
+                forest,
+                included,
+                children[0],
+                depth,
+                mapped_repository_index,
+                flattened_worktree_index,
+            );
+            return;
+        }
         let section = InlineSection::StackedBranches;
         let stack_expanded =
             self.disclosure_expanded(&DisclosureKey::Section(node.id.clone(), section), true);
@@ -5017,7 +5029,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(nested, vec![(10, 1), (11, 3), (12, 5), (13, 1)]);
+        assert_eq!(nested, vec![(10, 1), (11, 2), (12, 3), (13, 1)]);
 
         app.filter = "stack-grandchild".to_owned();
         app.filter_active = true;
@@ -5038,7 +5050,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(filtered, vec![(10, 1), (11, 3), (12, 5)]);
+        assert_eq!(filtered, vec![(10, 1), (11, 2), (12, 3)]);
         assert_eq!(
             app.visible_rows()
                 .into_iter()
@@ -5047,15 +5059,7 @@ mod tests {
             vec![
                 RowId::Repository(PathBuf::from("/repo")),
                 RowId::VirtualPullRequest(parent.identity.clone()),
-                RowId::Section(
-                    BranchId::VirtualPullRequest(parent.identity.clone()),
-                    InlineSection::StackedBranches,
-                ),
                 RowId::VirtualPullRequest(child.identity.clone()),
-                RowId::Section(
-                    BranchId::VirtualPullRequest(child.identity.clone()),
-                    InlineSection::StackedBranches,
-                ),
                 RowId::VirtualPullRequest(grandchild.identity.clone()),
                 RowId::Section(
                     BranchId::VirtualPullRequest(grandchild.identity.clone()),
@@ -5106,7 +5110,8 @@ mod tests {
             Some(RowId::VirtualPullRequest(grandchild.identity.clone()))
         );
         assert!(app.filter.is_empty());
-        assert_eq!(app.disclosure_expanded.get(&parent_stack), Some(&true));
+        // An omitted section does not hide its only child, even if previously collapsed.
+        assert_eq!(app.disclosure_expanded.get(&parent_stack), Some(&false));
     }
 
     #[test]
@@ -5189,7 +5194,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_local_and_virtual_descendants_share_typed_stack_sections_once() {
+    fn single_mixed_descendants_render_directly_under_their_parents() {
         let mut local = repository("/repo", true);
         let mut root = authored("team", "project", 9, "2025-12-31");
         root.pull_request.head.repository = Some("team/project".to_owned());
@@ -5239,26 +5244,22 @@ mod tests {
         ] {
             assert_eq!(rows.iter().filter(|row| row.id() == &id).count(), 1);
         }
-        assert!(rows.iter().any(|row| {
-            matches!(row, VisibleRow::Inline {
-                id: RowId::Section(
-                    BranchId::Worktree(path),
-                    InlineSection::StackedBranches
-                ),
-                text,
+        assert!(!rows.iter().any(|row| matches!(
+            row,
+            VisibleRow::Inline {
+                id: RowId::Section(_, InlineSection::StackedBranches),
                 ..
-            } if path == &PathBuf::from("/repo") && text == "Stacked branches")
-        }));
-        assert!(rows.iter().any(|row| {
-            matches!(row, VisibleRow::Inline {
-                id: RowId::Section(
-                    BranchId::Worktree(path),
-                    InlineSection::StackedBranches
-                ),
-                text,
-                ..
-            } if path == &PathBuf::from("/repo-topic") && text == "Stacked PRs")
-        }));
+            }
+        )));
+        let depths = rows
+            .iter()
+            .filter_map(|row| match row {
+                VisibleRow::Worktree { depth, .. }
+                | VisibleRow::VirtualPullRequest { depth, .. } => Some(*depth),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(depths, vec![1, 2, 3]);
 
         app.selected = Some(RowId::Worktree(topic));
         let review_request = app.review_request().unwrap();
@@ -5409,6 +5410,15 @@ mod tests {
     #[test]
     fn branch_and_stack_disclosures_survive_refresh_independently() {
         let mut app = local_pr_stack_app();
+        let mut sibling = authored("team", "project", 3, "2026-01-03");
+        sibling.pull_request.base.repository = Some("team/project".to_owned());
+        sibling.pull_request.base.branch = "main-pr".to_owned();
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: sibling.identity.repository.clone(),
+            mapped_repository: Some(PathBuf::from("/repo")),
+            expanded: true,
+            pull_requests: vec![sibling],
+        }];
         let owner = BranchId::Worktree(PathBuf::from("/repo"));
         app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
         app.handle_key(key(KeyCode::Char('h')));
@@ -5680,7 +5690,7 @@ mod tests {
             row,
             VisibleRow::Worktree {
                 id: RowId::Worktree(path),
-                depth: 2,
+                depth: 1,
                 ..
             } if path == &PathBuf::from("/repo-topic")
         )));
@@ -7261,21 +7271,15 @@ mod tests {
             .iter()
             .position(|row| row.id() == &RowId::Worktree(local_path.clone()))
             .unwrap();
-        let stack_header = expanded
-            .iter()
-            .position(|row| {
-                row.id()
-                    == &RowId::Section(
-                        BranchId::Worktree(local_path.clone()),
-                        InlineSection::StackedBranches,
-                    )
-            })
-            .unwrap();
         let child_row = expanded
             .iter()
             .position(|row| row.id() == &RowId::VirtualPullRequest(child.identity.clone()))
             .unwrap();
-        assert!(parent_row < stack_header && stack_header < child_row);
+        assert!(parent_row < child_row);
+        assert_eq!(
+            app.visible_row_depth(&expanded[child_row]),
+            app.visible_row_depth(&expanded[parent_row]) + 1
+        );
     }
 
     #[test]

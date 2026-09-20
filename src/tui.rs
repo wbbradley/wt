@@ -3324,9 +3324,9 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(mixed_virtual_rows, vec![(33902, 2)]);
+        assert_eq!(mixed_virtual_rows, vec![(33902, 1)]);
         let mixed_rows = controller.app.visible_rows();
-        assert!(mixed_rows.iter().any(|row| {
+        assert!(!mixed_rows.iter().any(|row| {
             matches!(
                 row,
                 crate::app::VisibleRow::Inline {
@@ -3403,7 +3403,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(all_virtual_rows, vec![(33580, 1), (33902, 3)]);
+        assert_eq!(all_virtual_rows, vec![(33580, 1), (33902, 2)]);
     }
 
     fn deletion_controller(directory: &std::path::Path) -> Controller {

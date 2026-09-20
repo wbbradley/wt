@@ -171,7 +171,8 @@ hidden values.
   available width for `@author excerpt (path)`, and marks outdated threads. It is the only subtree
   that renders review feedback and is omitted when empty.
 - **Stacked branches** starts expanded and owns local worktree descendants plus virtual-only PR
-  descendants. The label says `Stacked PRs` when every descendant is virtual and `Stacked
+  descendants. With only one visible direct child, the group is omitted and the child appears
+  directly under its parent branch. The label says `Stacked PRs` when every descendant is virtual and `Stacked
   worktrees` when every descendant is local; mixed trees use `Stacked branches`. Stack topology
   comes only from explicit pull-request base/head relationships; unrelated local worktrees remain
   siblings.
