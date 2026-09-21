@@ -128,7 +128,6 @@ pub fn suggested_destination(repository: &RepositoryConfig, mode: &CreateMode) -
 
 pub fn pull_request_destination(
     repository: &RepositoryConfig,
-    repository_root: &Path,
     identity: &crate::model::CanonicalPullRequestId,
     local_branch: &str,
 ) -> PathBuf {
@@ -137,7 +136,7 @@ pub fn pull_request_destination(
         None => repository
             .path
             .parent()
-            .unwrap_or(repository_root)
+            .unwrap_or_else(|| Path::new("."))
             .join(format!(
                 "{}-pr-{}",
                 sanitize_name(&identity.repository.repository),
@@ -832,7 +831,7 @@ mod tests {
             number: 42,
         };
         let mut repository = RepositoryConfig {
-            path: PathBuf::from("/repositories/project.git"),
+            path: PathBuf::from("/elsewhere/projects/project.git"),
             label: None,
             worktree_root: Some(PathBuf::from("/trees")),
             github_remote: None,
@@ -840,24 +839,13 @@ mod tests {
             github_preferred_remote: None,
         };
         assert_eq!(
-            pull_request_destination(
-                &repository,
-                Path::new("/repositories"),
-                &identity,
-                "feature/a thing"
-            ),
+            pull_request_destination(&repository, &identity, "feature/a thing"),
             PathBuf::from("/trees/feature-a-thing")
         );
         repository.worktree_root = None;
-        repository.path = PathBuf::from("/nw/project");
         assert_eq!(
-            pull_request_destination(
-                &repository,
-                Path::new("/repositories"),
-                &identity,
-                "ignored"
-            ),
-            PathBuf::from("/nw/project-pr-42")
+            pull_request_destination(&repository, &identity, "ignored"),
+            PathBuf::from("/elsewhere/projects/project-pr-42")
         );
     }
 

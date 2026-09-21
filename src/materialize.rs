@@ -119,7 +119,6 @@ pub fn materialize_pull_request(
     runner: &dyn GitRunner,
     fetch_runner: &dyn FetchRunner,
     repository: &RepositoryConfig,
-    repository_root: &Path,
     authored: &AuthoredPullRequest,
     https_token: Option<&ResolvedToken>,
 ) -> Result<MaterializedPullRequest, MaterializeError> {
@@ -247,12 +246,8 @@ pub fn materialize_pull_request(
             set_upstream(runner, &repository.path, &branch, upstream)?;
         }
 
-        let destination = operations::pull_request_destination(
-            repository,
-            repository_root,
-            &authored.identity,
-            &branch,
-        );
+        let destination =
+            operations::pull_request_destination(repository, &authored.identity, &branch);
         operations::validate_create(
             runner,
             repository,
@@ -997,15 +992,8 @@ mod tests {
         let authored = fixture.authored(42, "feature/topic", "contributor/project");
         let fetches = CountingFetchRunner::default();
 
-        let materialized = materialize_pull_request(
-            &SystemGit,
-            &fetches,
-            &repository,
-            &fixture.repository_root,
-            &authored,
-            None,
-        )
-        .unwrap();
+        let materialized =
+            materialize_pull_request(&SystemGit, &fetches, &repository, &authored, None).unwrap();
         assert_eq!(materialized.branch, "feature/topic");
         assert_eq!(
             materialized.path,
@@ -1037,15 +1025,8 @@ mod tests {
                 .starts_with(".wt-incomplete-worktree-")
         }));
 
-        let reused = materialize_pull_request(
-            &SystemGit,
-            &fetches,
-            &repository,
-            &fixture.repository_root,
-            &authored,
-            None,
-        )
-        .unwrap();
+        let reused =
+            materialize_pull_request(&SystemGit, &fetches, &repository, &authored, None).unwrap();
         assert!(reused.reused);
         assert_eq!(reused.path, materialized.path);
         assert_eq!(fetches.requests.load(Ordering::Relaxed), 1);
@@ -1058,24 +1039,23 @@ mod tests {
             &fixture.source,
             &["update-ref", "refs/pull/42/head", &fixture.target],
         );
-        let repository = fixture.base_repository(false);
+        let mut repository = fixture.base_repository(false);
+        let sibling_root = fixture._directory.path().join("elsewhere");
+        fs::create_dir(&sibling_root).unwrap();
+        let relocated = sibling_root.join("base.git");
+        fs::rename(&repository.path, &relocated).unwrap();
+        repository.path = fs::canonicalize(relocated).unwrap();
         let authored = fixture.authored(42, "feature/topic", "unconfigured/project");
         let bootstrap_root = fixture.repository_root.join("elsewhere");
 
-        let materialized = materialize_pull_request(
-            &SystemGit,
-            &SystemFetchRunner,
-            &repository,
-            &bootstrap_root,
-            &authored,
-            None,
-        )
-        .unwrap();
+        let materialized =
+            materialize_pull_request(&SystemGit, &SystemFetchRunner, &repository, &authored, None)
+                .unwrap();
         assert_eq!(materialized.branch, "pr/42-feature-topic");
         assert!(!bootstrap_root.exists());
         assert_eq!(
             materialized.path,
-            fs::canonicalize(fixture.repository_root.join("project-pr-42")).unwrap()
+            fs::canonicalize(sibling_root.join("project-pr-42")).unwrap()
         );
         assert_eq!(git_stdout(&repository.path, &["remote"]), "origin");
         assert_eq!(
@@ -1102,15 +1082,9 @@ mod tests {
         );
         let authored = fixture.authored(45, "deleted/topic", "contributor/project");
 
-        let materialized = materialize_pull_request(
-            &SystemGit,
-            &SystemFetchRunner,
-            &repository,
-            &fixture.repository_root,
-            &authored,
-            None,
-        )
-        .unwrap();
+        let materialized =
+            materialize_pull_request(&SystemGit, &SystemFetchRunner, &repository, &authored, None)
+                .unwrap();
         assert_eq!(materialized.branch, "pr/45-deleted-topic");
         assert_eq!(
             branch_head(&repository.path, &materialized.branch),
@@ -1126,13 +1100,12 @@ mod tests {
             &["update-ref", "refs/pull/42/head", &fixture.target],
         );
         let repository = fixture.base_repository(false);
-        let destination = fixture.repository_root.join("project-pr-42");
+        let destination = repository.path.parent().unwrap().join("project-pr-42");
         fs::write(&destination, "unrelated").unwrap();
         let result = materialize_pull_request(
             &SystemGit,
             &SystemFetchRunner,
             &repository,
-            &fixture.repository_root,
             &fixture.authored(42, "feature/topic", "unconfigured/project"),
             None,
         );
@@ -1163,7 +1136,6 @@ mod tests {
             &SystemGit,
             &SystemFetchRunner,
             &repository,
-            &fixture.repository_root,
             &fixture.authored(46, "feature/topic", "unconfigured/project"),
             None,
         );
@@ -1245,7 +1217,6 @@ mod tests {
             &SystemGit,
             &SystemFetchRunner,
             &repository,
-            &fixture.repository_root,
             &fixture.authored(41, "safe", "contributor/project"),
             None,
         )
@@ -1258,7 +1229,6 @@ mod tests {
             &SystemGit,
             &SystemFetchRunner,
             &repository,
-            &fixture.repository_root,
             &fixture.authored(42, "feature/topic", "contributor/project"),
             None,
         )
@@ -1271,7 +1241,6 @@ mod tests {
             &SystemGit,
             &SystemFetchRunner,
             &repository,
-            &fixture.repository_root,
             &fixture.authored(43, "diverged", "contributor/project"),
             None,
         )
@@ -1283,7 +1252,6 @@ mod tests {
             &SystemGit,
             &SystemFetchRunner,
             &repository,
-            &fixture.repository_root,
             &fixture.authored(44, "claimed", "contributor/project"),
             None,
         )

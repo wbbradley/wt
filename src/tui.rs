@@ -2153,7 +2153,6 @@ impl Controller {
                 &runner,
                 &runner,
                 &result.repository,
-                &repository_root,
                 &refreshed,
                 Some(&token),
             )
