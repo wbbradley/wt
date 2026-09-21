@@ -541,6 +541,16 @@ pub fn removal_preview(
     )
 }
 
+/// Normal removal checks, except that the caller may relocate before deletion.
+pub(crate) fn current_removal_preview(
+    runner: &dyn GitRunner,
+    repository: &RepositoryConfig,
+    selector: &str,
+    current_directory: &Path,
+) -> Result<WorktreeDetails, OperationError> {
+    removal_preview_with_current(runner, repository, selector, current_directory, false, true)
+}
+
 fn removal_preview_with_current(
     runner: &dyn GitRunner,
     repository: &RepositoryConfig,
@@ -637,7 +647,7 @@ fn removal_details(
     inspect(runner, repository, &worktree.path.to_string_lossy())
 }
 
-fn contains_path(worktree: &Path, candidate: &Path) -> bool {
+pub(crate) fn contains_path(worktree: &Path, candidate: &Path) -> bool {
     let worktree = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_owned());
     let candidate = fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_owned());
     candidate.starts_with(worktree)

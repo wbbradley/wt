@@ -80,7 +80,7 @@ Run `wt -x` from a linked worktree when you are finished with it. `wt` safely re
 
 ## Shell navigation and completion
 
-The integration supports Bash 3.2 and Zsh. With the function loaded, `wt` changes the current shell to the worktree selected in the TUI. Cancellation, an empty selection, and failures leave `$PWD` unchanged. Scriptable `config`, `repo`, and `worktree` commands plus shell initialization, help, and version requests pass directly to the binary.
+The integration supports Bash 3.2 and Zsh. With the function loaded, `wt` changes the current shell to the worktree selected in the TUI. Cancellation and an empty selection leave `$PWD` unchanged unless an active-worktree cleanup has supplied a fallback destination. A nonzero exit status leaves `$PWD` unchanged. Scriptable `config`, `repo`, and `worktree` commands plus shell initialization, help, and version requests pass directly to the binary.
 
 Navigate without opening the TUI when a branch, worktree basename, or path is unique:
 
@@ -200,8 +200,9 @@ wt worktree remove-merged --all --yes
 
 ### Safety rules
 
-- Normal removal refuses bare anchors, main worktrees, the worktree containing `$PWD`, locked worktrees, and dirty worktrees.
-- Top-level `wt -x` is the explicit exception for the worktree containing `$PWD`; it retains the bare, main, locked, and dirty protections.
+- Normal removal refuses bare anchors, main worktrees, locked worktrees, and dirty worktrees. CLI `worktree remove` also refuses the worktree containing `$PWD`.
+- In the TUI, `d` can remove the active linked worktree. After confirmation, `wt` changes directory to the nearest usable concrete ancestor in the PR stack, skipping virtual ancestors, or to `$HOME` if none is available, before starting removal. If neither destination is usable, removal does not start. Quitting afterward returns that destination to the shell; choosing another checkout overrides it.
+- Top-level `wt -x` also permits removing the worktree containing `$PWD`; it retains the bare, main, locked, and dirty protections.
 - Removal does not delete the branch.
 - Merged-PR cleanup additionally requires a live `merged` PR whose `headRefOid` exactly equals the worktree's current HEAD. It refuses ambiguous associations, missing or partial GitHub data, local changes including untracked files, locks, main/bare/detached/current/prunable worktrees, and any candidate that changes before execution. It revalidates each candidate and never escalates to force removal.
 - Force removal is a distinct command and requires `--confirm` to exactly match the branch or full worktree path.
@@ -290,7 +291,7 @@ Configured repositories use `<worktree_root>/<sanitized-local-branch>`; otherwis
 - **PR materialization is waiting:** another `wt` process holds the catalog sidecar lock; wait or press Ctrl-C to cancel without changing directories.
 - **SSO/SAML or classic PAT error:** authorize the token for the organization or use a token type allowed by its policy.
 - **Rate limited:** `wt` suppresses requests until the reported reset time while retaining stale data.
-- **Removal disabled:** inspect dirtiness, locks, whether the row is the main/bare worktree, and whether it contains the current directory.
+- **Removal disabled:** inspect dirtiness, locks, whether the row is the main/bare worktree, and whether its status is available.
 - **Shell does not change directory:** ensure the matching `wt shell-init` command runs in the current interactive shell and that `command -v wt` finds the binary.
 - **Terminal looks altered after an external kill:** run `reset`. Normal success, cancellation, errors, Ctrl-C, and panics restore raw mode, cursor visibility, and the alternate screen automatically.
 

@@ -306,3 +306,50 @@ fn zsh_script_has_valid_syntax() {
         .unwrap();
     assert!(status.success());
 }
+
+#[test]
+fn shell_wrappers_leave_deleted_cwd_using_the_returned_fallback() {
+    for shell in ["bash", "zsh"] {
+        for arguments in ["", "-x"] {
+            let directory = tempfile::tempdir().unwrap();
+            let bin = directory.path().join("bin");
+            let removed = directory.path().join("active worktree");
+            let destination = directory.path().join("stack parent");
+            for path in [&bin, &removed, &destination] {
+                fs::create_dir(path).unwrap();
+            }
+            let fake_wt = bin.join("wt");
+            fs::write(
+                &fake_wt,
+                "#!/bin/sh\ncd \"$WT_TEST_DESTINATION\" || exit 1\nrmdir \"$WT_TEST_REMOVED\" || exit 1\nprintf '%s\\n' \"$WT_TEST_DESTINATION\"\n",
+            ).unwrap();
+            fs::set_permissions(&fake_wt, fs::Permissions::from_mode(0o755)).unwrap();
+            let wrapper = format!("{}/shell/wt.{shell}", env!("CARGO_MANIFEST_DIR"));
+            let output = Command::new(shell)
+                .args([
+                    "-c",
+                    &format!(". \"$WT_TEST_WRAPPER\"\nwt {arguments} || exit $?\npwd -P"),
+                ])
+                .current_dir(&removed)
+                .env(
+                    "PATH",
+                    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                )
+                .env("WT_TEST_WRAPPER", wrapper)
+                .env("WT_TEST_DESTINATION", &destination)
+                .env("WT_TEST_REMOVED", &removed)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{shell} {arguments}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!removed.exists());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                fs::canonicalize(destination).unwrap().to_str().unwrap()
+            );
+        }
+    }
+}

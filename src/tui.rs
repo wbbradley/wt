@@ -389,6 +389,7 @@ struct Controller {
     materialization_detail: Option<String>,
     completed_materialization: Option<PathBuf>,
     completed_creation: Option<PathBuf>,
+    relocation_destination: Option<PathBuf>,
     url_opener: Arc<dyn UrlOpener>,
     clipboard: Arc<dyn Clipboard>,
     state_path: PathBuf,
@@ -441,6 +442,7 @@ impl Controller {
             materialization_detail: None,
             completed_materialization: None,
             completed_creation: None,
+            relocation_destination: None,
             url_opener: Arc::new(SystemUrlOpener),
             clipboard: Arc::new(SystemClipboard),
             state_path,
@@ -568,7 +570,7 @@ impl Controller {
                 let absolute = std::fs::canonicalize(&path).unwrap_or(path);
                 Ok(ControlFlow::Exit(Some(absolute)))
             }
-            Intent::Cancel => Ok(ControlFlow::Exit(None)),
+            Intent::Cancel => Ok(ControlFlow::Exit(self.relocation_destination.clone())),
             Intent::Refresh => {
                 self.request_local_refresh(true)?;
                 Ok(ControlFlow::Continue)
@@ -776,12 +778,11 @@ impl Controller {
             }
             Action::Remove => {
                 let (_, worktree, _) = self.require_selected_worktree()?;
-                let details = operations::removal_preview(
+                let details = operations::current_removal_preview(
                     &SystemGit,
                     &repository.config,
                     &worktree.path.to_string_lossy(),
                     &self.app.current_directory,
-                    false,
                 )?;
                 let mut summary = vec![
                     format!("repository: {}", repository.config.display_label()),
@@ -1730,6 +1731,32 @@ impl Controller {
         worktree: PathBuf,
     ) -> Result<(), TuiError> {
         let config = self.repository(repository)?.clone();
+        if operations::contains_path(&worktree, &self.app.current_directory) {
+            // Revalidate before changing directories; the background job checks again.
+            operations::current_removal_preview(
+                &SystemGit,
+                &config,
+                &worktree.to_string_lossy(),
+                &self.app.current_directory,
+            )?;
+            let mut candidates = self.app.worktree_ancestors(&worktree);
+            candidates.extend(env::var_os("HOME").map(PathBuf::from));
+            let destination = candidates.into_iter().find_map(|candidate| {
+                let candidate = std::fs::canonicalize(candidate).ok()?;
+                if operations::contains_path(&worktree, &candidate)
+                    || self.app.deleting.iter().any(|path| operations::contains_path(path, &candidate))
+                {
+                    return None;
+                }
+                env::set_current_dir(&candidate).ok()?;
+                Some(candidate)
+            }).ok_or_else(|| TuiError::InvalidForm {
+                field: "removal destination",
+                message: "cannot change directory to a stack ancestor or $HOME; worktree was not removed".to_owned(),
+            })?;
+            self.app.set_current_directory(destination.clone());
+            self.relocation_destination = Some(destination);
+        }
         let current_directory = self.app.current_directory.clone();
         let label = worktree_label(&worktree);
         let target = worktree.clone();
@@ -3404,6 +3431,254 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(all_virtual_rows, vec![(33580, 1), (33902, 2)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_deletion_relocates_safely_in_subprocess() {
+        use crate::app::{GitHubState, StatusState};
+        use crate::model::{GitHubBranchData, WorktreeStatus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let Ok(case) = env::var("WT_ACTIVE_DELETION_CASE") else {
+            let git = Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap();
+            assert!(git.status.success());
+            let git = String::from_utf8(git.stdout).unwrap();
+            for case in [
+                "stack",
+                "home",
+                "unavailable",
+                "inside",
+                "dirty",
+                "locked",
+                "cancel",
+                "nonactive",
+                "missing-parent",
+                "deleting-parent",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let home = directory.path().join("home with spaces");
+                std::fs::create_dir(&home).unwrap();
+                let bin = directory.path().join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                let wrapper = bin.join("git");
+                std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$3\" = worktree ] && [ \"$4\" = remove ]; then pwd -P > \"$WT_DELETION_CWD_LOG\"; fi\nexec \"$WT_REAL_GIT\" \"$@\"\n").unwrap();
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let output = Command::new(env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tui::tests::active_deletion_relocates_safely_in_subprocess",
+                        "--nocapture",
+                    ])
+                    .env("WT_ACTIVE_DELETION_CASE", case)
+                    .env("WT_REAL_GIT", git.trim())
+                    .env("WT_DELETION_CWD_LOG", directory.path().join("deletion-cwd"))
+                    .env(
+                        "PATH",
+                        format!("{}:{}", bin.display(), env::var("PATH").unwrap()),
+                    )
+                    .env(
+                        "HOME",
+                        if case == "unavailable" {
+                            directory.path().join("missing")
+                        } else {
+                            home
+                        },
+                    )
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let repo = root.join("project");
+        let parent = root.join("parent");
+        let topic = root.join("topic");
+        run_git_command(&root, &["init", "-b", "main", repo.to_str().unwrap()]);
+        run_git_command(&repo, &["config", "user.email", "test@example.com"]);
+        run_git_command(&repo, &["config", "user.name", "Test User"]);
+        run_git_command(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+        for (branch, path) in [("parent", &parent), ("topic", &topic)] {
+            run_git_command(
+                &repo,
+                &["worktree", "add", "-b", branch, path.to_str().unwrap()],
+            );
+        }
+        let nested = topic.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let alias = root.join("alias");
+        symlink(&topic, &alias).unwrap();
+        let current = if case == "nonactive" {
+            repo.clone()
+        } else {
+            alias.join("nested")
+        };
+        env::set_current_dir(&current).unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let mut repository = RepositoryConfig {
+            path: repo.clone(),
+            label: None,
+            worktree_root: None,
+            github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
+        };
+        repository.github_remotes.insert(
+            "origin".into(),
+            GitHubRepositoryIdentity::canonical("github.com", "team", "project"),
+        );
+        let catalog = Catalog {
+            repositories: vec![repository],
+            ..Catalog::default()
+        };
+        let catalog_path = root.join("wt.json");
+        config::save(&catalog_path, &catalog).unwrap();
+        let views = load_repository_views(&catalog, &current);
+        let mut app = App::new(views, current);
+        app.selected = Some(RowId::Worktree(topic.clone()));
+        app.statuses
+            .insert(topic.clone(), StatusState::Ready(WorktreeStatus::default()));
+        if case != "nonactive" {
+            assert!(app.is_current_worktree(&topic));
+        }
+        if matches!(
+            case.as_str(),
+            "stack" | "missing-parent" | "deleting-parent"
+        ) {
+            let mut parent_pr = test_authored_pull_request("viewer").pull_request;
+            parent_pr.number = 1;
+            parent_pr.head.repository = Some("team/project".into());
+            parent_pr.head.branch = "parent".into();
+            let mut child_pr = parent_pr.clone();
+            child_pr.number = 2;
+            child_pr.base = parent_pr.head.clone();
+            child_pr.head.branch = "topic".into();
+            for (path, pr) in [(&parent, parent_pr), (&topic, child_pr)] {
+                app.github.insert(
+                    path.clone(),
+                    GitHubState::Ready(GitHubBranchData {
+                        pull_request: Some(pr),
+                        warnings: Vec::new(),
+                        rate_limit: None,
+                    }),
+                );
+            }
+        }
+        let mut controller = Controller::new(catalog_path, catalog, app);
+        controller.discover_authored_pull_requests = false;
+        assert!(controller.app.action_availability(Action::Remove).enabled);
+        controller.begin_action(Action::Remove).unwrap();
+        assert!(matches!(
+            controller.app.modal,
+            Some(Modal::Confirm {
+                action: Action::Remove,
+                ..
+            })
+        ));
+        assert_eq!(env::current_dir().unwrap(), original_cwd);
+        assert!(controller.deletions.is_empty());
+
+        if case == "cancel" {
+            let intent = controller
+                .app
+                .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            controller.handle_intent(intent).unwrap();
+            assert!(topic.exists());
+            assert!(controller.deletions.is_empty());
+            assert_eq!(env::current_dir().unwrap(), original_cwd);
+            assert!(matches!(
+                controller.handle_intent(Intent::Cancel).unwrap(),
+                ControlFlow::Exit(None)
+            ));
+            env::set_current_dir(&root).unwrap();
+            return;
+        }
+        // Changes made after preview must still be rejected before relocation.
+        if case == "dirty" {
+            std::fs::write(topic.join("untracked"), "change").unwrap();
+        }
+        if case == "locked" {
+            run_git_command(&repo, &["worktree", "lock", topic.to_str().unwrap()]);
+        }
+        if case == "missing-parent" {
+            std::fs::remove_dir_all(&parent).unwrap();
+        }
+        if case == "deleting-parent" {
+            controller.app.deleting.insert(parent.clone());
+        }
+        if case == "inside" {
+            let home = PathBuf::from(env::var_os("HOME").unwrap());
+            std::fs::remove_dir(&home).unwrap();
+            symlink(&nested, &home).unwrap();
+        }
+        let result = controller.handle_intent(Intent::ConfirmAction(Action::Remove));
+        if matches!(case.as_str(), "unavailable" | "inside" | "dirty" | "locked") {
+            assert!(result.is_err());
+            assert!(topic.exists());
+            assert!(controller.deletions.is_empty());
+            assert_eq!(env::current_dir().unwrap(), original_cwd);
+            assert!(controller.relocation_destination.is_none());
+            assert!(!Path::new(&env::var_os("WT_DELETION_CWD_LOG").unwrap()).exists());
+            env::set_current_dir(&root).unwrap();
+            return;
+        }
+        result.unwrap();
+        let expected = match case.as_str() {
+            "stack" => parent.clone(),
+            "nonactive" => repo.clone(),
+            _ => std::fs::canonicalize(env::var_os("HOME").unwrap()).unwrap(),
+        };
+        assert_eq!(env::current_dir().unwrap(), expected);
+        assert_eq!(
+            std::fs::canonicalize(&controller.app.current_directory).unwrap(),
+            expected
+        );
+        if case == "stack" {
+            assert!(controller.app.is_current_worktree(&parent));
+        }
+        drain_deletions(&mut controller);
+        assert!(!topic.exists(), "{:?}", controller.app.inline_error);
+        let logged = std::fs::read_to_string(env::var_os("WT_DELETION_CWD_LOG").unwrap()).unwrap();
+        assert_eq!(
+            logged.trim(),
+            expected.to_str().unwrap(),
+            "cwd when Git removal began"
+        );
+        match controller.handle_intent(Intent::Cancel).unwrap() {
+            ControlFlow::Exit(destination) => {
+                assert_eq!(destination, (case != "nonactive").then_some(expected))
+            }
+            _ => panic!("cancel must exit"),
+        }
+        if case == "stack" {
+            // Deleting the new active parent updates the remembered fallback again.
+            controller
+                .start_worktree_deletion(&repo, parent.clone())
+                .unwrap();
+            let home = std::fs::canonicalize(env::var_os("HOME").unwrap()).unwrap();
+            assert_eq!(env::current_dir().unwrap(), home);
+            drain_deletions(&mut controller);
+            assert!(!parent.exists());
+            assert!(
+                matches!(controller.handle_intent(Intent::Cancel).unwrap(), ControlFlow::Exit(Some(path)) if path == home)
+            );
+        }
+        assert!(
+            matches!(controller.handle_intent(Intent::Accept(repo.clone())).unwrap(), ControlFlow::Exit(Some(path)) if path == repo)
+        );
+        env::set_current_dir(&root).unwrap();
     }
 
     fn deletion_controller(directory: &std::path::Path) -> Controller {

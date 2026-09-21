@@ -577,6 +577,55 @@ impl App {
         self.current_worktree.as_deref() == Some(path)
     }
 
+    pub(crate) fn set_current_directory(&mut self, directory: PathBuf) {
+        self.current_directory = directory;
+        self.refresh_current_worktree();
+    }
+
+    /// Concrete ancestors in nearest-first order, independent of visible rows.
+    pub(crate) fn worktree_ancestors(&self, path: &Path) -> Vec<PathBuf> {
+        let Some(repository_index) = self.repositories.iter().position(|repository| {
+            repository
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == path)
+        }) else {
+            return Vec::new();
+        };
+        let repository = &self.repositories[repository_index];
+        let virtual_indexes = self
+            .virtual_repositories
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                candidate.mapped_repository.as_ref() == Some(&repository.config.path)
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let forest = self.branch_forest(Some(repository_index), &virtual_indexes);
+        let mut parent = forest
+            .nodes
+            .iter()
+            .find(|node| node.id == BranchId::Worktree(path.to_owned()))
+            .and_then(|node| node.parent);
+        let mut ancestors = Vec::new();
+        while let Some(index) = parent {
+            let node = &forest.nodes[index];
+            if let BranchSource::Worktree {
+                repository_index,
+                worktree_index,
+            } = node.source
+            {
+                let worktree = &self.repositories[repository_index].worktrees[worktree_index];
+                if worktree.navigable() && !self.is_deleting(&worktree.path) {
+                    ancestors.push(worktree.path.clone());
+                }
+            }
+            parent = node.parent;
+        }
+        ancestors
+    }
+
     fn refresh_current_worktree(&mut self) {
         let candidate = canonical_path_or_owned(&self.current_directory);
         self.current_worktree = self
@@ -2822,13 +2871,7 @@ impl App {
                         Some(StatusState::Ready(status)) if status.is_dirty() => {
                             disabled("worktree has local changes")
                         }
-                        Some(StatusState::Ready(_)) => {
-                            if self.is_current_worktree(&worktree.path) {
-                                disabled("worktree contains the current directory")
-                            } else {
-                                enabled()
-                            }
-                        }
+                        Some(StatusState::Ready(_)) => enabled(),
                         Some(StatusState::Error(_)) => disabled("worktree status is unavailable"),
                         _ => disabled("worktree status is still loading"),
                     },
@@ -8051,6 +8094,99 @@ mod tests {
             }),
         );
         assert!(!app.action_availability(Action::Remove).enabled);
+    }
+
+    #[test]
+    fn active_worktree_removal_retains_other_guards() {
+        let topic = PathBuf::from("/repo-topic");
+        let mut app = App::new(vec![repository("/repo", true)], topic.join("nested"));
+        app.selected = Some(RowId::Worktree(topic.clone()));
+        assert!(app.is_current_worktree(&topic));
+        assert!(!app.action_availability(Action::Remove).enabled);
+        app.statuses
+            .insert(topic.clone(), StatusState::Ready(WorktreeStatus::default()));
+        assert!(app.action_availability(Action::Remove).enabled);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('d'))),
+            Intent::BeginAction(Action::Remove)
+        );
+        app.repositories[0].worktrees[1].locked = Some("busy".into());
+        assert!(!app.action_availability(Action::Remove).enabled);
+        app.repositories[0].worktrees[1].locked = None;
+        app.statuses.insert(
+            topic.clone(),
+            StatusState::Ready(WorktreeStatus {
+                untracked: 1,
+                ..WorktreeStatus::default()
+            }),
+        );
+        assert!(!app.action_availability(Action::Remove).enabled);
+        app.statuses
+            .insert(topic.clone(), StatusState::Error("unavailable".into()));
+        assert!(!app.action_availability(Action::Remove).enabled);
+        app.selected = Some(RowId::Worktree(PathBuf::from("/repo")));
+        app.statuses.insert(
+            PathBuf::from("/repo"),
+            StatusState::Ready(WorktreeStatus::default()),
+        );
+        assert!(!app.action_availability(Action::Remove).enabled);
+    }
+
+    #[test]
+    fn relocation_ancestors_follow_the_stack_through_hidden_and_virtual_nodes() {
+        let mut grandparent = authored("team", "project", 1, "1");
+        grandparent.pull_request.head.repository = Some("team/project".into());
+        let mut parent = authored("team", "project", 2, "2");
+        parent.pull_request.head.repository = Some("team/project".into());
+        parent.pull_request.base = grandparent.pull_request.head.clone();
+        let mut child = authored("team", "project", 3, "3");
+        child.pull_request.base = parent.pull_request.head.clone();
+        let mut repo = repository("/repo", false);
+        repo.config
+            .github_remotes
+            .insert("origin".into(), child.identity.repository.clone());
+        let root = repo.worktrees[0].path.clone();
+        let topic = repo.worktrees[1].path.clone();
+        let mut app = App::new(vec![repo], topic.clone());
+        for (path, pr) in [(&root, &grandparent), (&topic, &child)] {
+            app.github.insert(
+                path.clone(),
+                GitHubState::Ready(GitHubBranchData {
+                    pull_request: Some(pr.pull_request.clone()),
+                    warnings: Vec::new(),
+                    rate_limit: None,
+                }),
+            );
+        }
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: parent.identity.repository.clone(),
+            mapped_repository: Some(PathBuf::from("/repo")),
+            expanded: false,
+            pull_requests: vec![parent.clone()],
+        }];
+        app.set_committed_filter("no matching rows");
+        assert_eq!(app.worktree_ancestors(&topic), vec![root.clone()]);
+        let parent_path = PathBuf::from("/repo-parent");
+        app.repositories[0]
+            .worktrees
+            .push(worktree("/repo-parent", "parent", false));
+        app.github.insert(
+            parent_path.clone(),
+            GitHubState::Ready(GitHubBranchData {
+                pull_request: Some(parent.pull_request.clone()),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+        assert_eq!(
+            app.worktree_ancestors(&topic),
+            vec![parent_path.clone(), root.clone()]
+        );
+        app.deleting.insert(parent_path);
+        assert_eq!(app.worktree_ancestors(&topic), vec![root.clone()]);
+        app.deleting.insert(root);
+        assert!(app.worktree_ancestors(&topic).is_empty());
+        assert!(app.worktree_ancestors(Path::new("/unknown")).is_empty());
     }
 
     #[test]
