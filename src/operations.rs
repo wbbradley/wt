@@ -134,11 +134,15 @@ pub fn pull_request_destination(
 ) -> PathBuf {
     match repository.worktree_root.as_deref() {
         Some(root) => root.join(sanitize_name(local_branch)),
-        None => repository_root.join(format!(
-            "{}-pr-{}",
-            sanitize_name(&identity.repository.repository),
-            identity.number
-        )),
+        None => repository
+            .path
+            .parent()
+            .unwrap_or(repository_root)
+            .join(format!(
+                "{}-pr-{}",
+                sanitize_name(&identity.repository.repository),
+                identity.number
+            )),
     }
 }
 
@@ -845,6 +849,7 @@ mod tests {
             PathBuf::from("/trees/feature-a-thing")
         );
         repository.worktree_root = None;
+        repository.path = PathBuf::from("/nw/project");
         assert_eq!(
             pull_request_destination(
                 &repository,
@@ -852,7 +857,7 @@ mod tests {
                 &identity,
                 "ignored"
             ),
-            PathBuf::from("/repositories/project-pr-42")
+            PathBuf::from("/nw/project-pr-42")
         );
     }
 

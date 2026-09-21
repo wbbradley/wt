@@ -1060,17 +1060,19 @@ mod tests {
         );
         let repository = fixture.base_repository(false);
         let authored = fixture.authored(42, "feature/topic", "unconfigured/project");
+        let bootstrap_root = fixture.repository_root.join("elsewhere");
 
         let materialized = materialize_pull_request(
             &SystemGit,
             &SystemFetchRunner,
             &repository,
-            &fixture.repository_root,
+            &bootstrap_root,
             &authored,
             None,
         )
         .unwrap();
         assert_eq!(materialized.branch, "pr/42-feature-topic");
+        assert!(!bootstrap_root.exists());
         assert_eq!(
             materialized.path,
             fs::canonicalize(fixture.repository_root.join("project-pr-42")).unwrap()
