@@ -5,6 +5,7 @@ mod background;
 mod bootstrap;
 mod cache;
 mod cli;
+mod clipboard;
 mod config;
 mod git;
 mod github;

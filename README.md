@@ -150,6 +150,8 @@ For `c`, a check or comment row is exact, including an individually selected pas
 
 For `p`, a leaf or non-stacking section selects its owning PR and container scopes mirror `c`. Leading conventional-commit prefixes are removed and drafts end in ` - DRAFT`. A truly empty scope reports `p: no PR under selection` without changing the clipboard.
 
+Clipboard copies run in the background and time out after five seconds if the clipboard command stalls. Navigation and quitting remain available; additional `c` or `p` presses are ignored while a copy is pending.
+
 ```text
 In feature/login (#42 Fix login race):
 

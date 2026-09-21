@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ use crate::background::{
 };
 use crate::bootstrap;
 use crate::cache;
+use crate::clipboard::{Clipboard, SystemClipboard};
 use crate::config;
 use crate::git::{self, SystemGit};
 use crate::github::{
@@ -301,44 +302,6 @@ trait UrlOpener: Send + Sync {
     fn open(&self, url: &str) -> Result<(), String>;
 }
 
-trait Clipboard: Send + Sync {
-    fn copy(&self, contents: &str) -> Result<(), String>;
-}
-
-struct SystemClipboard;
-
-impl Clipboard for SystemClipboard {
-    fn copy(&self, contents: &str) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        let mut child = Command::new("pbcopy");
-        #[cfg(target_os = "windows")]
-        let mut child = {
-            let mut command = Command::new("clip");
-            command
-        };
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let mut child = Command::new("wl-copy");
-        let mut child = child
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("cannot launch clipboard command: {error}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| "clipboard command has no stdin".to_owned())?
-            .write_all(contents.as_bytes())
-            .map_err(|error| format!("cannot write clipboard contents: {error}"))?;
-        let status = child
-            .wait()
-            .map_err(|error| format!("cannot wait for clipboard command: {error}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("clipboard command exited with {status}"))
-        }
-    }
-}
-
 struct SystemUrlOpener;
 
 impl UrlOpener for SystemUrlOpener {
@@ -375,6 +338,13 @@ struct Deletion {
     detail: Option<String>,
 }
 
+struct ClipboardCopy {
+    job: BackgroundJob<()>,
+    success_message: &'static str,
+    error_prefix: &'static str,
+    show_feedback: bool,
+}
+
 struct Controller {
     catalog_path: PathBuf,
     remote_cache_path: PathBuf,
@@ -409,6 +379,7 @@ struct Controller {
     relocation_destination: Option<PathBuf>,
     url_opener: Arc<dyn UrlOpener>,
     clipboard: Arc<dyn Clipboard>,
+    clipboard_copy: Option<ClipboardCopy>,
     state_path: PathBuf,
     pending_focus: Option<PersistentFocusTarget>,
 }
@@ -462,6 +433,7 @@ impl Controller {
             relocation_destination: None,
             url_opener: Arc::new(SystemUrlOpener),
             clipboard: Arc::new(SystemClipboard),
+            clipboard_copy: None,
             state_path,
             pending_focus,
         };
@@ -565,6 +537,17 @@ impl Controller {
     }
 
     fn handle_intent(&mut self, intent: Intent) -> Result<ControlFlow, TuiError> {
+        if !matches!(
+            intent,
+            Intent::None | Intent::BeginAction(Action::CopyAgentPrompt | Action::CopyReviewRequest)
+        ) {
+            if let Some(copy) = &mut self.clipboard_copy {
+                copy.show_feedback = false;
+                if self.app.progress.as_deref() == Some("copying to clipboard…") {
+                    self.app.progress = None;
+                }
+            }
+        }
         if self.materialization_job.is_some() {
             return match intent {
                 Intent::None => Ok(ControlFlow::Continue),
@@ -670,7 +653,12 @@ impl Controller {
             return Ok(());
         }
         if matches!(action, Action::CopyAgentPrompt | Action::CopyReviewRequest) {
+            // Ignore repeated requests until the current copy is reaped.
+            if self.clipboard_copy.is_some() {
+                return Ok(());
+            }
             self.app.progress = None;
+            self.app.inline_error = None;
             let (contents, empty_message, success_message, error_prefix) = match action {
                 Action::CopyAgentPrompt => (
                     self.app.agent_prompt(),
@@ -687,8 +675,19 @@ impl Controller {
                 _ => unreachable!("copy actions checked above"),
             };
             if let Some(contents) = contents {
-                match self.clipboard.copy(&contents) {
-                    Ok(()) => self.app.progress = Some(success_message.to_owned()),
+                let clipboard = Arc::clone(&self.clipboard);
+                match BackgroundJob::spawn("wt-clipboard", move |context| {
+                    clipboard.copy(&contents, &context)
+                }) {
+                    Ok(job) => {
+                        self.clipboard_copy = Some(ClipboardCopy {
+                            job,
+                            success_message,
+                            error_prefix,
+                            show_feedback: true,
+                        });
+                        self.app.progress = Some("copying to clipboard…".to_owned());
+                    }
                     Err(error) => {
                         self.app.inline_error = Some(format!("{error_prefix}: {error}"));
                     }
@@ -1542,8 +1541,37 @@ impl Controller {
         });
     }
 
+    fn pump_clipboard(&mut self) -> bool {
+        let result = self
+            .clipboard_copy
+            .as_ref()
+            .and_then(|copy| copy.job.try_recv());
+        let Some(JobMessage::Finished(result)) = result else {
+            return false;
+        };
+        let copy = self.clipboard_copy.take().unwrap();
+        let owns_progress = self.app.progress.as_deref() == Some("copying to clipboard…");
+        if owns_progress {
+            self.app.progress = None;
+        }
+        if copy.show_feedback && owns_progress && self.app.inline_error.is_none() {
+            match result {
+                Ok(()) => self.app.progress = Some(copy.success_message.to_owned()),
+                Err(error) => {
+                    let message = match error {
+                        JobError::Failed(message) => message,
+                        JobError::Cancelled => "clipboard copy cancelled".to_owned(),
+                    };
+                    self.app.inline_error = Some(format!("{}: {message}", copy.error_prefix));
+                }
+            }
+        }
+        true
+    }
+
     fn pump_background_results(&mut self) -> bool {
-        let mut changed = self.pump_local_refresh();
+        let mut changed = self.pump_clipboard();
+        changed |= self.pump_local_refresh();
         self.submit_status_backlog();
         let mut refresh = false;
         while let Some(result) = self.status_pool.try_recv() {
@@ -2397,7 +2425,11 @@ mod tests {
     }
 
     impl Clipboard for FakeClipboard {
-        fn copy(&self, contents: &str) -> Result<(), String> {
+        fn copy(
+            &self,
+            contents: &str,
+            _context: &crate::background::JobContext,
+        ) -> Result<(), String> {
             if let Some(error) = &self.error {
                 return Err(error.clone());
             }
@@ -2461,6 +2493,115 @@ mod tests {
         app
     }
 
+    fn finish_clipboard(controller: &mut Controller) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while controller.clipboard_copy.is_some() {
+            assert!(Instant::now() < deadline, "clipboard did not finish");
+            controller.pump_clipboard();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    struct WaitingClipboard {
+        calls: std::sync::atomic::AtomicUsize,
+        release: std::sync::atomic::AtomicBool,
+    }
+
+    impl Clipboard for WaitingClipboard {
+        fn copy(&self, _: &str, context: &crate::background::JobContext) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) && !context.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pending_clipboard_allows_navigation_rendering_and_quit_and_bounds_repeats() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        for action in [Action::CopyAgentPrompt, Action::CopyReviewRequest] {
+            let directory = tempfile::tempdir().unwrap();
+            let clipboard = Arc::new(WaitingClipboard {
+                calls: AtomicUsize::new(0),
+                release: AtomicBool::new(false),
+            });
+            let mut controller = Controller::with_clipboard(
+                directory.path().join("wt.json"),
+                Catalog::default(),
+                prompt_app(),
+                clipboard.clone(),
+            );
+            controller
+                .handle_intent(Intent::BeginAction(action))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while clipboard.calls.load(Ordering::SeqCst) == 0 {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            for _ in 0..20 {
+                controller
+                    .handle_intent(Intent::BeginAction(Action::CopyReviewRequest))
+                    .unwrap();
+            }
+            assert_eq!(clipboard.calls.load(Ordering::SeqCst), 1);
+            let previous = controller.app.selected.clone();
+            let intent = controller.app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            controller.handle_intent(intent).unwrap();
+            assert_ne!(controller.app.selected, previous);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| ui::render(frame, &mut controller.app))
+                .unwrap();
+            assert!(!controller.pump_clipboard());
+            assert!(matches!(
+                controller.handle_intent(Intent::Cancel).unwrap(),
+                ControlFlow::Exit(_)
+            ));
+            let started = Instant::now();
+            drop(controller);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn clipboard_completion_does_not_replace_newer_feedback() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let clipboard = Arc::new(WaitingClipboard {
+            calls: AtomicUsize::new(0),
+            release: AtomicBool::new(false),
+        });
+        let mut controller = Controller::with_clipboard(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            prompt_app(),
+            clipboard.clone(),
+        );
+        controller
+            .handle_intent(Intent::BeginAction(Action::CopyAgentPrompt))
+            .unwrap();
+        // A newer operation owns the feedback, even if its text later changes.
+        controller.url_opener = Arc::new(FakeUrlOpener {
+            opened: Mutex::new(Vec::new()),
+            error: None,
+        });
+        controller
+            .handle_intent(Intent::BeginAction(Action::OpenPullRequestWeb))
+            .unwrap();
+        controller.app.progress = Some("newer operation".to_owned());
+        clipboard.release.store(true, Ordering::SeqCst);
+        finish_clipboard(&mut controller);
+        assert_eq!(controller.app.progress.as_deref(), Some("newer operation"));
+        assert!(controller.clipboard_copy.is_none());
+    }
+
     #[test]
     fn injected_clipboard_handles_success_empty_scope_and_failure() {
         let directory = tempfile::tempdir().unwrap();
@@ -2477,6 +2618,7 @@ mod tests {
         controller
             .handle_intent(Intent::BeginAction(Action::CopyAgentPrompt))
             .unwrap();
+        finish_clipboard(&mut controller);
         assert_eq!(clipboard.copied.lock().unwrap().len(), 1);
         assert_eq!(
             controller.app.progress.as_deref(),
@@ -2485,6 +2627,7 @@ mod tests {
         controller
             .handle_intent(Intent::BeginAction(Action::CopyReviewRequest))
             .unwrap();
+        finish_clipboard(&mut controller);
         let copied = clipboard.copied.lock().unwrap();
         assert_eq!(copied.len(), 2);
         assert!(copied[1].contains("https://github.com/team/project/pull/42 - Fix CI"));
@@ -2498,6 +2641,7 @@ mod tests {
         controller
             .handle_intent(Intent::BeginAction(Action::CopyAgentPrompt))
             .unwrap();
+        finish_clipboard(&mut controller);
         assert_eq!(clipboard.copied.lock().unwrap().len(), 2);
         assert_eq!(
             controller.app.progress.as_deref(),
@@ -2506,6 +2650,7 @@ mod tests {
         controller
             .handle_intent(Intent::BeginAction(Action::CopyReviewRequest))
             .unwrap();
+        finish_clipboard(&mut controller);
         assert_eq!(clipboard.copied.lock().unwrap().len(), 2);
         assert_eq!(
             controller.app.progress.as_deref(),
@@ -2520,6 +2665,7 @@ mod tests {
         controller
             .handle_intent(Intent::BeginAction(Action::CopyAgentPrompt))
             .unwrap();
+        finish_clipboard(&mut controller);
         assert!(
             controller
                 .app
@@ -2530,6 +2676,7 @@ mod tests {
         controller
             .handle_intent(Intent::BeginAction(Action::CopyReviewRequest))
             .unwrap();
+        finish_clipboard(&mut controller);
         assert_eq!(
             controller.app.inline_error.as_deref(),
             Some("p: clipboard error: clipboard unavailable")
