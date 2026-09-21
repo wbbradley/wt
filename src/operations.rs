@@ -475,26 +475,6 @@ pub fn remove(
     Ok(details)
 }
 
-pub fn remove_current(
-    runner: &dyn GitRunner,
-    repository: &RepositoryConfig,
-    selector: &str,
-    current_directory: &Path,
-) -> Result<WorktreeDetails, OperationError> {
-    let details =
-        removal_preview_with_current(runner, repository, selector, current_directory, false, true)?;
-    git::run_git(
-        runner,
-        &repository.path,
-        &[
-            OsString::from("worktree"),
-            OsString::from("remove"),
-            details.worktree.path.as_os_str().to_owned(),
-        ],
-    )?;
-    Ok(details)
-}
-
 pub fn force_remove(
     runner: &dyn GitRunner,
     repository: &RepositoryConfig,

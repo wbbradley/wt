@@ -179,6 +179,20 @@ pub fn run() -> Result<Option<PathBuf>, TuiError> {
 }
 
 pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError> {
+    run_with_startup_deletion(initial_filter, None)
+}
+
+pub fn run_with_deletion(
+    repository: &Path,
+    worktree: PathBuf,
+) -> Result<Option<PathBuf>, TuiError> {
+    run_with_startup_deletion("", Some((repository, worktree)))
+}
+
+fn run_with_startup_deletion(
+    initial_filter: &str,
+    deletion: Option<(&Path, PathBuf)>,
+) -> Result<Option<PathBuf>, TuiError> {
     let catalog_path = config::catalog_path()?;
     let catalog = config::load(&catalog_path)?;
     let current_directory = env::current_dir().map_err(TuiError::CurrentDirectory)?;
@@ -189,6 +203,9 @@ pub fn run_with_filter(initial_filter: &str) -> Result<Option<PathBuf>, TuiError
     controller.load_remote_cache();
     let _panic_hook = PanicHookGuard::install();
     let mut terminal = InteractiveTerminal::open()?;
+    if let Some((repository, worktree)) = deletion {
+        controller.start_worktree_deletion(repository, worktree)?;
+    }
 
     // The first frame contains only catalog and worktree-list data. Slow status
     // work starts only after that frame is visible.
@@ -3715,6 +3732,68 @@ mod tests {
             controller.pump_deletions();
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn startup_deletion_renders_dimmed_italic_row_until_completion() {
+        use ratatui::{Terminal, backend::TestBackend, style::Modifier};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let repo = root.join("project");
+        let topic = root.join("topic");
+        run_git_command(&root, &["init", "-b", "main", repo.to_str().unwrap()]);
+        run_git_command(&repo, &["config", "user.email", "test@example.com"]);
+        run_git_command(&repo, &["config", "user.name", "Test User"]);
+        run_git_command(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+        run_git_command(
+            &repo,
+            &["worktree", "add", "-b", "topic", topic.to_str().unwrap()],
+        );
+        let catalog = Catalog {
+            repositories: vec![RepositoryConfig {
+                path: repo.clone(),
+                label: None,
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            }],
+            ..Catalog::default()
+        };
+        let catalog_path = root.join("wt.json");
+        config::save(&catalog_path, &catalog).unwrap();
+        // Startup has already relocated to the anchor, but loads the listing
+        // before starting deletion so the first frame retains the target row.
+        let app = App::new(load_repository_views(&catalog, &repo), repo.clone());
+        let mut controller = Controller::new(catalog_path, catalog, app);
+        controller.discover_authored_pull_requests = false;
+        controller
+            .start_worktree_deletion(&repo, topic.clone())
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal
+            .draw(|frame| ui::render(frame, &mut controller.app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = (0..buffer.area.height)
+            .find(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, *y)].symbol())
+                    .collect::<String>()
+                    .contains("deleting")
+            })
+            .expect("startup frame shows deletion");
+        assert!((0..buffer.area.width).any(|x| {
+            let cell = &buffer[(x, row)];
+            cell.symbol().trim().len() > 0
+                && cell.modifier.contains(Modifier::DIM | Modifier::ITALIC)
+        }));
+        assert!(controller.app.is_deleting(&topic));
+        drain_deletions(&mut controller);
+        assert!(!topic.exists(), "{:?}", controller.app.inline_error);
+        assert!(!controller.app.is_deleting(&topic));
+        assert!(controller.app.inline_error.is_none());
     }
 
     #[test]

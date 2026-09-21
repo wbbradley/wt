@@ -76,7 +76,7 @@ wt repo list
 
 Running `wt` opens the global TUI. Running it inside an unregistered Git repository also shows that repository as session-only; press `a` to register it. An empty catalog displays onboarding instructions.
 
-Run `wt -x` from a linked worktree when you are finished with it. `wt` safely removes the containing worktree only when it is clean and unlocked, relocates to the registered repository anchor (or `$HOME` if the anchor is unavailable), and then opens the TUI normally. The main worktree and bare anchors remain protected. If the TUI is cancelled after a successful cleanup, the shell still moves to that fallback directory.
+Run `wt -x` from a linked worktree when you are finished with it. `wt` checks that the containing worktree is clean and unlocked, relocates to the registered repository anchor (or `$HOME` if the anchor is unavailable), and opens the TUI while removing the worktree in the background. The row stays dimmed and italicized with a `deleting` label until removal finishes. The main worktree and bare anchors remain protected. If the TUI is cancelled after a successful cleanup, the shell still moves to that fallback directory.
 
 ## Shell navigation and completion
 

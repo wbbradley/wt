@@ -331,19 +331,20 @@ pub fn run(cli: Cli) -> Result<Option<PathBuf>, CliError> {
         };
     }
     if cli.command.is_none() {
-        let cleanup_destination = if cli.cleanup {
+        if cli.cleanup {
             let path = config::catalog_path()?;
             let catalog = config::load(&path)?;
             let current = env::current_dir().map_err(CliError::CurrentDirectory)?;
-            let cleanup = cleanup_current_worktree(&SystemGit, &catalog, &current)?;
-            let destination = relocate_after_cleanup(&cleanup.destination, &cleanup.removed)?;
-            eprintln!("removed\t{}", cleanup.removed.display());
-            Some(destination)
-        } else {
-            None
-        };
-        return Ok(tui::run()?.or(cleanup_destination));
+            let cleanup = prepare_current_worktree_cleanup(&SystemGit, &catalog, &current)?;
+            let destination = relocate_for_cleanup(&cleanup.destination, &cleanup.worktree)?;
+            return Ok(
+                tui::run_with_deletion(&cleanup.repository, cleanup.worktree)?
+                    .or(Some(destination)),
+            );
+        }
+        return Ok(tui::run()?);
     }
+
     if let Some(Command::ShellInit { shell }) = cli.command.as_ref() {
         let script = match shell {
             SupportedShell::Bash => BASH_SHELL_INIT,
@@ -454,16 +455,17 @@ fn resolve_navigation(
     }
 }
 
-struct CleanupOutcome {
-    removed: PathBuf,
+struct CleanupPlan {
+    repository: PathBuf,
+    worktree: PathBuf,
     destination: PathBuf,
 }
 
-fn cleanup_current_worktree(
+fn prepare_current_worktree_cleanup(
     runner: &dyn GitRunner,
     catalog: &Catalog,
     current_directory: &Path,
-) -> Result<CleanupOutcome, CliError> {
+) -> Result<CleanupPlan, CliError> {
     let current = fs::canonicalize(current_directory).unwrap_or_else(|_| current_directory.into());
     let mut containing = Vec::new();
     for repository in &catalog.repositories {
@@ -488,14 +490,15 @@ fn cleanup_current_worktree(
         .max_by_key(|(_, worktree)| worktree.path.components().count())
         .ok_or(CliError::CurrentWorktreeNotFound)?;
     let destination = cleanup_destination(&repository, &worktree.path)?;
-    let details = operations::remove_current(
+    let details = operations::current_removal_preview(
         runner,
         &repository,
         &worktree.path.to_string_lossy(),
         &current,
     )?;
-    Ok(CleanupOutcome {
-        removed: details.worktree.path,
+    Ok(CleanupPlan {
+        repository: repository.path,
+        worktree: details.worktree.path,
         destination,
     })
 }
@@ -516,7 +519,7 @@ fn cleanup_destination(
         .ok_or(CliError::CleanupDestinationUnavailable)
 }
 
-fn relocate_after_cleanup(preferred: &Path, removed_worktree: &Path) -> Result<PathBuf, CliError> {
+fn relocate_for_cleanup(preferred: &Path, removed_worktree: &Path) -> Result<PathBuf, CliError> {
     let mut candidates = vec![preferred.to_owned()];
     if let Some(home) = env::var_os("HOME").map(PathBuf::from)
         && !home.starts_with(removed_worktree)
@@ -1362,7 +1365,7 @@ mod tests {
     use std::process::Command as ProcessCommand;
 
     #[test]
-    fn cleanup_flag_removes_containing_clean_linked_worktree() {
+    fn cleanup_flag_prepares_containing_worktree_without_removing_it() {
         let directory = tempfile::tempdir().unwrap();
         let repository_path = directory.path().join("repository");
         let worktree_path = directory.path().join("topic");
@@ -1395,16 +1398,20 @@ mod tests {
             ..Catalog::default()
         };
 
-        let outcome = cleanup_current_worktree(&SystemGit, &catalog, &nested).unwrap();
+        let outcome = prepare_current_worktree_cleanup(&SystemGit, &catalog, &nested).unwrap();
 
-        assert_eq!(outcome.removed, canonical_worktree);
+        assert_eq!(outcome.worktree, canonical_worktree);
         assert_eq!(
             outcome.destination,
             fs::canonicalize(repository_path).unwrap()
         );
-        assert!(!outcome.removed.exists());
+        assert!(outcome.worktree.exists());
         let remaining = git::discover_worktrees(&SystemGit, &catalog.repositories[0].path).unwrap();
-        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.len(), 2);
+
+        fs::write(worktree_path.join("untracked"), "dirty").unwrap();
+        assert!(prepare_current_worktree_cleanup(&SystemGit, &catalog, &nested).is_err());
+        assert!(worktree_path.exists());
     }
 
     #[test]
