@@ -121,6 +121,20 @@ fn exec_configured(_value: &str, _path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn editor_argument_preserves_non_utf8_filename_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(OsString::from_vec(b"raw\xff\nfile".to_vec()));
+        std::fs::write(&path, "").unwrap();
+        let cmd = command("editor", &path).unwrap();
+        assert_eq!(cmd.get_args().next(), Some(path.as_os_str()));
+    }
+
     #[test]
     fn quoted_editor_arguments_are_literal() {
         assert_eq!(

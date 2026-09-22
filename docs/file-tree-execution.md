@@ -1,16 +1,18 @@
-# Untracked file tree implementation
+# Configured ignored file tree implementation
 
-Work on main as requested. Preserve the original PLAN.md entries in COMPLETED.md upon completion.
+Work on main. The untracked-file task is committed and its original plan entry is archived in the locally ignored COMPLETED.md.
 
-- Extend src/model.rs WorktreeStatus with raw PathBuf untracked paths; src/git.rs requests all files and parses NUL-separated raw bytes. Add parser and real repository discovery tests, including status.showUntrackedFiles=no, ignored files and non-UTF-8 names.
-- Reuse VisibleRow::Inline in src/app.rs with an UntrackedFiles section and distinct File row identity carrying owner, section and relative PathBuf. Add children before PR details so singleton and ordinary local trees share the implementation. Default expansion, navigation, refresh reconciliation and file Enter intent must use existing disclosure and fallback mechanisms.
-- Render file labels plainly in src/ui.rs; test flattened nesting and section appearance.
-- Add src/editor.rs for quoted EDITOR argument parsing and Unix exec with all three streams attached to /dev/tty. Add module in src/main.rs and distinct control flow in src/tui.rs; explicitly restore TerminalGuard before exec. Missing files/configuration and exec failures return clear errors without directory output.
-- Update README.md tree, keyboard and editor documentation.
-- Add focused unit tests and PTY subprocess coverage for safe arguments, terminal restoration, exec failure and captured stdout compatibility.
-- Risks: full untracked discovery costs more on large directories; lossy labels must never become opening paths; exec bypasses destructors; tests must not mutate shared process environment.
+- src/model.rs: add default-empty catalog ignored_files (Vec<PathBuf>) and independent status ignored_paths.
+- src/config.rs: normalize literal relative paths at load/save, reject empty/root/parent components, deduplicate while preserving order. Test defaults, invalid input and round trips.
+- src/git.rs: expose exit codes on runner output to distinguish check-ignore no-match from errors. Stat configured candidates first; skip missing/broken links/directories, accept links to regular files, surface other errors. Run check-ignore -z --stdin with NUL-delimited input/output for surviving candidates only, preserving raw output paths. Add real repository tests for ignored parents, negations, tracked files, info/global excludes, literal special names and symlinks; fake runner tests prove filtering and no-command behavior.
+- src/background.rs: carry ignored_files in each StatusTask and loader; status and ignore classification stay on workers.
+- src/tui.rs: snapshot configuration into status tasks; invalidate old generations and clear stale ignored lists on configuration replacement before old results can apply. Test reload and queued results.
+- src/app.rs and src/ui.rs: reuse shared file rows, add distinct IgnoredFiles section; default expand, preserve folds, reconcile removal, reuse editor intent. Test coexistence, singleton/bare/virtual visibility, dirty counts and editor path.
+- tests/editor_pty.rs: exercise ignored files through the same real editor handoff and disappearance failure path.
+- README.md: document JSON setting, literal file paths, validation, filesystem-first filtering, Git rules, visibility and refresh.
+- Risks: symlink checks must classify the configured link path; deleted files can race every check and must produce safe errors; generation invalidation must not reset unrelated selection or folds.
 
-Verification: cargo fmt --check; cargo clippy --all-targets --all-features -- -D warnings; cargo test. Commit implementation using Conventional Commits, then remove the completed entry and append its verbatim original with an implementation summary to COMPLETED.md.
+Verification: cargo fmt --check; cargo clippy --all-targets --all-features -- -D warnings; cargo test. Commit implementation, archive the verbatim original plan entry and remove it from PLAN.md. Plan files are ignored: do not stage them.
 
 ## Post-Plan Execution Steps
 
@@ -42,3 +44,16 @@ Read the plan file at `/home/wbbradley/src/wt/PLAN.md`. **Remove** the completed
 2. The full text of the plan entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
 
 If upcoming plan items need modifications due to a change during this implementation then update those. If new future work items were discovered, add them. If the plan file or completed file is outside the source repository or is ignored, do not try to stage it; otherwise commit it with the other changes.
+
+## Completion audit
+
+Both requested features are implemented. Evidence from the final code and tests:
+
+- Raw untracked discovery: git parser byte test and real-repository test cover root/nested files, ignored/tracked exclusion and overriding status.showUntrackedFiles.
+- Tree behavior: app tests cover ordinary/singleton worktrees, flat paths, default expansion, independent disclosure, refresh selection/fallback, empty/bare/virtual exclusion and identical editor intents. UI tests cover both section labels and literal file rows.
+- Editor handoff: editor argument tests preserve quoting and raw paths; Bash and Zsh PTY tests exercise the actual CLI, terminal restoration before exec, controlling-terminal streams, editor failure, vanished files and unchanged shell directory.
+- Ignored configuration: config tests cover defaults, rejection, normalization, deduplication, literal patterns and round trips.
+- Ignored discovery: fake-runner tests prove filesystem filtering and skipped Git calls; real Git tests cover tracked/negated/ordinary/missing/directory candidates, parent directory rules, info/global excludes, links, raw bytes and refresh changes. Counts and dirty state are independent of ignored paths.
+- Asynchronous refresh: status tasks carry the catalog setting; the controller reload test proves old generations cannot restore stale configured files and workers receive the replacement setting.
+- README documents both sections, editor behavior, literal configuration semantics and the filesystem/Git check order.
+- Verification: formatting and strict Clippy passed; full suite passed with 294 tests plus one existing release-mode latency benchmark marked ignored. One existing streaming-progress test timed out on an intermediate run, then passed in isolation and in the final full run.

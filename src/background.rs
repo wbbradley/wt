@@ -19,9 +19,11 @@ use crate::model::WorktreeStatus;
 pub struct StatusTask {
     pub generation: u64,
     pub path: PathBuf,
+    pub ignored_files: Vec<PathBuf>,
 }
 
-type StatusLoader = dyn Fn(&Path) -> Result<WorktreeStatus, String> + Send + Sync + 'static;
+type StatusLoader =
+    dyn Fn(&Path, &[PathBuf]) -> Result<WorktreeStatus, String> + Send + Sync + 'static;
 
 pub struct StatusPool {
     sender: Option<SyncSender<StatusTask>>,
@@ -33,7 +35,10 @@ impl StatusPool {
     pub fn with_git(worker_count: usize) -> Self {
         Self::new(
             worker_count,
-            Arc::new(|path| git::status(&SystemGit, path).map_err(|error| error.to_string())),
+            Arc::new(|path, configured| {
+                git::status_with_ignored(&SystemGit, path, configured)
+                    .map_err(|error| error.to_string())
+            }),
         )
     }
 
@@ -59,7 +64,7 @@ impl StatusPool {
                             let Ok(task) = task else {
                                 break;
                             };
-                            let result = loader(&task.path);
+                            let result = loader(&task.path, &task.ignored_files);
                             if sender
                                 .send(StatusUpdate {
                                     generation: task.generation,
@@ -438,6 +443,7 @@ impl git::GitRunner for CancellableGitRunner {
             stdout: output.stdout,
             stderr: output.stderr,
             success: output.success,
+            exit_code: None,
         })
     }
 }
@@ -482,7 +488,7 @@ mod tests {
         let loader = {
             let active = Arc::clone(&active);
             let maximum = Arc::clone(&maximum);
-            Arc::new(move |_path: &Path| {
+            Arc::new(move |_path: &Path, _configured: &[PathBuf]| {
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 maximum.fetch_max(now, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(5));
@@ -494,6 +500,7 @@ mod tests {
         let mut pending: Vec<StatusTask> = (0..8)
             .map(|index| StatusTask {
                 generation: 42,
+                ignored_files: Vec::new(),
                 path: PathBuf::from(format!("/{index}")),
             })
             .collect();

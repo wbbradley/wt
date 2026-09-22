@@ -38,6 +38,7 @@ pub enum InlineSection {
     OpenComments,
     StackedBranches,
     UntrackedFiles,
+    IgnoredFiles,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1723,35 +1724,46 @@ impl App {
         let Some(StatusState::Ready(status)) = self.statuses.get(&worktree.path) else {
             return;
         };
-        let paths = &status.untracked_paths;
-        if paths.is_empty() {
-            return;
-        }
-        let owner = BranchId::Worktree(worktree.path.clone());
-        let section = InlineSection::UntrackedFiles;
-        let expanded = self.inline_section_expanded(&owner, section);
-        rows.push(VisibleRow::Inline {
-            owner: owner.clone(),
-            section,
-            depth,
-            kind: InlineRowKind::Section,
-            text: "Untracked files".to_owned(),
-            url: None,
-            expanded: Some(expanded),
-            id: RowId::Section(owner.clone(), section),
-        });
-        if expanded {
-            for path in paths {
-                rows.push(VisibleRow::Inline {
-                    owner: owner.clone(),
-                    section,
-                    depth: depth + 1,
-                    kind: InlineRowKind::File,
-                    text: path.to_string_lossy().into_owned(),
-                    url: None,
-                    expanded: None,
-                    id: RowId::File(owner.clone(), section, path.clone()),
-                });
+        for (section, label, paths) in [
+            (
+                InlineSection::UntrackedFiles,
+                "Untracked files",
+                &status.untracked_paths,
+            ),
+            (
+                InlineSection::IgnoredFiles,
+                "Ignored files",
+                &status.ignored_paths,
+            ),
+        ] {
+            if paths.is_empty() {
+                continue;
+            }
+            let owner = BranchId::Worktree(worktree.path.clone());
+            let expanded = self.inline_section_expanded(&owner, section);
+            rows.push(VisibleRow::Inline {
+                owner: owner.clone(),
+                section,
+                depth,
+                kind: InlineRowKind::Section,
+                text: label.to_owned(),
+                url: None,
+                expanded: Some(expanded),
+                id: RowId::Section(owner.clone(), section),
+            });
+            if expanded {
+                for path in paths {
+                    rows.push(VisibleRow::Inline {
+                        owner: owner.clone(),
+                        section,
+                        depth: depth + 1,
+                        kind: InlineRowKind::File,
+                        text: path.to_string_lossy().into_owned(),
+                        url: None,
+                        expanded: None,
+                        id: RowId::File(owner.clone(), section, path.clone()),
+                    });
+                }
             }
         }
     }
@@ -2261,6 +2273,7 @@ impl App {
                 InlineSection::OpenComments
                     | InlineSection::StackedBranches
                     | InlineSection::UntrackedFiles
+                    | InlineSection::IgnoredFiles
             ),
         )
     }
@@ -2333,6 +2346,7 @@ impl App {
                     InlineSection::OpenComments
                         | InlineSection::StackedBranches
                         | InlineSection::UntrackedFiles
+                        | InlineSection::IgnoredFiles
                 ),
             })
     }
@@ -4062,14 +4076,11 @@ impl App {
             ),
             Some(VisibleRow::Inline {
                 owner,
-                section: InlineSection::UntrackedFiles,
+                section: section @ (InlineSection::UntrackedFiles | InlineSection::IgnoredFiles),
                 expanded: Some(expanded),
                 ..
             }) => {
-                self.set_disclosure_expanded(
-                    DisclosureKey::Section(owner, InlineSection::UntrackedFiles),
-                    !expanded,
-                );
+                self.set_disclosure_expanded(DisclosureKey::Section(owner, section), !expanded);
                 self.ensure_selection_visible();
                 Intent::None
             }
@@ -4834,6 +4845,121 @@ mod tests {
             bare,
             locked: None,
             prunable: None,
+        }
+    }
+
+    #[test]
+    fn virtual_worktrees_never_gain_file_sections() {
+        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
+        let pr = authored("team", "project", 1, "2026-01-01");
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: pr.identity.repository.clone(),
+            mapped_repository: None,
+            expanded: true,
+            pull_requests: vec![pr],
+        }];
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|row| matches!(row, VisibleRow::VirtualPullRequest { .. }))
+        );
+        assert!(!app.visible_rows().iter().any(|row| matches!(
+            row.id(),
+            RowId::Section(
+                _,
+                InlineSection::UntrackedFiles | InlineSection::IgnoredFiles
+            ) | RowId::File(..)
+        )));
+    }
+
+    #[test]
+    fn ignored_files_coexist_with_untracked_files_and_preserve_independent_folds() {
+        for singleton in [false, true] {
+            let mut repo = repository("/repo", true);
+            if singleton {
+                repo.worktrees.truncate(1);
+            }
+            let mut app = App::new(vec![repo], PathBuf::from("/repo"));
+            let root = PathBuf::from("/repo");
+            let owner = BranchId::Worktree(root.clone());
+            let ignored = InlineSection::IgnoredFiles;
+            let untracked = InlineSection::UntrackedFiles;
+            let paths = ["PLAN.md", "notes/a ;$(x)"].map(PathBuf::from).to_vec();
+            let update = |ignored_paths: Vec<PathBuf>| StatusUpdate {
+                generation: 0,
+                path: root.clone(),
+                result: Ok(WorktreeStatus {
+                    ignored_paths,
+                    untracked: 1,
+                    untracked_paths: vec![PathBuf::from("new")],
+                    ..Default::default()
+                }),
+            };
+            app.apply_status(update(paths.clone()));
+            let rows = app.visible_rows();
+            let files: Vec<_> = rows
+                .iter()
+                .filter(|row| matches!(row.id(), RowId::File(_, InlineSection::IgnoredFiles, _)))
+                .collect();
+            assert_eq!(files.len(), 2);
+            assert_eq!(
+                app.visible_row_depth(files[0]),
+                app.visible_row_depth(files[1])
+            );
+            app.selected = Some(RowId::File(owner.clone(), ignored, paths[1].clone()));
+            assert_eq!(
+                app.handle_key(key(KeyCode::Enter)),
+                Intent::EditFile(root.join(&paths[1]))
+            );
+            app.apply_status(update(paths.clone()));
+            assert_eq!(
+                app.selected,
+                Some(RowId::File(owner.clone(), ignored, paths[1].clone()))
+            );
+            app.selected = Some(RowId::Section(owner.clone(), ignored));
+            app.handle_key(key(KeyCode::Enter));
+            app.apply_status(update(paths.clone()));
+            assert!(
+                !app.visible_rows()
+                    .iter()
+                    .any(|row| matches!(row.id(), RowId::File(_, InlineSection::IgnoredFiles, _)))
+            );
+            assert!(
+                app.visible_rows().iter().any(|row| matches!(
+                    row.id(),
+                    RowId::File(_, InlineSection::UntrackedFiles, _)
+                ))
+            );
+            app.handle_key(key(KeyCode::Right));
+            app.selected = Some(RowId::File(owner.clone(), ignored, paths[0].clone()));
+            app.apply_status(update(vec![paths[1].clone()]));
+            assert_eq!(app.selected, Some(RowId::Section(owner.clone(), ignored)));
+            let unrelated = RowId::File(owner.clone(), untracked, PathBuf::from("new"));
+            app.selected = Some(unrelated.clone());
+            app.apply_status(update(vec![]));
+            assert_eq!(app.selected, Some(unrelated));
+            assert!(
+                !app.visible_rows()
+                    .iter()
+                    .any(|row| matches!(row.id(), RowId::Section(_, InlineSection::IgnoredFiles)))
+            );
+            let clean = WorktreeStatus {
+                ignored_paths: paths.clone(),
+                ..Default::default()
+            };
+            assert!(!clean.is_dirty());
+            assert_eq!(clean.untracked, 0);
+            app.apply_status(StatusUpdate {
+                generation: 0,
+                path: root,
+                result: Ok(clean),
+            });
+            app.repositories[0].worktrees[0].bare = true;
+            assert!(
+                !app.visible_rows()
+                    .iter()
+                    .any(|row| matches!(row.id(), RowId::File(..)))
+            );
         }
     }
 

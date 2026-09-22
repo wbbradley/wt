@@ -16,6 +16,8 @@ pub struct Catalog {
     pub repository_root: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub github_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored_files: Vec<PathBuf>,
     #[serde(default)]
     pub repositories: Vec<RepositoryConfig>,
 }
@@ -27,6 +29,7 @@ impl Default for Catalog {
             github_refresh_interval_secs: DEFAULT_GITHUB_REFRESH_INTERVAL_SECS,
             repository_root: None,
             github_hosts: Vec::new(),
+            ignored_files: Vec::new(),
             repositories: Vec::new(),
         }
     }
@@ -568,6 +571,7 @@ pub struct WorktreeStatus {
     pub unstaged: usize,
     pub untracked: usize,
     pub untracked_paths: Vec<PathBuf>,
+    pub ignored_paths: Vec<PathBuf>,
 }
 
 impl WorktreeStatus {

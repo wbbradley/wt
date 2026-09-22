@@ -10,24 +10,30 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn editor_exec_restores_terminal_and_keeps_shell_capture_empty() {
-    run_editor(Some("valid"), false);
+    run_editor(Some("valid"), false, false, false);
 }
 
 #[test]
 fn editor_failures_restore_terminal_without_directory_selection() {
     for editor in [None, Some("'unmatched"), Some("/no/such/editor")] {
-        run_editor(editor, false);
+        run_editor(editor, false, false, false);
     }
 }
 
 #[test]
 fn zsh_editor_handoff_keeps_directory_unchanged() {
-    if Command::new("zsh").arg("--version").output().is_ok() {
-        run_editor(Some("valid"), true);
+    run_editor(Some("valid"), true, false, false);
+}
+
+#[test]
+fn ignored_files_share_editor_handoff_and_handle_disappearance() {
+    for zsh in [false, true] {
+        run_editor(Some("valid"), zsh, true, false);
+        run_editor(Some("valid"), zsh, true, true);
     }
 }
 
-fn run_editor(editor: Option<&str>, zsh: bool) {
+fn run_editor(editor: Option<&str>, zsh: bool, ignored: bool, disappear: bool) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let repo = root.join("repo");
@@ -42,11 +48,15 @@ fn run_editor(editor: Option<&str>, zsh: bool) {
     );
     let name = "file ;$(touch BAD) 'quote'.txt";
     fs::write(repo.join(name), "hello").unwrap();
+    if ignored {
+        fs::write(repo.join(".git/info/exclude"), format!("{name}\n")).unwrap();
+    }
     let config = root.join("wt.json");
     fs::write(
         &config,
         serde_json::to_vec(&serde_json::json!({
-            "version": 1, "repositories": [{"path": repo}], "repository_root": root
+            "version": 1, "repositories": [{"path": repo}], "repository_root": root,
+            "ignored_files": if ignored { vec![name] } else { vec![] }
         }))
         .unwrap(),
     )
@@ -156,6 +166,9 @@ exit 0
             output.extend_from_slice(&buffer[..n]);
         }
         if !sent && String::from_utf8_lossy(&output).contains("quote'.txt") {
+            if disappear {
+                fs::remove_file(repo.join(name)).unwrap();
+            }
             master.write_all(b"G\r").unwrap();
             sent = true;
         }
@@ -163,7 +176,10 @@ exit 0
             break;
         }
         if Instant::now() > deadline {
-            child.kill().unwrap();
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            child.wait().unwrap();
             panic!(
                 "editor handoff timed out: {}",
                 String::from_utf8_lossy(&output)
@@ -179,7 +195,7 @@ exit 0
         .read_to_string(&mut stdout)
         .unwrap();
     assert!(sent);
-    let success = editor == Some("valid");
+    let success = editor == Some("valid") && !disappear;
     assert_eq!(
         stdout,
         format!(
@@ -214,6 +230,8 @@ exit 0
                 .split_whitespace()
                 .any(|word| word == "-icanon" || word == "-echo")
         );
+    } else if disappear {
+        assert!(terminal_output.contains("cannot open"));
     } else {
         assert!(terminal_output.contains("EDITOR"));
     }

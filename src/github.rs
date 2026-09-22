@@ -2378,6 +2378,7 @@ mod tests {
                     .unwrap_or_default(),
                 stderr: Vec::new(),
                 success: value.is_some(),
+                exit_code: None,
             })
         }
     }
@@ -3722,6 +3723,7 @@ mod tests {
                     stdout: value.map_or_else(Vec::new, |value| format!("{value}\n").into_bytes()),
                     stderr: Vec::new(),
                     success: value.is_some(),
+                    exit_code: None,
                 })
             }
         }

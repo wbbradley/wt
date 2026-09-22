@@ -1152,7 +1152,7 @@ impl Controller {
                     catalog.repositories.push(repository);
                     config::save(&self.catalog_path, &catalog)?;
                 }
-                self.catalog = catalog;
+                self.replace_catalog(catalog);
             }
             PendingAction::EditRepository {
                 repository,
@@ -1173,7 +1173,7 @@ impl Controller {
                 entry.worktree_root = worktree_root;
                 entry.github_remote = github_remote;
                 config::save(&self.catalog_path, &catalog)?;
-                self.catalog = catalog;
+                self.replace_catalog(catalog);
             }
             PendingAction::RemoveRepository { repository } => {
                 let _lock = config::acquire_catalog_lock(&self.catalog_path)?;
@@ -1186,7 +1186,7 @@ impl Controller {
                     return Err(TuiError::RepositoryGone);
                 }
                 config::save(&self.catalog_path, &catalog)?;
-                self.catalog = catalog;
+                self.replace_catalog(catalog);
             }
         }
         Ok(())
@@ -1261,8 +1261,21 @@ impl Controller {
         Ok(())
     }
 
+    fn replace_catalog(&mut self, catalog: Catalog) {
+        if self.catalog.ignored_files != catalog.ignored_files {
+            self.app.begin_status_refresh(&[], false);
+            self.status_backlog.clear();
+            for state in self.app.statuses.values_mut() {
+                if let crate::app::StatusState::Ready(status) = state {
+                    status.ignored_paths.clear();
+                }
+            }
+        }
+        self.catalog = catalog;
+    }
+
     fn apply_local_snapshot(&mut self, snapshot: LocalSnapshot) {
-        self.catalog = snapshot.catalog;
+        self.replace_catalog(snapshot.catalog);
         self.github_refresh_interval = github_refresh_interval(&self.catalog);
         self.app.replace_repositories(snapshot.repositories);
         let current_paths = self
@@ -1322,7 +1335,11 @@ impl Controller {
         let generation = self.app.begin_status_refresh(&paths, show_progress);
         self.status_backlog = paths
             .into_iter()
-            .map(|path| StatusTask { generation, path })
+            .map(|path| StatusTask {
+                generation,
+                path,
+                ignored_files: self.catalog.ignored_files.clone(),
+            })
             .collect();
         self.submit_status_backlog();
     }
@@ -2522,6 +2539,82 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn ignored_file_configuration_reload_invalidates_old_status_and_reaches_workers() {
+        use crate::app::{RowId, StatusState, StatusUpdate};
+        use crate::model::WorktreeStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git::run_git(&SystemGit, &root, &["init".into(), "-q".into()]).unwrap();
+        std::fs::write(root.join(".git/info/exclude"), "old\nnew\n").unwrap();
+        std::fs::write(root.join("old"), "").unwrap();
+        std::fs::write(root.join("new"), "").unwrap();
+        let config_path = dir.path().join("wt.json");
+        let mut catalog = Catalog {
+            ignored_files: vec![PathBuf::from("old")],
+            ..Default::default()
+        };
+        catalog.repositories.push(RepositoryConfig {
+            path: root.clone(),
+            label: None,
+            worktree_root: None,
+            github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
+        });
+        config::save(&config_path, &catalog).unwrap();
+        let app = App::new(
+            load_repository_views(&catalog, dir.path()),
+            dir.path().to_owned(),
+        );
+        let mut controller = Controller::new(config_path.clone(), catalog.clone(), app);
+        controller.app.statuses.insert(
+            root.clone(),
+            StatusState::Ready(WorktreeStatus {
+                ignored_paths: vec![PathBuf::from("old")],
+                ..Default::default()
+            }),
+        );
+        let old_generation = controller
+            .app
+            .begin_status_refresh(std::slice::from_ref(&root), false);
+        let selection = Some(RowId::Repository(root.clone()));
+        controller.app.selected = selection.clone();
+        catalog.ignored_files = vec![PathBuf::from("new")];
+        config::save(&config_path, &catalog).unwrap();
+        let snapshot = collect_local_snapshot(&config_path, dir.path()).unwrap();
+        controller.apply_local_snapshot(snapshot);
+        assert_eq!(controller.app.selected, selection);
+        let stale = StatusUpdate {
+            generation: old_generation,
+            path: root.clone(),
+            result: Ok(WorktreeStatus {
+                ignored_paths: vec![PathBuf::from("old")],
+                ..Default::default()
+            }),
+        };
+        controller.app.apply_status(stale);
+        assert!(
+            matches!(controller.app.statuses.get(&root), Some(StatusState::Ready(status)) if status.ignored_paths.is_empty())
+        );
+        controller.start_status_refresh(false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            controller.submit_status_backlog();
+            if let Some(update) = controller.status_pool.try_recv() {
+                controller.app.apply_status(update);
+                break;
+            }
+            assert!(Instant::now() < deadline, "status worker timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(controller.app.statuses.get(&root), Some(StatusState::Ready(status)) if status.ignored_paths == vec![PathBuf::from("new")] && !status.is_dirty())
+        );
+        assert_eq!(controller.app.selected, selection);
     }
 
     #[test]

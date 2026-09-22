@@ -939,6 +939,7 @@ mod tests {
                     stdout: Vec::new(),
                     stderr: b"fatal: simulated checkout failure\n".to_vec(),
                     success: false,
+                    exit_code: None,
                 });
             }
             self.inner.run(directory, arguments)

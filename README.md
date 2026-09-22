@@ -132,7 +132,7 @@ Navigation:
 - `l`/Right expands a disclosure and is a no-op on leaves. Inner fold choices survive outer folds and refreshes.
 - `f` focuses the selected repository, Backburner group, branch, PR, or owning branch of a selected detail. Pressing `f` again on a more specific visible item replaces the current focus, so a repository focus can be narrowed to one of its PRs. `Esc` leaves focus mode. Focus persists across restarts using the repository path or canonical pull-request identity rather than a row position.
 - `]`/`[` moves to the next/previous actionable non-Backburner PR, wraps, and reveals only its required ancestor path.
-- `Enter` toggles a repository/disclosure, selects a local worktree, materializes a virtual PR, opens an untracked file in `$EDITOR`, or opens an inline URL with PR fallback. `w` opens the selected item or owning PR in a browser.
+- `Enter` toggles a repository/disclosure, selects a local worktree, materializes a virtual PR, opens an untracked or configured ignored file in `$EDITOR`, or opens an inline URL with PR fallback. `w` opens the selected item or owning PR in a browser.
 - `r` coalesces local and GitHub refreshes. `?` or Space opens the action palette. `q`/`Esc`/`Ctrl-c` cancels when unfocused; while focused, `Esc` restores the full tree. During materialization, Ctrl-C stops the active process and returns to the TUI.
 
 Press `/` to edit a case-insensitive search regular expression. It searches rendered repository, branch, section, reviewer, comment, and check text plus hidden paths, SHAs, URLs, warnings, IDs, and status/error values. Matching updates incrementally, highlights visible matches in black on yellow, and retains only exact matching rows plus their complete ancestor paths; an incomplete or invalid expression shows no rows until it becomes valid. Enter commits the search as a worktree/branch pruner: repositories and branches without matches stay hidden, while every detail row under each matching branch is restored. Search preserves saved folds, expanding only the paths needed to expose exact hits, and has its own temporary `h`/`l` overrides. While focus mode is active, search is limited to the focused scope; committing, replacing, or clearing search leaves focus and saved folds intact. `/` replaces search and Esc clears it, restoring the exact saved tree choices.
@@ -324,3 +324,36 @@ vanished files, and launch failures produce an error.
 The editor uses the controlling terminal for stdin, stdout, and stderr, including
 when the Bash or Zsh wrapper captures stdout. Closing it exits the invocation:
 there is no return to the tree and no directory selection or shell navigation.
+
+### Configured ignored files
+
+Add an optional top-level `ignored_files` list to `wt.json`:
+
+```json
+{
+  "version": 1,
+  "ignored_files": ["PLAN.md", ".env", "notes/local.md"],
+  "repositories": [{"path": "/home/me/src/project"}]
+}
+```
+
+Entries name literal files relative to **each local worktree root**, including
+singleton repository rows. They are not relative to the catalog and are not
+globs: shell expressions and patterns are never expanded. Empty, absolute, and
+parent-traversing paths are rejected; redundant `.` components are normalized
+and duplicates removed. The default is an empty list.
+
+Background refresh first stats only configured paths, skipping missing files,
+directories, and broken symlinks. A symlink resolving to a regular file can
+qualify; Git checks the link's configured path. Only surviving candidates are
+sent to `git check-ignore`; with none, that command is skipped entirely.
+Normal Git rules apply, including negations, `.gitignore`, `.git/info/exclude`,
+and global excludes. Tracked files and ordinary untracked files are excluded.
+Unexpected filesystem or Git failures appear as status errors.
+
+Qualifying files appear as flat, worktree-relative leaves under **Ignored files**
+beside **Untracked files**. The section starts expanded and preserves subsequent
+fold choices across refreshes. It is omitted when empty and for virtual worktrees
+or bare roots. Ignored files do not contribute to dirty state or untracked counts.
+Refresh rereads the setting and file/ignore state. Enter uses the same editor
+handoff described above; a file removed before launch produces a clear error.

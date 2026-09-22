@@ -15,10 +15,21 @@ pub struct CommandOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub success: bool,
+    pub exit_code: Option<i32>,
 }
 
 pub trait GitRunner {
     fn run(&self, directory: &Path, arguments: &[OsString]) -> Result<CommandOutput, GitError>;
+    fn run_with_input(
+        &self,
+        _directory: &Path,
+        _arguments: &[OsString],
+        _input: &[u8],
+    ) -> Result<CommandOutput, GitError> {
+        Err(GitError::Command {
+            message: "Git runner does not support stdin".to_owned(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -26,18 +37,44 @@ pub struct SystemGit;
 
 impl GitRunner for SystemGit {
     fn run(&self, directory: &Path, arguments: &[OsString]) -> Result<CommandOutput, GitError> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(directory)
-            .args(arguments)
-            .output()
-            .map_err(|source| GitError::Launch { source })?;
-        Ok(CommandOutput {
-            stdout: output.stdout,
-            stderr: output.stderr,
-            success: output.status.success(),
-        })
+        system_git(directory, arguments, None)
     }
+
+    fn run_with_input(
+        &self,
+        directory: &Path,
+        arguments: &[OsString],
+        input: &[u8],
+    ) -> Result<CommandOutput, GitError> {
+        system_git(directory, arguments, Some(input))
+    }
+}
+
+fn system_git(
+    directory: &Path,
+    arguments: &[OsString],
+    input: Option<&[u8]>,
+) -> Result<CommandOutput, GitError> {
+    use std::io::{Seek, Write};
+    let mut command = Command::new("git");
+    command.arg("-C").arg(directory).args(arguments);
+    if let Some(input) = input {
+        // A file avoids pipe deadlocks when both the input and output are large.
+        let mut file = tempfile::tempfile().map_err(|source| GitError::Launch { source })?;
+        file.write_all(input)
+            .and_then(|()| file.rewind())
+            .map_err(|source| GitError::Launch { source })?;
+        command.stdin(file);
+    }
+    let output = command
+        .output()
+        .map_err(|source| GitError::Launch { source })?;
+    Ok(CommandOutput {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        success: output.status.success(),
+        exit_code: output.status.code(),
+    })
 }
 
 #[derive(Debug, Error)]
@@ -57,6 +94,11 @@ pub enum GitError {
     MalformedPorcelain(String),
     #[error("malformed status porcelain: {0}")]
     MalformedStatus(String),
+    #[error("cannot inspect {path}: {source}")]
+    FileMetadata {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 pub fn resolve_repository(
@@ -203,6 +245,75 @@ pub fn status(runner: &dyn GitRunner, worktree: &Path) -> Result<WorktreeStatus,
         ],
     )?;
     parse_status_porcelain(&output)
+}
+
+pub fn status_with_ignored(
+    runner: &dyn GitRunner,
+    worktree: &Path,
+    configured: &[PathBuf],
+) -> Result<WorktreeStatus, GitError> {
+    let mut result = status(runner, worktree)?;
+    result.ignored_paths = ignored_files(runner, worktree, configured)?;
+    Ok(result)
+}
+
+fn ignored_files(
+    runner: &dyn GitRunner,
+    worktree: &Path,
+    configured: &[PathBuf],
+) -> Result<Vec<PathBuf>, GitError> {
+    let mut candidates = Vec::new();
+    for path in configured {
+        match fs::metadata(worktree.join(path)) {
+            Ok(metadata) if metadata.is_file() => {
+                if !candidates.contains(path) {
+                    candidates.push(path.clone());
+                }
+            }
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(source) => {
+                return Err(GitError::FileMetadata {
+                    path: worktree.join(path),
+                    source,
+                });
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let arguments = ["check-ignore", "-z", "--stdin"].map(OsString::from);
+    let mut input = Vec::new();
+    for path in candidates {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            input.extend_from_slice(path.as_os_str().as_bytes());
+        }
+        #[cfg(not(unix))]
+        input.extend_from_slice(path.to_string_lossy().as_bytes());
+        input.push(0);
+    }
+    let output = runner.run_with_input(worktree, &arguments, &input)?;
+    if output.exit_code == Some(1) {
+        return Ok(Vec::new());
+    }
+    if !output.success {
+        return Err(GitError::Command {
+            message: format!("check-ignore failed: {}", lossy(&output.stderr).trim()),
+        });
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .map(|field| bytes_to_path(field, "ignored path"))
+        .collect()
 }
 
 pub fn parse_status_porcelain(input: &[u8]) -> Result<WorktreeStatus, GitError> {
@@ -366,6 +477,203 @@ fn bytes_to_path(bytes: &[u8], field: &'static str) -> Result<PathBuf, GitError>
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn ignored_files_use_git_rules_and_refresh_without_affecting_dirty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_checked(&SystemGit, root, &["init", "-q"]).unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "*.secret\n!keep.secret\nignored-dir/\nlink\nraw*\n",
+        )
+        .unwrap();
+        fs::write(root.join("tracked.secret"), "").unwrap();
+        run_checked(
+            &SystemGit,
+            root,
+            &["add", "-f", ".gitignore", "tracked.secret"],
+        )
+        .unwrap();
+        fs::create_dir(root.join("ignored-dir")).unwrap();
+        fs::write(root.join(".git/info/exclude"), "info-file\n").unwrap();
+        let global = dir.path().join("global-excludes");
+        fs::write(&global, "global-file\n").unwrap();
+        run_git(
+            &SystemGit,
+            root,
+            &[
+                OsString::from("config"),
+                OsString::from("core.excludesFile"),
+                global.into_os_string(),
+            ],
+        )
+        .unwrap();
+        let names = [
+            "a.secret",
+            "keep.secret",
+            "tracked.secret",
+            "ignored-dir/nested ;$(x)",
+            "info-file",
+            "global-file",
+            "ordinary",
+            "missing",
+            "ignored-dir",
+        ];
+        for name in names
+            .iter()
+            .filter(|name| !matches!(**name, "missing" | "ignored-dir"))
+        {
+            fs::write(root.join(name), "").unwrap();
+        }
+        let configured: Vec<_> = names.iter().map(PathBuf::from).collect();
+        let before = status(&SystemGit, root).unwrap();
+        let after = status_with_ignored(&SystemGit, root, &configured).unwrap();
+        assert_eq!(
+            after.ignored_paths,
+            [
+                "a.secret",
+                "ignored-dir/nested ;$(x)",
+                "info-file",
+                "global-file"
+            ]
+            .map(PathBuf::from)
+        );
+        assert_eq!(
+            (
+                before.staged,
+                before.unstaged,
+                before.untracked,
+                before.is_dirty()
+            ),
+            (
+                after.staged,
+                after.unstaged,
+                after.untracked,
+                after.is_dirty()
+            )
+        );
+        fs::remove_file(root.join("a.secret")).unwrap();
+        assert!(
+            !ignored_files(&SystemGit, root, &configured)
+                .unwrap()
+                .contains(&PathBuf::from("a.secret"))
+        );
+        fs::write(root.join("a.secret"), "").unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "*.secret\n!a.secret\n!keep.secret\nignored-dir/\n",
+        )
+        .unwrap();
+        assert!(
+            !ignored_files(&SystemGit, root, &configured)
+                .unwrap()
+                .contains(&PathBuf::from("a.secret"))
+        );
+        assert!(
+            ignored_files(&SystemGit, root, &[PathBuf::from("ordinary")])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_files_preserve_bytes_and_classify_the_symlink_path() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_checked(&SystemGit, root, &["init", "-q"]).unwrap();
+        fs::write(root.join(".gitignore"), "link\nraw*\n").unwrap();
+        fs::write(root.join("target"), "").unwrap();
+        symlink("target", root.join("link")).unwrap();
+        symlink("absent", root.join("broken")).unwrap();
+        symlink("loop", root.join("loop")).unwrap();
+        let raw = PathBuf::from(OsString::from_vec(b"raw\xff\nname".to_vec()));
+        fs::write(root.join(&raw), "").unwrap();
+        let result = ignored_files(
+            &SystemGit,
+            root,
+            &[PathBuf::from("link"), raw.clone(), PathBuf::from("broken")],
+        )
+        .unwrap();
+        assert_eq!(result, vec![PathBuf::from("link"), raw.clone()]);
+        assert_eq!(result[1].as_os_str().as_bytes(), raw.as_os_str().as_bytes());
+        assert!(matches!(
+            ignored_files(&SystemGit, root, &[PathBuf::from("loop")]),
+            Err(GitError::FileMetadata { .. })
+        ));
+    }
+
+    #[test]
+    fn ignored_files_filter_before_git_and_distinguish_no_match_from_failure() {
+        use std::cell::RefCell;
+        struct Runner {
+            calls: RefCell<Vec<Vec<OsString>>>,
+            exit: i32,
+        }
+        impl GitRunner for Runner {
+            fn run(&self, _: &Path, arguments: &[OsString]) -> Result<CommandOutput, GitError> {
+                panic!("unexpected no-input call: {arguments:?}")
+            }
+            fn run_with_input(
+                &self,
+                _: &Path,
+                arguments: &[OsString],
+                input: &[u8],
+            ) -> Result<CommandOutput, GitError> {
+                assert_eq!(input, b"a ;$(x)\0");
+                self.calls.borrow_mut().push(arguments.to_vec());
+                Ok(CommandOutput {
+                    stdout: Vec::new(),
+                    stderr: b"diagnostic".to_vec(),
+                    success: self.exit == 0,
+                    exit_code: Some(self.exit),
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("directory")).unwrap();
+        let runner = Runner {
+            calls: RefCell::new(Vec::new()),
+            exit: 1,
+        };
+        assert!(ignored_files(&runner, root, &[]).unwrap().is_empty());
+        assert!(
+            ignored_files(&runner, root, &["missing", "directory"].map(PathBuf::from))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(runner.calls.borrow().is_empty());
+        fs::write(root.join("a ;$(x)"), "").unwrap();
+        ignored_files(
+            &runner,
+            root,
+            &["missing", "a ;$(x)", "directory", "a ;$(x)"].map(PathBuf::from),
+        )
+        .unwrap();
+        assert_eq!(
+            *runner.calls.borrow(),
+            vec![
+                vec!["check-ignore", "-z", "--stdin"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            ]
+        );
+        let runner = Runner {
+            calls: RefCell::new(Vec::new()),
+            exit: 128,
+        };
+        assert!(
+            ignored_files(&runner, root, &[PathBuf::from("a ;$(x)")])
+                .unwrap_err()
+                .to_string()
+                .contains("diagnostic")
+        );
+    }
 
     #[test]
     fn untracked_discovery_includes_nested_files_despite_configuration() {

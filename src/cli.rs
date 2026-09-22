@@ -1450,6 +1450,7 @@ mod tests {
                     stdout: b"worktree /trees/topic\0HEAD a\0branch refs/heads/main\0\0worktree /trees/other\0HEAD b\0branch refs/heads/topic\0\0".to_vec(),
                     stderr: Vec::new(),
                     success: true,
+                    exit_code: Some(0),
                 })
             }
         }
@@ -1476,6 +1477,7 @@ mod tests {
                     stdout: Vec::new(),
                     stderr: Vec::new(),
                     success: true,
+                    exit_code: Some(0),
                 })
             }
         }

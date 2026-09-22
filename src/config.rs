@@ -39,6 +39,10 @@ pub enum ConfigError {
     Lock { path: PathBuf, source: io::Error },
     #[error("catalog lock acquisition was cancelled")]
     LockCancelled,
+    #[error(
+        "invalid ignored_files path {path:?}: expected a nonempty relative file path without parent traversal"
+    )]
+    InvalidIgnoredFile { path: PathBuf },
 }
 
 pub struct CatalogLock {
@@ -67,7 +71,7 @@ pub fn load(path: &Path) -> Result<Catalog, ConfigError> {
             });
         }
     };
-    let catalog: Catalog =
+    let mut catalog: Catalog =
         serde_json::from_slice(&contents).map_err(|source| ConfigError::Parse {
             path: path.to_owned(),
             source,
@@ -78,10 +82,36 @@ pub fn load(path: &Path) -> Result<Catalog, ConfigError> {
             supported: CATALOG_VERSION,
         });
     }
+    normalize_ignored_files(&mut catalog)?;
     Ok(catalog)
 }
 
+pub fn normalize_ignored_files(catalog: &mut Catalog) -> Result<(), ConfigError> {
+    use std::path::Component;
+    let mut normalized = Vec::new();
+    for path in &catalog.ignored_files {
+        let mut result = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(name) => result.push(name),
+                Component::CurDir => {}
+                _ => return Err(ConfigError::InvalidIgnoredFile { path: path.clone() }),
+            }
+        }
+        if result.as_os_str().is_empty() {
+            return Err(ConfigError::InvalidIgnoredFile { path: path.clone() });
+        }
+        if !normalized.contains(&result) {
+            normalized.push(result);
+        }
+    }
+    catalog.ignored_files = normalized;
+    Ok(())
+}
+
 pub fn save(path: &Path, catalog: &Catalog) -> Result<(), ConfigError> {
+    let mut catalog = catalog.clone();
+    normalize_ignored_files(&mut catalog)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
         path: path.to_owned(),
@@ -94,7 +124,7 @@ pub fn save(path: &Path, catalog: &Catalog) -> Result<(), ConfigError> {
     })?;
     {
         let mut writer = BufWriter::new(temporary.as_file_mut());
-        serde_json::to_writer_pretty(&mut writer, catalog)?;
+        serde_json::to_writer_pretty(&mut writer, &catalog)?;
         writer
             .write_all(b"\n")
             .map_err(|source| ConfigError::Write {
@@ -320,6 +350,34 @@ mod tests {
     use crate::model::{DEFAULT_GITHUB_REFRESH_INTERVAL_SECS, RepositoryConfig};
     use std::collections::HashMap;
     use std::sync::mpsc;
+
+    #[test]
+    fn ignored_files_defaults_validation_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wt.json");
+        fs::write(&path, r#"{"version":1}"#).unwrap();
+        assert!(load(&path).unwrap().ignored_files.is_empty());
+        fs::write(&path, r#"{"version":1,"ignored_files":["./PLAN.md","notes/./local.md","PLAN.md","$HOME","*.txt"]}"#).unwrap();
+        let catalog = load(&path).unwrap();
+        assert_eq!(
+            catalog.ignored_files,
+            ["PLAN.md", "notes/local.md", "$HOME", "*.txt"].map(PathBuf::from)
+        );
+        save(&path, &catalog).unwrap();
+        assert_eq!(load(&path).unwrap(), catalog);
+        for invalid in ["", ".", "./", "/tmp/file", "../file", "notes/../file"] {
+            let catalog = Catalog {
+                ignored_files: vec![PathBuf::from(invalid)],
+                ..Default::default()
+            };
+            fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+            assert!(
+                matches!(load(&path), Err(ConfigError::InvalidIgnoredFile { .. })),
+                "{invalid}"
+            );
+            assert!(save(&path, &catalog).is_err());
+        }
+    }
 
     #[test]
     fn missing_catalog_loads_default() {

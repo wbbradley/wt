@@ -1835,6 +1835,30 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn ignored_section_renders_disclosure_and_relative_file_label() {
+        let spans = inline_row_spans(
+            InlineRowKind::Section,
+            InlineSection::IgnoredFiles,
+            "Ignored files",
+            Some(true),
+            String::new(),
+            80,
+        );
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "▾Ignored files");
+        let spans = inline_row_spans(
+            InlineRowKind::File,
+            InlineSection::IgnoredFiles,
+            "notes/private file",
+            None,
+            "  └─ ".to_owned(),
+            80,
+        );
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "  └─ notes/private file");
+    }
+
+    #[test]
     fn file_rows_render_literal_flat_labels_and_disclosure() {
         let spans = inline_row_spans(
             InlineRowKind::File,
