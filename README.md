@@ -325,16 +325,16 @@ The viewer accepts UTF-8 text files up to 1 MiB. Binary, oversized, unreadable,
 and missing files produce an error in the tree; `e` remains available for editor
 handoff. Terminal control characters are displayed as replacement characters.
 
-Pressing `e` on a selected file restores the terminal and replaces `wt` with `$EDITOR`. For example,
+Pressing `e` on a selected file restores the terminal and runs `$EDITOR` as a subprocess. For example,
 `export EDITOR='code --wait'` or `export EDITOR='vim -f'`. Arguments support quotes
 and backslash escapes; shell expansions, pipelines, and redirections are not
 evaluated. The file is passed as a separate absolute-path argument, preserving
 spaces, special characters, and filename bytes. Missing/invalid configuration,
-vanished files, and launch failures produce an error.
+vanished files, launch failures, and unsuccessful editor exits produce an error in the tree.
 
 The editor uses the controlling terminal for stdin, stdout, and stderr, including
-when the Bash or Zsh wrapper captures stdout. Closing it exits the invocation:
-there is no return to the tree and no directory selection or shell navigation.
+when the Bash or Zsh wrapper captures stdout. Closing it returns to the tree and refreshes local file status. Editor output does
+not trigger directory selection or shell navigation.
 
 ### Configured ignored files
 

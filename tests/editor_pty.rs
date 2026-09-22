@@ -9,13 +9,18 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
-fn editor_exec_restores_terminal_and_keeps_shell_capture_empty() {
+fn editor_subprocess_returns_to_tree_and_keeps_shell_capture_empty() {
     run_editor(Some("valid"), false, false, false);
 }
 
 #[test]
 fn editor_failures_restore_terminal_without_directory_selection() {
-    for editor in [None, Some("'unmatched"), Some("/no/such/editor")] {
+    for editor in [
+        None,
+        Some("'unmatched"),
+        Some("/no/such/editor"),
+        Some("failure"),
+    ] {
         run_editor(editor, false, false, false);
     }
 }
@@ -88,7 +93,7 @@ printf '%s' "$3" > "$EDITOR_RESULT"
 stty -a > "$EDITOR_TERMIOS"
 printf 'EDITOR_OUTPUT'
 printf 'EDITOR_ERROR' >&2
-exit 0
+exit "$EDITOR_EXIT"
 "#,
     )
     .unwrap();
@@ -142,6 +147,10 @@ exit 0
         .env("WT_CONFIG_PATH", config)
         .env("WT_STATE_PATH", root.join("state.json"))
         .env("XDG_CACHE_HOME", root.join("cache"))
+        .env(
+            "EDITOR_EXIT",
+            if editor == Some("failure") { "7" } else { "0" },
+        )
         .env("EDITOR_RESULT", root.join("result"))
         .env("EDITOR_TERMIOS", root.join("termios"))
         .env_remove("GITHUB_TOKEN")
@@ -153,7 +162,7 @@ exit 0
     if let Some(value) = editor {
         command.env(
             "EDITOR",
-            if value == "valid" {
+            if matches!(value, "valid" | "failure") {
                 format!("'{}' --wait 'two words'", editor_path.display())
             } else {
                 value.to_owned()
@@ -208,6 +217,20 @@ exit 0
             master.write_all(b"q").unwrap();
             returned = true;
         }
+        if !viewer && sent && !returned {
+            let terminal_output = String::from_utf8_lossy(&output);
+            if let Some((_, after_restore)) = terminal_output.split_once("\x1b[?1049l")
+                && let Some((_, resumed)) = after_restore.split_once("\x1b[?1049h")
+                && resumed.contains("Enter views")
+            {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "wt must remain running"
+                );
+                master.write_all(b"q").unwrap();
+                returned = true;
+            }
+        }
         if child.try_wait().unwrap().is_some() {
             break;
         }
@@ -232,14 +255,8 @@ exit 0
         .unwrap();
     assert!(sent);
     let success = viewer || (editor == Some("valid") && !disappear);
-    assert_eq!(
-        stdout,
-        format!(
-            "RESULT={}\n{}\n",
-            if success { 0 } else { 1 },
-            root.display()
-        )
-    );
+    assert!(returned, "wt must return to the tree before quitting");
+    assert_eq!(stdout, format!("RESULT=0\n{}\n", root.display()));
     let terminal_output = String::from_utf8_lossy(&output);
     assert!(terminal_output.contains("\x1b[?1049l"));
     assert!(terminal_output.contains("\x1b[?25h"));
@@ -273,6 +290,8 @@ exit 0
                 .split_whitespace()
                 .any(|word| word == "-icanon" || word == "-echo")
         );
+    } else if editor == Some("failure") {
+        assert!(terminal_output.contains("EDITOR exited with"));
     } else if disappear {
         assert!(terminal_output.contains("cannot open"));
     } else {

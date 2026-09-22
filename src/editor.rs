@@ -77,16 +77,15 @@ fn command(value: &str, path: &Path) -> io::Result<Command> {
     Ok(command)
 }
 
-/// The caller must restore the terminal first: successful exec never returns.
-pub fn exec(path: &Path) -> io::Result<()> {
+/// The caller must restore the terminal first and resume it after the editor exits.
+pub fn run(path: &Path) -> io::Result<()> {
     let value = std::env::var("EDITOR")
         .map_err(|_| invalid("set EDITOR to an editor executable and optional arguments"))?;
-    exec_configured(&value, path)
+    run_configured(&value, path)
 }
 
 #[cfg(unix)]
-fn exec_configured(value: &str, path: &Path) -> io::Result<()> {
-    use std::os::unix::process::CommandExt;
+fn run_configured(value: &str, path: &Path) -> io::Result<()> {
     let mut command = command(value, path)?;
     let tty = std::fs::OpenOptions::new()
         .read(true)
@@ -102,18 +101,21 @@ fn exec_configured(value: &str, path: &Path) -> io::Result<()> {
         .stdin(tty.try_clone()?)
         .stdout(tty.try_clone()?)
         .stderr(tty);
-    let error = command.exec();
-    Err(io::Error::new(
-        error.kind(),
-        format!("failed to execute EDITOR: {error}"),
-    ))
+    let status = command.status().map_err(|error| {
+        io::Error::new(error.kind(), format!("failed to launch EDITOR: {error}"))
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("EDITOR exited with {status}")))
+    }
 }
 
 #[cfg(not(unix))]
-fn exec_configured(_value: &str, _path: &Path) -> io::Result<()> {
+fn run_configured(_value: &str, _path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "editor process replacement requires Unix",
+        "editor terminal access requires Unix",
     ))
 }
 

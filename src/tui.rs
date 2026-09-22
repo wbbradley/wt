@@ -272,8 +272,20 @@ fn run_with_startup_deletion(
                     }
                     Ok(ControlFlow::EditFile(path)) => {
                         terminal.restore()?;
-                        crate::editor::exec(&path)?;
-                        return Ok(None);
+                        let result = crate::editor::run(&path);
+                        terminal = InteractiveTerminal::open()?;
+                        controller.app.inline_error = result.err().map(|error| error.to_string());
+                        if let Err(error) = controller.refresh_local() {
+                            let message =
+                                controller.app.inline_error.get_or_insert_with(String::new);
+                            if !message.is_empty() {
+                                message.push_str("; ");
+                            }
+                            message.push_str(&format!("refresh failed: {error}"));
+                        }
+                        terminal
+                            .terminal_mut()
+                            .draw(|frame| ui::render(frame, &mut controller.app))?;
                     }
                     Ok(ControlFlow::Exit(selection)) => {
                         terminal.restore()?;
