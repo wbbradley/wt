@@ -114,6 +114,7 @@ pub(crate) fn row_search_text(app: &App, row: &VisibleRow) -> String {
                     .and_then(GitHubState::data)
                     .and_then(|data| data.pull_request.as_ref());
                 if let Some(pull_request) = pull_request {
+                    spans.splice(0..0, pull_request_prefix_spans(pull_request));
                     let details = app
                         .pull_request_details_for(repository, pull_request)
                         .map(|(_, details)| details);
@@ -173,6 +174,7 @@ pub(crate) fn row_search_text(app: &App, row: &VisibleRow) -> String {
                 .and_then(GitHubState::data)
                 .and_then(|data| data.pull_request.as_ref());
             if let Some(pull_request) = pull_request {
+                spans.splice(0..0, pull_request_prefix_spans(pull_request));
                 let details = app
                     .pull_request_details_for(repository, pull_request)
                     .map(|(_, details)| details);
@@ -215,7 +217,8 @@ pub(crate) fn row_search_text(app: &App, row: &VisibleRow) -> String {
         } => {
             let authored = &app.virtual_repositories[*virtual_repository_index].pull_requests
                 [*pull_request_index];
-            let mut spans = vec![Span::raw(authored.pull_request.head.branch.clone())];
+            let mut spans = pull_request_prefix_spans(&authored.pull_request);
+            spans.push(Span::raw(authored.pull_request.head.branch.clone()));
             spans.extend(pull_request_tree_spans(
                 &authored.pull_request,
                 app.pull_request_details.get(&authored.identity),
@@ -315,6 +318,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, rows: &[VisibleRow], area: 
                     location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
                 ];
+                if let Some(pull_request) = singleton
+                    .and_then(|worktree| app.github.get(&worktree.path))
+                    .and_then(GitHubState::data)
+                    .and_then(|data| data.pull_request.as_ref())
+                {
+                    spans.extend(pull_request_prefix_spans(pull_request));
+                }
                 spans.push(Span::styled(
                     repository.config.display_label(),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -425,13 +435,15 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, rows: &[VisibleRow], area: 
                 } else {
                     tree_prefix
                 };
-                let prefix_width = 2 + display_width(&tree_prefix);
+                let pr_prefix = pull_request
+                    .map(pull_request_prefix_spans)
+                    .unwrap_or_default();
+                let prefix_width = 2
+                    + display_width(&tree_prefix)
+                    + pr_prefix.iter().map(Span::width).sum::<usize>();
                 let line_width = area.width.saturating_sub(3) as usize;
-                let priority_suffix_width = local_state
-                    .iter()
-                    .chain(suffix.first())
-                    .map(|span| span.width())
-                    .sum::<usize>();
+                let priority_suffix_width =
+                    local_state.iter().map(|span| span.width()).sum::<usize>();
                 let label_width = line_width
                     .saturating_sub(prefix_width + priority_suffix_width + 1)
                     .max(4);
@@ -450,6 +462,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, rows: &[VisibleRow], area: 
                     location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
                 ];
+                spans.extend(pr_prefix);
                 spans.push(Span::styled(
                     truncate_label(&identity, identity_width),
                     Style::default().fg(BRANCH),
@@ -527,20 +540,20 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, rows: &[VisibleRow], area: 
                     tree_prefix
                 };
                 let line_width = area.width.saturating_sub(3) as usize;
-                let prefix_width = 2 + display_width(&tree_prefix);
-                let priority_suffix_width =
-                    suffix.first().map(|span| span.width()).unwrap_or_default();
-                let label_width = line_width
-                    .saturating_sub(prefix_width + priority_suffix_width + 1)
-                    .max(4);
+                let pr_prefix = pull_request_prefix_spans(&pull_request.pull_request);
+                let prefix_width = 2
+                    + display_width(&tree_prefix)
+                    + pr_prefix.iter().map(Span::width).sum::<usize>();
+                let label_width = line_width.saturating_sub(prefix_width + 1).max(4);
                 let mut spans = vec![
                     location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
-                    Span::styled(
-                        truncate_label(&pull_request.pull_request.head.branch, label_width),
-                        Style::default().fg(REMOTE),
-                    ),
                 ];
+                spans.extend(pr_prefix);
+                spans.push(Span::styled(
+                    truncate_label(&pull_request.pull_request.head.branch, label_width),
+                    Style::default().fg(REMOTE),
+                ));
                 spans.extend(suffix);
                 if backburnered {
                     for span in spans.iter_mut().skip(2) {
@@ -1099,6 +1112,19 @@ fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
     (to_byte(red), to_byte(green), to_byte(blue))
 }
 
+fn pull_request_prefix_spans(pull_request: &crate::model::PullRequest) -> Vec<Span<'static>> {
+    if pull_request.state == PullRequestState::Merged {
+        return Vec::new();
+    }
+    vec![
+        Span::styled(
+            format!("PR #{}", pull_request.number),
+            Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(MUTED)),
+    ]
+}
+
 fn pull_request_tree_spans(
     pull_request: &crate::model::PullRequest,
     details: Option<&PullRequestDetails>,
@@ -1109,10 +1135,6 @@ fn pull_request_tree_spans(
     let summary = details.map(PullRequestDetails::attention_summary);
     let mut spans = Vec::new();
     if pull_request.state != PullRequestState::Merged {
-        spans.push(Span::styled(
-            format!(" · PR #{}", pull_request.number),
-            Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD),
-        ));
         spans.push(tree_label(&pull_request.title, Color::White));
     }
     match pull_request.state {
@@ -2363,7 +2385,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
-        assert!(content.contains("└▾feature/compact-attention"));
+        assert!(content.contains("└▾PR #42 · feature/compact-attention"));
         assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
         assert!(content.contains("PR #42"));
         assert!(content.contains("virtual feature"));
