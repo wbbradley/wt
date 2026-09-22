@@ -28,6 +28,10 @@ const SELECTION: Color = Color::Rgb(45, 55, 72);
 const GITHUB_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
+    if let Some(view) = &mut app.file_view {
+        view.render(frame);
+        return;
+    }
     let area = frame.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -745,6 +749,9 @@ fn list_selection_hint(app: &App, rows: &[VisibleRow]) -> &'static str {
     let Some(row) = app.selected_row_in(rows) else {
         return "Enter selects";
     };
+    if matches!(row.id(), crate::app::RowId::File(..)) {
+        return "Enter views · e edits";
+    }
     match row {
         VisibleRow::Repository {
             singleton_worktree_index,

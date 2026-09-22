@@ -8,6 +8,7 @@ mod cli;
 mod clipboard;
 mod config;
 mod editor;
+mod file_view;
 mod git;
 mod github;
 mod materialize;

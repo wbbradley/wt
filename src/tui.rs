@@ -577,6 +577,16 @@ impl Controller {
         match intent {
             Intent::None => Ok(ControlFlow::Continue),
             Intent::EditFile(path) => Ok(ControlFlow::EditFile(path)),
+            Intent::ViewFile(path) => {
+                match crate::file_view::FileView::load(path.clone()) {
+                    Ok(view) => self.app.file_view = Some(view),
+                    Err(error) => {
+                        self.app.inline_error =
+                            Some(format!("cannot view {}: {error}", path.display()))
+                    }
+                }
+                Ok(ControlFlow::Continue)
+            }
             Intent::Accept(path) => {
                 let absolute = std::fs::canonicalize(&path).unwrap_or(path);
                 Ok(ControlFlow::Exit(Some(absolute)))
@@ -2564,6 +2574,37 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn viewing_files_stays_in_tui_and_reports_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        let mut controller =
+            Controller::new(dir.path().join("wt.json"), Catalog::default(), prompt_app());
+        assert!(matches!(
+            controller
+                .handle_intent(Intent::ViewFile(path.clone()))
+                .unwrap(),
+            ControlFlow::Continue
+        ));
+        assert!(
+            controller
+                .app
+                .inline_error
+                .as_deref()
+                .unwrap()
+                .contains("cannot view")
+        );
+        assert!(controller.app.file_view.is_none());
+        std::fs::write(&path, "# Notes").unwrap();
+        assert!(matches!(
+            controller
+                .handle_intent(Intent::ViewFile(path.clone()))
+                .unwrap(),
+            ControlFlow::Continue
+        ));
+        assert_eq!(controller.app.file_view.as_ref().unwrap().path, path);
     }
 
     #[test]

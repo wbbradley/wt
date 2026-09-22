@@ -33,7 +33,20 @@ fn ignored_files_share_editor_handoff_and_handle_disappearance() {
     }
 }
 
+#[test]
+fn file_viewer_returns_to_tree_without_editor_or_shell_navigation() {
+    for zsh in [false, true] {
+        for ignored in [false, true] {
+            run_session(Some("valid"), zsh, ignored, false, true);
+        }
+    }
+}
+
 fn run_editor(editor: Option<&str>, zsh: bool, ignored: bool, disappear: bool) {
+    run_session(editor, zsh, ignored, disappear, false);
+}
+
+fn run_session(editor: Option<&str>, zsh: bool, ignored: bool, disappear: bool, viewer: bool) {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let repo = root.join("repo");
@@ -47,7 +60,11 @@ fn run_editor(editor: Option<&str>, zsh: bool, ignored: bool, disappear: bool) {
             .success()
     );
     let name = "file ;$(touch BAD) 'quote'.txt";
-    fs::write(repo.join(name), "hello").unwrap();
+    fs::write(
+        repo.join(name),
+        if viewer { "VIEWER_CONTENT" } else { "hello" },
+    )
+    .unwrap();
     if ignored {
         fs::write(repo.join(".git/info/exclude"), format!("{name}\n")).unwrap();
     }
@@ -157,6 +174,9 @@ exit 0
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut output = Vec::new();
     let mut sent = false;
+    let mut viewed = false;
+    let mut returned = false;
+    let mut after_close = 0;
     loop {
         let mut buffer = [0; 65536];
         while let Ok(n) = master.read(&mut buffer) {
@@ -169,8 +189,24 @@ exit 0
             if disappear {
                 fs::remove_file(repo.join(name)).unwrap();
             }
-            master.write_all(b"G\r").unwrap();
+            master
+                .write_all(if viewer { b"G\r" } else { b"Ge" })
+                .unwrap();
             sent = true;
+        }
+        if viewer && sent && !viewed && String::from_utf8_lossy(&output).contains("VIEWER_CONTENT")
+        {
+            assert!(!root.join("result").exists());
+            master.write_all(b"\x1b").unwrap();
+            viewed = true;
+            after_close = output.len();
+        }
+        if viewed
+            && !returned
+            && String::from_utf8_lossy(&output[after_close..]).contains("Enter views")
+        {
+            master.write_all(b"q").unwrap();
+            returned = true;
         }
         if child.try_wait().unwrap().is_some() {
             break;
@@ -195,7 +231,7 @@ exit 0
         .read_to_string(&mut stdout)
         .unwrap();
     assert!(sent);
-    let success = editor == Some("valid") && !disappear;
+    let success = viewer || (editor == Some("valid") && !disappear);
     assert_eq!(
         stdout,
         format!(
@@ -215,7 +251,14 @@ exit 0
     let termios = unsafe { termios.assume_init() };
     assert_ne!(termios.c_lflag & libc::ICANON, 0);
     assert_ne!(termios.c_lflag & libc::ECHO, 0);
-    if success {
+    if viewer {
+        assert!(
+            viewed && returned,
+            "viewer must return to the selected file in the tree"
+        );
+        assert!(!root.join("result").exists());
+        assert!(!terminal_output.contains("EDITOR_OUTPUT"));
+    } else if success {
         assert_eq!(
             fs::read(root.join("result")).unwrap(),
             repo.join(name).as_os_str().as_encoded_bytes()

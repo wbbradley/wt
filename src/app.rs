@@ -438,6 +438,7 @@ pub enum Intent {
     None,
     Accept(PathBuf),
     EditFile(PathBuf),
+    ViewFile(PathBuf),
     Cancel,
     Refresh,
     RefreshGitHub,
@@ -471,6 +472,7 @@ pub struct App {
     disclosure_expanded: HashMap<DisclosureKey, bool>,
     filter_collapsed: HashSet<DisclosureKey>,
     filter_expanded: HashSet<DisclosureKey>,
+    pub file_view: Option<crate::file_view::FileView>,
     pub modal: Option<Modal>,
     pub inline_error: Option<String>,
     pub progress: Option<String>,
@@ -516,6 +518,7 @@ impl App {
             disclosure_expanded: HashMap::new(),
             filter_collapsed: HashSet::new(),
             filter_expanded: HashSet::new(),
+            file_view: None,
             modal: None,
             inline_error: None,
             progress: None,
@@ -2527,6 +2530,18 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Intent {
         self.inline_error = None;
+        if let Some(view) = &mut self.file_view {
+            if key.code == KeyCode::Esc {
+                self.file_view = None;
+            } else if key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                return Intent::Cancel;
+            } else {
+                view.handle_key(key);
+            }
+            return Intent::None;
+        }
         if let Some(modal) = self.modal.clone() {
             return self.handle_modal_key(modal, key);
         }
@@ -2606,6 +2621,9 @@ impl App {
             }
             KeyCode::Char('q') => Intent::Cancel,
             KeyCode::Char('w') => self.open_selected_url(),
+            KeyCode::Char('e') if self.selected_file().is_some() => {
+                Intent::EditFile(self.selected_file().unwrap())
+            }
             KeyCode::Char('d') if self.selected_file().is_some() => {
                 Intent::BeginAction(Action::DeleteFile)
             }
@@ -4043,7 +4061,7 @@ impl App {
             Some(VisibleRow::Inline {
                 id: RowId::File(BranchId::Worktree(root), _, path),
                 ..
-            }) => Intent::EditFile(root.join(path)),
+            }) => Intent::ViewFile(root.join(path)),
             Some(VisibleRow::Repository {
                 repository_index, ..
             }) => {
@@ -4840,6 +4858,43 @@ fn canonical_path_or_owned(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn viewer_keys_preserve_tree_focus_search_and_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        std::fs::write(&path, "# Notes").unwrap();
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/repo"));
+        app.handle_key(key(KeyCode::Char('f')));
+        app.filter = "repo".to_owned();
+        let selected = app.selected.clone();
+        let focus = app.focus_target.clone();
+        let folds = app.disclosure_expanded.clone();
+        app.scroll = 5;
+        app.file_view = Some(crate::file_view::FileView::load(path).unwrap());
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Char('d'),
+            KeyCode::Char('e'),
+            KeyCode::Char('/'),
+            KeyCode::Char('r'),
+            KeyCode::Enter,
+        ] {
+            assert_eq!(app.handle_key(key(code)), Intent::None);
+            assert!(app.file_view.is_some());
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Intent::None);
+        assert!(app.file_view.is_none());
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.focus_target, focus);
+        assert_eq!(app.filter, "repo");
+        assert_eq!(app.scroll, 5);
+        assert_eq!(app.disclosure_expanded, folds);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('e'))),
+            Intent::BeginAction(Action::EditRepository)
+        );
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -4937,6 +4992,10 @@ mod tests {
             app.selected = Some(RowId::File(owner.clone(), ignored, paths[1].clone()));
             assert_eq!(
                 app.handle_key(key(KeyCode::Enter)),
+                Intent::ViewFile(root.join(&paths[1]))
+            );
+            assert_eq!(
+                app.handle_key(key(KeyCode::Char('e'))),
                 Intent::EditFile(root.join(&paths[1]))
             );
             app.apply_status(update(paths.clone()));
@@ -4992,7 +5051,7 @@ mod tests {
     }
 
     #[test]
-    fn untracked_files_are_flat_stable_and_open_in_editor() {
+    fn untracked_files_are_flat_stable_and_open_in_viewer() {
         for singleton in [false, true] {
             let mut repo = repository("/repo", true);
             if singleton {
@@ -5035,6 +5094,10 @@ mod tests {
             app.selected = Some(id.clone());
             assert_eq!(
                 app.handle_key(key(KeyCode::Enter)),
+                Intent::ViewFile(root.join(&paths[1]))
+            );
+            assert_eq!(
+                app.handle_key(key(KeyCode::Char('e'))),
                 Intent::EditFile(root.join(&paths[1]))
             );
             app.apply_status(update(paths.clone()));
