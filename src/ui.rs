@@ -1456,7 +1456,7 @@ fn shortcut_line(shortcuts: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
-fn render_footer(frame: &mut Frame<'_>, app: &App, _rows: &[VisibleRow], area: Rect) {
+fn render_footer(frame: &mut Frame<'_>, app: &App, rows: &[VisibleRow], area: Rect) {
     let top = if app.filter_active {
         Line::from(vec![
             Span::styled(
@@ -1521,6 +1521,15 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, _rows: &[VisibleRow], area: R
                 ("m", "move"),
                 (exit_key, "cancel"),
             ];
+            if matches!(
+                app.selected_row_in(rows),
+                Some(VisibleRow::Inline {
+                    kind: InlineRowKind::File,
+                    ..
+                })
+            ) {
+                shortcuts.insert(0, ("d", "delete file"));
+            }
             if app.filter.is_empty() {
                 shortcuts.insert(4, ("n", "create"));
             }

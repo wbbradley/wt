@@ -357,3 +357,9 @@ fold choices across refreshes. It is omitted when empty and for virtual worktree
 or bare roots. Ignored files do not contribute to dirty state or untracked counts.
 Refresh rereads the setting and file/ignore state. Enter uses the same editor
 handoff described above; a file removed before launch produces a clear error.
+
+Press `d` on an untracked or ignored file to open a **Confirm delete file** dialog
+showing its full path. Enter or `y` permanently deletes it; `n` or Esc cancels.
+The listing refreshes after deletion. Symlinks are removed without deleting their
+targets; directories are never recursively deleted. On worktree rows, `d` keeps
+its existing remove-worktree behavior.

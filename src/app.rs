@@ -337,6 +337,7 @@ pub enum Action {
     Lock,
     Unlock,
     Remove,
+    DeleteFile,
     Repair,
     Prune,
     RegisterRepository,
@@ -345,7 +346,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::CopyAgentPrompt,
         Self::CopyReviewRequest,
         Self::OpenPullRequestWeb,
@@ -355,6 +356,7 @@ impl Action {
         Self::Lock,
         Self::Unlock,
         Self::Remove,
+        Self::DeleteFile,
         Self::Repair,
         Self::Prune,
         Self::RegisterRepository,
@@ -373,6 +375,7 @@ impl Action {
             Self::Lock => "lock worktree",
             Self::Unlock => "unlock worktree",
             Self::Remove => "remove worktree",
+            Self::DeleteFile => "delete file",
             Self::Repair => "repair worktree",
             Self::Prune => "prune stale records",
             Self::RegisterRepository => "register repository",
@@ -391,7 +394,7 @@ impl Action {
             Self::Move => Some("m"),
             Self::Lock => Some("L"),
             Self::Unlock => Some("U"),
-            Self::Remove => Some("d"),
+            Self::Remove | Self::DeleteFile => Some("d"),
             Self::Repair => Some("R"),
             Self::Prune => Some("P"),
             Self::RegisterRepository => Some("a"),
@@ -2603,6 +2606,9 @@ impl App {
             }
             KeyCode::Char('q') => Intent::Cancel,
             KeyCode::Char('w') => self.open_selected_url(),
+            KeyCode::Char('d') if self.selected_file().is_some() => {
+                Intent::BeginAction(Action::DeleteFile)
+            }
             KeyCode::Char(character) => self.direct_action(character),
             KeyCode::Enter => self.accept_or_toggle(),
             KeyCode::Esc if self.is_focused() => {
@@ -2831,12 +2837,33 @@ impl App {
         self.modal = Some(Modal::Confirm { action, summary });
     }
 
+    pub fn selected_file(&self) -> Option<PathBuf> {
+        match self.selected_row()? {
+            VisibleRow::Inline {
+                id: RowId::File(BranchId::Worktree(root), _, path),
+                ..
+            } => Some(root.join(path)),
+            _ => None,
+        }
+    }
+
     pub fn action_availability(&self, action: Action) -> ActionAvailability {
         let disabled = |reason: &str| ActionAvailability {
             action,
             enabled: false,
             reason: Some(reason.to_owned()),
         };
+        if action == Action::DeleteFile {
+            return if self.selected_file().is_some() {
+                ActionAvailability {
+                    action,
+                    enabled: true,
+                    reason: None,
+                }
+            } else {
+                disabled("select an untracked or ignored file")
+            };
+        }
         if matches!(action, Action::CopyAgentPrompt | Action::CopyReviewRequest) {
             return ActionAvailability {
                 action,
@@ -2892,6 +2919,7 @@ impl App {
                     disabled("repository is already registered")
                 }
             }
+            Action::DeleteFile => unreachable!("handled before selection validation"),
             Action::CopyAgentPrompt => unreachable!("handled before selection validation"),
             Action::CopyReviewRequest => {
                 unreachable!("handled before selection validation")

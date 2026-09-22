@@ -103,6 +103,9 @@ pub enum TuiError {
 
 #[derive(Clone, Debug)]
 enum PendingAction {
+    DeleteFile {
+        path: PathBuf,
+    },
     Create {
         repository: PathBuf,
         destination: PathBuf,
@@ -160,6 +163,7 @@ enum PendingAction {
 impl PendingAction {
     fn action(&self) -> Action {
         match self {
+            Self::DeleteFile { .. } => Action::DeleteFile,
             Self::Create { .. } => Action::Create,
             Self::NewWorktree { .. } => Action::NewWorktree,
             Self::Move { .. } => Action::Move,
@@ -650,6 +654,20 @@ impl Controller {
     }
 
     fn begin_action(&mut self, action: Action) -> Result<(), TuiError> {
+        if action == Action::DeleteFile {
+            let path = self.app.selected_file().ok_or(TuiError::InvalidForm {
+                field: "file",
+                message: "select an untracked or ignored file".to_owned(),
+            })?;
+            self.confirm(
+                PendingAction::DeleteFile { path: path.clone() },
+                vec![
+                    format!("Delete: {}", path.display()),
+                    "This permanently deletes the file. This cannot be undone.".to_owned(),
+                ],
+            );
+            return Ok(());
+        }
         if action == Action::OpenPullRequestWeb {
             if let Some(url) = self.app.selected_pull_request_url() {
                 self.open_url(&url);
@@ -710,6 +728,7 @@ impl Controller {
             .ok_or(TuiError::RepositoryGone)?;
         let repository_path = repository.config.path.clone();
         match action {
+            Action::DeleteFile => unreachable!("handled above"),
             Action::CopyAgentPrompt => unreachable!("handled before repository resolution"),
             Action::CopyReviewRequest => {
                 unreachable!("handled before repository resolution")
@@ -1053,6 +1072,12 @@ impl Controller {
 
     fn execute(&mut self, pending: PendingAction) -> Result<(), TuiError> {
         match pending {
+            PendingAction::DeleteFile { path } => {
+                std::fs::remove_file(&path).map_err(|error| TuiError::InvalidForm {
+                    field: "file deletion",
+                    message: format!("cannot delete {}: {error}", path.display()),
+                })?;
+            }
             PendingAction::Create {
                 repository,
                 destination,
@@ -2539,6 +2564,136 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn file_deletion_requires_confirmation_and_refreshes_both_file_sections() {
+        use crate::app::{BranchId, InlineSection, Modal, RowId, StatusState};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for section in [InlineSection::UntrackedFiles, InlineSection::IgnoredFiles] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir(&root).unwrap();
+            git::run_git(&SystemGit, &root, &["init".into(), "-q".into()]).unwrap();
+            let relative = PathBuf::from("file ;$(literal) with spaces");
+            let path = root.join(&relative);
+            std::fs::write(&path, "keep until confirmed").unwrap();
+            let mut catalog = Catalog::default();
+            if section == InlineSection::IgnoredFiles {
+                std::fs::write(
+                    root.join(".git/info/exclude"),
+                    format!("{}\n", relative.display()),
+                )
+                .unwrap();
+                catalog.ignored_files.push(relative.clone());
+            }
+            catalog.repositories.push(RepositoryConfig {
+                path: root.clone(),
+                label: None,
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            });
+            let config_path = dir.path().join("wt.json");
+            config::save(&config_path, &catalog).unwrap();
+            let mut app = App::new(
+                load_repository_views(&catalog, dir.path()),
+                dir.path().to_owned(),
+            );
+            app.statuses.insert(
+                root.clone(),
+                StatusState::Ready(
+                    git::status_with_ignored(&SystemGit, &root, &catalog.ignored_files).unwrap(),
+                ),
+            );
+            let file_id = RowId::File(BranchId::Worktree(root.clone()), section, relative.clone());
+            app.selected = Some(file_id.clone());
+            let mut controller = Controller::new(config_path, catalog, app);
+            controller.github_in_flight = true;
+            let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+            for cancel in [KeyCode::Esc, KeyCode::Char('n')] {
+                let intent = controller.app.handle_key(key(KeyCode::Char('d')));
+                assert_eq!(intent, Intent::BeginAction(Action::DeleteFile));
+                controller.handle_intent(intent).unwrap();
+                assert!(path.exists());
+                assert!(
+                    matches!(&controller.app.modal, Some(Modal::Confirm { action: Action::DeleteFile, summary })
+                    if summary.iter().any(|line| line.contains(&path.display().to_string())))
+                );
+                let intent = controller.app.handle_key(key(cancel));
+                controller.handle_intent(intent).unwrap();
+                assert!(controller.app.modal.is_none());
+                assert!(path.exists());
+            }
+            let intent = controller.app.handle_key(key(KeyCode::Char('d')));
+            controller.handle_intent(intent).unwrap();
+            // A refresh or selection change must not change the confirmed target.
+            controller.app.selected = Some(RowId::Repository(root.clone()));
+            let intent = controller.app.handle_key(key(KeyCode::Enter));
+            assert_eq!(intent, Intent::ConfirmAction(Action::DeleteFile));
+            controller.handle_intent(intent).unwrap();
+            assert!(!path.exists());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                controller.submit_status_backlog();
+                if let Some(update) = controller.status_pool.try_recv() {
+                    controller.app.apply_status(update);
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                !controller
+                    .app
+                    .visible_rows()
+                    .iter()
+                    .any(|row| row.id() == &file_id)
+            );
+            assert!(
+                !controller
+                    .app
+                    .action_availability(Action::DeleteFile)
+                    .enabled
+            );
+            assert!(controller.begin_action(Action::DeleteFile).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_deletion_removes_links_not_targets_and_rejects_directories_and_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(
+            dir.path().join("wt.json"),
+            Catalog::default(),
+            App::new(Vec::new(), dir.path().to_owned()),
+        );
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::write(&target, "preserved").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        controller
+            .execute(PendingAction::DeleteFile { path: link.clone() })
+            .unwrap();
+        assert!(target.exists());
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert!(
+            controller
+                .execute(PendingAction::DeleteFile { path: link })
+                .unwrap_err()
+                .to_string()
+                .contains("cannot delete")
+        );
+        assert!(
+            controller
+                .execute(PendingAction::DeleteFile {
+                    path: dir.path().to_owned()
+                })
+                .is_err()
+        );
+        assert!(target.exists());
     }
 
     #[test]
