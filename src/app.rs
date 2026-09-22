@@ -37,6 +37,7 @@ pub enum InlineSection {
     Reviewers,
     OpenComments,
     StackedBranches,
+    UntrackedFiles,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -57,6 +58,7 @@ pub enum RowId {
     VirtualPullRequest(CanonicalPullRequestId),
     Section(BranchId, InlineSection),
     Metadata(BranchId, String),
+    File(BranchId, InlineSection, PathBuf),
     Check(CanonicalPullRequestId, String),
     Reviewer(CanonicalPullRequestId, String),
     OpenComment(CanonicalPullRequestId, String),
@@ -288,6 +290,7 @@ pub enum InlineRowKind {
     Check,
     Reviewer,
     OpenComment,
+    File,
 }
 
 impl VisibleRow {
@@ -430,6 +433,7 @@ pub enum Modal {
 pub enum Intent {
     None,
     Accept(PathBuf),
+    EditFile(PathBuf),
     Cancel,
     Refresh,
     RefreshGitHub,
@@ -1712,6 +1716,46 @@ impl App {
         })
     }
 
+    fn append_file_rows(&self, rows: &mut Vec<VisibleRow>, worktree: &Worktree, depth: usize) {
+        if worktree.bare {
+            return;
+        }
+        let Some(StatusState::Ready(status)) = self.statuses.get(&worktree.path) else {
+            return;
+        };
+        let paths = &status.untracked_paths;
+        if paths.is_empty() {
+            return;
+        }
+        let owner = BranchId::Worktree(worktree.path.clone());
+        let section = InlineSection::UntrackedFiles;
+        let expanded = self.inline_section_expanded(&owner, section);
+        rows.push(VisibleRow::Inline {
+            owner: owner.clone(),
+            section,
+            depth,
+            kind: InlineRowKind::Section,
+            text: "Untracked files".to_owned(),
+            url: None,
+            expanded: Some(expanded),
+            id: RowId::Section(owner.clone(), section),
+        });
+        if expanded {
+            for path in paths {
+                rows.push(VisibleRow::Inline {
+                    owner: owner.clone(),
+                    section,
+                    depth: depth + 1,
+                    kind: InlineRowKind::File,
+                    text: path.to_string_lossy().into_owned(),
+                    url: None,
+                    expanded: None,
+                    id: RowId::File(owner.clone(), section, path.clone()),
+                });
+            }
+        }
+    }
+
     fn append_local_pull_request_rows(
         &self,
         rows: &mut Vec<VisibleRow>,
@@ -1722,6 +1766,7 @@ impl App {
         let repository = &self.repositories[repository_index];
         let worktree = &repository.worktrees[worktree_index];
         let owner = BranchId::Worktree(worktree.path.clone());
+        self.append_file_rows(rows, worktree, depth);
         let Some(github_state) = self.github.get(&worktree.path) else {
             return;
         };
@@ -2211,7 +2256,12 @@ impl App {
     fn inline_section_expanded(&self, owner: &BranchId, section: InlineSection) -> bool {
         self.disclosure_expanded(
             &DisclosureKey::Section(owner.clone(), section),
-            section == InlineSection::OpenComments || section == InlineSection::StackedBranches,
+            matches!(
+                section,
+                InlineSection::OpenComments
+                    | InlineSection::StackedBranches
+                    | InlineSection::UntrackedFiles
+            ),
         )
     }
 
@@ -2280,7 +2330,9 @@ impl App {
                 DisclosureKey::Branch(_) => true,
                 DisclosureKey::Section(_, section) => matches!(
                     section,
-                    InlineSection::OpenComments | InlineSection::StackedBranches
+                    InlineSection::OpenComments
+                        | InlineSection::StackedBranches
+                        | InlineSection::UntrackedFiles
                 ),
             })
     }
@@ -2917,6 +2969,7 @@ impl App {
             Err(error) => StatusState::Error(error),
         };
         self.statuses.insert(update.path, state);
+        self.ensure_selection_visible();
         self.pending_status = self.pending_status.saturating_sub(1);
         if self.pending_status == 0 {
             if self.status_progress_visible {
@@ -3331,7 +3384,7 @@ impl App {
                     .and_then(|data| data.pull_request.as_ref())?;
                 self.pull_request_identity(repository, pull_request)
             }
-            RowId::Section(owner, _) | RowId::Metadata(owner, _) => {
+            RowId::Section(owner, _) | RowId::Metadata(owner, _) | RowId::File(owner, _, _) => {
                 self.pull_request_identity_for_branch(owner)
             }
             RowId::Check(identity, _)
@@ -3722,7 +3775,7 @@ impl App {
             RowId::Section(owner, InlineSection::StackedBranches) => {
                 self.branch_scope_identities(owner, true)
             }
-            RowId::Section(owner, _) | RowId::Metadata(owner, _)
+            RowId::Section(owner, _) | RowId::Metadata(owner, _) | RowId::File(owner, _, _)
                 if non_container_owns_pull_request =>
             {
                 self.pull_request_identity_for_branch(owner)
@@ -3738,6 +3791,7 @@ impl App {
             }
             RowId::Section(_, _)
             | RowId::Metadata(_, _)
+            | RowId::File(_, _, _)
             | RowId::Check(_, _)
             | RowId::Reviewer(_, _)
             | RowId::OpenComment(_, _) => Vec::new(),
@@ -3944,6 +3998,10 @@ impl App {
 
     fn accept_or_toggle(&mut self) -> Intent {
         match self.selected_row() {
+            Some(VisibleRow::Inline {
+                id: RowId::File(BranchId::Worktree(root), _, path),
+                ..
+            }) => Intent::EditFile(root.join(path)),
             Some(VisibleRow::Repository {
                 repository_index, ..
             }) => {
@@ -4002,6 +4060,19 @@ impl App {
                     .identity
                     .clone(),
             ),
+            Some(VisibleRow::Inline {
+                owner,
+                section: InlineSection::UntrackedFiles,
+                expanded: Some(expanded),
+                ..
+            }) => {
+                self.set_disclosure_expanded(
+                    DisclosureKey::Section(owner, InlineSection::UntrackedFiles),
+                    !expanded,
+                );
+                self.ensure_selection_visible();
+                Intent::None
+            }
             Some(VisibleRow::Inline { url, .. }) => {
                 url.map(Intent::OpenUrl).unwrap_or(Intent::None)
             }
@@ -4281,6 +4352,9 @@ impl App {
     fn semantic_fallback_ids(&self, selected: &RowId) -> Vec<RowId> {
         let mut candidates = Vec::new();
         match selected {
+            RowId::File(owner, section, _) => {
+                candidates.push(RowId::Section(owner.clone(), *section));
+            }
             RowId::Metadata(owner, _) => {
                 candidates.push(RowId::Section(owner.clone(), InlineSection::Overview));
             }
@@ -4388,7 +4462,9 @@ impl App {
             RowId::VirtualPullRequest(identity) => {
                 Some(BranchId::VirtualPullRequest(identity.clone()))
             }
-            RowId::Section(owner, _) | RowId::Metadata(owner, _) => Some(owner.clone()),
+            RowId::Section(owner, _) | RowId::Metadata(owner, _) | RowId::File(owner, _, _) => {
+                Some(owner.clone())
+            }
             RowId::Check(identity, _)
             | RowId::Reviewer(identity, _)
             | RowId::OpenComment(identity, _) => self.branch_for_pull_request(identity),
@@ -4758,6 +4834,82 @@ mod tests {
             bare,
             locked: None,
             prunable: None,
+        }
+    }
+
+    #[test]
+    fn untracked_files_are_flat_stable_and_open_in_editor() {
+        for singleton in [false, true] {
+            let mut repo = repository("/repo", true);
+            if singleton {
+                repo.worktrees.truncate(1);
+            }
+            let mut app = App::new(vec![repo], PathBuf::from("/repo"));
+            let root = PathBuf::from("/repo");
+            let owner = BranchId::Worktree(root.clone());
+            let section = InlineSection::UntrackedFiles;
+            let paths = vec![
+                PathBuf::from("new.rs"),
+                PathBuf::from("scratch/nested/a ;$(x)"),
+            ];
+            let update = |paths: Vec<PathBuf>| StatusUpdate {
+                generation: 0,
+                path: root.clone(),
+                result: Ok(WorktreeStatus {
+                    untracked: paths.len(),
+                    untracked_paths: paths,
+                    ..Default::default()
+                }),
+            };
+            assert!(
+                !app.visible_rows()
+                    .iter()
+                    .any(|row| matches!(row.id(), RowId::File(..)))
+            );
+            app.apply_status(update(paths.clone()));
+            let rows = app.visible_rows();
+            let files: Vec<_> = rows
+                .iter()
+                .filter(|row| matches!(row.id(), RowId::File(..)))
+                .collect();
+            assert_eq!(files.len(), 2);
+            assert_eq!(
+                app.visible_row_depth(files[0]),
+                app.visible_row_depth(files[1])
+            );
+            let id = RowId::File(owner.clone(), section, paths[1].clone());
+            app.selected = Some(id.clone());
+            assert_eq!(
+                app.handle_key(key(KeyCode::Enter)),
+                Intent::EditFile(root.join(&paths[1]))
+            );
+            app.apply_status(update(paths.clone()));
+            assert_eq!(app.selected, Some(id));
+            app.apply_status(update(vec![paths[0].clone()]));
+            assert_eq!(app.selected, Some(RowId::Section(owner.clone(), section)));
+            app.handle_key(key(KeyCode::Left));
+            app.apply_status(update(paths));
+            assert!(
+                !app.visible_rows()
+                    .iter()
+                    .any(|row| matches!(row.id(), RowId::File(..)))
+            );
+            app.handle_key(key(KeyCode::Right));
+            assert_eq!(
+                app.visible_rows()
+                    .iter()
+                    .filter(|row| matches!(row.id(), RowId::File(..)))
+                    .count(),
+                2
+            );
+            app.apply_status(update(vec![]));
+            assert!(
+                !app.visible_rows().iter().any(|row| matches!(
+                    row.id(),
+                    RowId::Section(_, InlineSection::UntrackedFiles)
+                ))
+            );
+            assert!(app.selected_row().is_some());
         }
     }
 

@@ -266,6 +266,11 @@ fn run_with_startup_deletion(
                             .terminal_mut()
                             .draw(|frame| ui::render(frame, &mut controller.app))?;
                     }
+                    Ok(ControlFlow::EditFile(path)) => {
+                        terminal.restore()?;
+                        crate::editor::exec(&path)?;
+                        return Ok(None);
+                    }
                     Ok(ControlFlow::Exit(selection)) => {
                         terminal.restore()?;
                         return Ok(selection);
@@ -296,6 +301,7 @@ fn run_with_startup_deletion(
 enum ControlFlow {
     Continue,
     Exit(Option<PathBuf>),
+    EditFile(PathBuf),
 }
 
 trait UrlOpener: Send + Sync {
@@ -566,6 +572,7 @@ impl Controller {
         }
         match intent {
             Intent::None => Ok(ControlFlow::Continue),
+            Intent::EditFile(path) => Ok(ControlFlow::EditFile(path)),
             Intent::Accept(path) => {
                 let absolute = std::fs::canonicalize(&path).unwrap_or(path);
                 Ok(ControlFlow::Exit(Some(absolute)))
@@ -3932,7 +3939,7 @@ mod tests {
             .expect("startup frame shows deletion");
         assert!((0..buffer.area.width).any(|x| {
             let cell = &buffer[(x, row)];
-            cell.symbol().trim().len() > 0
+            !cell.symbol().trim().is_empty()
                 && cell.modifier.contains(Modifier::DIM | Modifier::ITALIC)
         }));
         assert!(controller.app.is_deleting(&topic));

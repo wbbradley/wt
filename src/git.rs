@@ -197,6 +197,7 @@ pub fn status(runner: &dyn GitRunner, worktree: &Path) -> Result<WorktreeStatus,
         &[
             OsString::from("status"),
             OsString::from("--porcelain=v2"),
+            OsString::from("--untracked-files=all"),
             OsString::from("--branch"),
             OsString::from("-z"),
         ],
@@ -256,7 +257,12 @@ pub fn parse_status_porcelain(input: &[u8]) -> Result<WorktreeStatus, GitError> 
                     index += 1;
                 }
             }
-            Some(b'?') if field.get(1) == Some(&b' ') => status.untracked += 1,
+            Some(b'?') if field.get(1) == Some(&b' ') => {
+                status
+                    .untracked_paths
+                    .push(bytes_to_path(&field[2..], "untracked path")?);
+                status.untracked += 1;
+            }
             Some(b'!') if field.get(1) == Some(&b' ') => {}
             _ => return Err(GitError::MalformedStatus(lossy(field))),
         }
@@ -360,6 +366,48 @@ fn bytes_to_path(bytes: &[u8], field: &'static str) -> Result<PathBuf, GitError>
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn untracked_discovery_includes_nested_files_despite_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        run_checked(&SystemGit, root, &["init", "-q"]).unwrap();
+        run_checked(
+            &SystemGit,
+            root,
+            &["config", "status.showUntrackedFiles", "no"],
+        )
+        .unwrap();
+        fs::write(root.join(".gitignore"), "ignored\n").unwrap();
+        fs::write(root.join("tracked"), "").unwrap();
+        run_checked(&SystemGit, root, &["add", ".gitignore", "tracked"]).unwrap();
+        fs::create_dir_all(root.join("scratch/nested")).unwrap();
+        for name in ["root file", "scratch/nested/a;$(x)", "ignored"] {
+            fs::write(root.join(name), "").unwrap();
+        }
+        let status = status(&SystemGit, root).unwrap();
+        assert_eq!(status.untracked, 2);
+        assert_eq!(
+            status.untracked_paths,
+            vec![
+                PathBuf::from("root file"),
+                PathBuf::from("scratch/nested/a;$(x)")
+            ]
+        );
+        assert!(status.is_dirty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_parser_preserves_filename_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let status = parse_status_porcelain(b"? raw\xff\nname\0").unwrap();
+        assert_eq!(
+            status.untracked_paths[0].as_os_str().as_bytes(),
+            b"raw\xff\nname"
+        );
+        assert!(parse_status_porcelain(b"? \0").is_err());
+    }
 
     #[test]
     fn parses_all_worktree_states_and_spaces() {

@@ -567,6 +567,7 @@ pub struct WorktreeStatus {
     pub staged: usize,
     pub unstaged: usize,
     pub untracked: usize,
+    pub untracked_paths: Vec<PathBuf>,
 }
 
 impl WorktreeStatus {

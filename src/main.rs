@@ -7,6 +7,7 @@ mod cache;
 mod cli;
 mod clipboard;
 mod config;
+mod editor;
 mod git;
 mod github;
 mod materialize;

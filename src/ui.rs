@@ -830,6 +830,7 @@ fn inline_row_spans(
         return spans;
     }
     match kind {
+        InlineRowKind::File => spans.push(Span::raw(text.to_owned())),
         InlineRowKind::Metadata => {
             spans.extend(url_spans(
                 text,
@@ -1832,6 +1833,31 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
+
+    #[test]
+    fn file_rows_render_literal_flat_labels_and_disclosure() {
+        let spans = inline_row_spans(
+            InlineRowKind::File,
+            InlineSection::UntrackedFiles,
+            "scratch/nested/a ;$(x)",
+            None,
+            "  └─ ".to_owned(),
+            80,
+        );
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "  └─ scratch/nested/a ;$(x)");
+        let spans = inline_row_spans(
+            InlineRowKind::Section,
+            InlineSection::UntrackedFiles,
+            "Untracked files",
+            Some(true),
+            String::new(),
+            80,
+        );
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("▾"));
+        assert!(text.contains("Untracked files"));
+    }
 
     #[test]
     fn redraw_uses_one_row_snapshot_and_cached_current_location() {

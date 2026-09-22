@@ -117,6 +117,7 @@ A non-bare repository with exactly one worktree omits the separate branch row an
 Disclosure defaults match Rollup while retaining `wt`'s local metadata:
 
 - repositories, complete branch subtrees, Open comments, and Stacked worktrees/PRs/branches start expanded;
+- Local worktrees (including singleton repository rows) show an initially expanded **Untracked files** section when files exist. Files are flat leaves with worktree-relative paths, including files inside wholly untracked directories. Clean and virtual worktrees omit it; refresh preserves your fold choices. Full discovery can cost more in large untracked directories.
 - Overview, Checks, Pending, Valid Results, Reviewers, and Backburner start collapsed;
 - Overview expands to URL, base/head, full head SHA, state/update time, auto-merge, conflict, warning, and stale/loading detail state;
 - Checks keeps failure/error and unknown rows direct, Pending/Expected under Pending, and successful/neutral/skipped rows under Valid Results;
@@ -131,7 +132,7 @@ Navigation:
 - `l`/Right expands a disclosure and is a no-op on leaves. Inner fold choices survive outer folds and refreshes.
 - `f` focuses the selected repository, Backburner group, branch, PR, or owning branch of a selected detail. Pressing `f` again on a more specific visible item replaces the current focus, so a repository focus can be narrowed to one of its PRs. `Esc` leaves focus mode. Focus persists across restarts using the repository path or canonical pull-request identity rather than a row position.
 - `]`/`[` moves to the next/previous actionable non-Backburner PR, wraps, and reveals only its required ancestor path.
-- `Enter` toggles a repository/disclosure, selects a local worktree, materializes a virtual PR, or opens an inline URL with PR fallback. `w` opens the selected item or owning PR in a browser.
+- `Enter` toggles a repository/disclosure, selects a local worktree, materializes a virtual PR, opens an untracked file in `$EDITOR`, or opens an inline URL with PR fallback. `w` opens the selected item or owning PR in a browser.
 - `r` coalesces local and GitHub refreshes. `?` or Space opens the action palette. `q`/`Esc`/`Ctrl-c` cancels when unfocused; while focused, `Esc` restores the full tree. During materialization, Ctrl-C stops the active process and returns to the TUI.
 
 Press `/` to edit a case-insensitive search regular expression. It searches rendered repository, branch, section, reviewer, comment, and check text plus hidden paths, SHAs, URLs, warnings, IDs, and status/error values. Matching updates incrementally, highlights visible matches in black on yellow, and retains only exact matching rows plus their complete ancestor paths; an incomplete or invalid expression shows no rows until it becomes valid. Enter commits the search as a worktree/branch pruner: repositories and branches without matches stay hidden, while every detail row under each matching branch is restored. Search preserves saved folds, expanding only the paths needed to expose exact hits, and has its own temporary `h`/`l` overrides. While focus mode is active, search is limited to the focused scope; committing, replacing, or clearing search leaves focus and saved folds intact. `/` replaces search and Esc clears it, restoring the exact saved tree choices.
@@ -310,3 +311,16 @@ zsh -n shell/wt.zsh
 ## License
 
 `wt` is available under the [MIT License](LICENSE).
+
+### Opening files in an editor
+
+Enter on a file restores the terminal and replaces `wt` with `$EDITOR`. For example,
+`export EDITOR='code --wait'` or `export EDITOR='vim -f'`. Arguments support quotes
+and backslash escapes; shell expansions, pipelines, and redirections are not
+evaluated. The file is passed as a separate absolute-path argument, preserving
+spaces, special characters, and filename bytes. Missing/invalid configuration,
+vanished files, and launch failures produce an error.
+
+The editor uses the controlling terminal for stdin, stdout, and stderr, including
+when the Bash or Zsh wrapper captures stdout. Closing it exits the invocation:
+there is no return to the tree and no directory selection or shell navigation.
