@@ -329,6 +329,7 @@ impl VisibleRow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     CopyAgentPrompt,
+    CopyFilePath,
     CopyReviewRequest,
     OpenPullRequestWeb,
     Create,
@@ -346,8 +347,9 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::CopyAgentPrompt,
+        Self::CopyFilePath,
         Self::CopyReviewRequest,
         Self::OpenPullRequestWeb,
         Self::Create,
@@ -367,6 +369,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Self::CopyAgentPrompt => "copy agent prompt",
+            Self::CopyFilePath => "copy relative file path",
             Self::CopyReviewRequest => "copy review request",
             Self::OpenPullRequestWeb => "open pull request in browser",
             Self::Create => "create worktree",
@@ -386,7 +389,7 @@ impl Action {
 
     pub fn shortcut(self) -> Option<&'static str> {
         match self {
-            Self::CopyAgentPrompt => Some("c"),
+            Self::CopyAgentPrompt | Self::CopyFilePath => Some("c"),
             Self::CopyReviewRequest => Some("p"),
             Self::OpenPullRequestWeb => Some("w"),
             Self::Create => None,
@@ -2531,7 +2534,7 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) -> Intent {
         self.inline_error = None;
         if let Some(view) = &mut self.file_view {
-            if key.code == KeyCode::Esc {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 self.file_view = None;
             } else if key.code == KeyCode::Char('c')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2621,6 +2624,9 @@ impl App {
             }
             KeyCode::Char('q') => Intent::Cancel,
             KeyCode::Char('w') => self.open_selected_url(),
+            KeyCode::Char('c') if self.selected_file().is_some() => {
+                Intent::BeginAction(Action::CopyFilePath)
+            }
             KeyCode::Char('e') if self.selected_file().is_some() => {
                 Intent::EditFile(self.selected_file().unwrap())
             }
@@ -2855,6 +2861,21 @@ impl App {
         self.modal = Some(Modal::Confirm { action, summary });
     }
 
+    pub fn selected_file_relative_path(&self) -> Option<PathBuf> {
+        match self.selected_row()? {
+            VisibleRow::Inline {
+                id:
+                    RowId::File(
+                        BranchId::Worktree(_),
+                        InlineSection::UntrackedFiles | InlineSection::IgnoredFiles,
+                        path,
+                    ),
+                ..
+            } => Some(path),
+            _ => None,
+        }
+    }
+
     pub fn selected_file(&self) -> Option<PathBuf> {
         match self.selected_row()? {
             VisibleRow::Inline {
@@ -2871,7 +2892,7 @@ impl App {
             enabled: false,
             reason: Some(reason.to_owned()),
         };
-        if action == Action::DeleteFile {
+        if matches!(action, Action::DeleteFile | Action::CopyFilePath) {
             return if self.selected_file().is_some() {
                 ActionAvailability {
                     action,
@@ -2937,7 +2958,9 @@ impl App {
                     disabled("repository is already registered")
                 }
             }
-            Action::DeleteFile => unreachable!("handled before selection validation"),
+            Action::DeleteFile | Action::CopyFilePath => {
+                unreachable!("handled before selection validation")
+            }
             Action::CopyAgentPrompt => unreachable!("handled before selection validation"),
             Action::CopyReviewRequest => {
                 unreachable!("handled before selection validation")
@@ -4882,8 +4905,14 @@ mod tests {
             assert_eq!(app.handle_key(key(code)), Intent::None);
             assert!(app.file_view.is_some());
         }
-        assert_eq!(app.handle_key(key(KeyCode::Esc)), Intent::None);
-        assert!(app.file_view.is_none());
+        for close in [KeyCode::Esc, KeyCode::Char('q')] {
+            assert_eq!(app.handle_key(key(close)), Intent::None);
+            assert!(app.file_view.is_none());
+            if close == KeyCode::Esc {
+                app.file_view =
+                    Some(crate::file_view::FileView::load(dir.path().join("notes.md")).unwrap());
+            }
+        }
         assert_eq!(app.selected, selected);
         assert_eq!(app.focus_target, focus);
         assert_eq!(app.filter, "repo");

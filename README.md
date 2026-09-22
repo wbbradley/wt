@@ -318,7 +318,7 @@ Enter on an untracked or configured ignored file opens a read-only pane inside
 `wt`. Files ending in `.md` display formatted Markdown; other files display plain
 text. Use `j`/`k` or arrow keys to scroll, PageUp/PageDown for a page,
 Ctrl-u/Ctrl-d for half a page, and `g`/`G` for the beginning/end. Long lines wrap
-to the pane width. Esc returns to the tree with its selection, scroll, folds,
+to the pane width. `q` or Esc returns to the tree with its selection, scroll, folds,
 focus, and search preserved. The viewer displays a snapshot taken when opened.
 
 The viewer accepts UTF-8 text files up to 1 MiB. Binary, oversized, unreadable,
@@ -369,6 +369,9 @@ or bare roots. Ignored files do not contribute to dirty state or untracked count
 Refresh rereads the setting and file/ignore state. Enter opens the file viewer;
 `e` uses the editor handoff described above. A file removed before opening
 produces a clear error.
+
+Press `c` on an untracked or ignored file in the tree to copy its worktree-relative
+path to the clipboard.
 
 Press `d` on an untracked or ignored file to open a **Confirm delete file** dialog
 showing its full path. Enter or `y` permanently deletes it; `n` or Esc cancels.

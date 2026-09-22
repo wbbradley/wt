@@ -561,7 +561,10 @@ impl Controller {
     fn handle_intent(&mut self, intent: Intent) -> Result<ControlFlow, TuiError> {
         if !matches!(
             intent,
-            Intent::None | Intent::BeginAction(Action::CopyAgentPrompt | Action::CopyReviewRequest)
+            Intent::None
+                | Intent::BeginAction(
+                    Action::CopyAgentPrompt | Action::CopyFilePath | Action::CopyReviewRequest
+                )
         ) {
             if let Some(copy) = &mut self.clipboard_copy {
                 copy.show_feedback = false;
@@ -699,7 +702,10 @@ impl Controller {
             }
             return Ok(());
         }
-        if matches!(action, Action::CopyAgentPrompt | Action::CopyReviewRequest) {
+        if matches!(
+            action,
+            Action::CopyAgentPrompt | Action::CopyFilePath | Action::CopyReviewRequest
+        ) {
             // Ignore repeated requests until the current copy is reaped.
             if self.clipboard_copy.is_some() {
                 return Ok(());
@@ -711,6 +717,14 @@ impl Controller {
                     self.app.agent_prompt(),
                     "c: nothing to address here",
                     "copied to clipboard",
+                    "c: clipboard error",
+                ),
+                Action::CopyFilePath => (
+                    self.app
+                        .selected_file_relative_path()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    "c: no file under selection",
+                    "copied relative file path",
                     "c: clipboard error",
                 ),
                 Action::CopyReviewRequest => (
@@ -750,7 +764,7 @@ impl Controller {
             .ok_or(TuiError::RepositoryGone)?;
         let repository_path = repository.config.path.clone();
         match action {
-            Action::DeleteFile => unreachable!("handled above"),
+            Action::DeleteFile | Action::CopyFilePath => unreachable!("handled above"),
             Action::CopyAgentPrompt => unreachable!("handled before repository resolution"),
             Action::CopyReviewRequest => {
                 unreachable!("handled before repository resolution")
@@ -2907,6 +2921,69 @@ mod tests {
         finish_clipboard(&mut controller);
         assert_eq!(controller.app.progress.as_deref(), Some("newer operation"));
         assert!(controller.clipboard_copy.is_none());
+    }
+
+    #[test]
+    fn copy_file_shortcut_copies_worktree_relative_path_from_both_sections() {
+        use crate::app::{BranchId, InlineSection, StatusState};
+        use crate::model::WorktreeStatus;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git::run_git(&SystemGit, &root, &["init".into(), "-q".into()]).unwrap();
+        let mut catalog = Catalog::default();
+        catalog.repositories.push(RepositoryConfig {
+            path: root.clone(),
+            label: None,
+            worktree_root: None,
+            github_remote: None,
+            github_remotes: Default::default(),
+            github_preferred_remote: None,
+        });
+        let mut app = App::new(
+            load_repository_views(&catalog, dir.path()),
+            dir.path().to_owned(),
+        );
+        let relative = PathBuf::from("nested/file ;$(literal) with spaces.md");
+        app.statuses.insert(
+            root.clone(),
+            StatusState::Ready(WorktreeStatus {
+                untracked: 1,
+                untracked_paths: vec![relative.clone()],
+                ignored_paths: vec![relative.clone()],
+                ..Default::default()
+            }),
+        );
+        let clipboard = Arc::new(FakeClipboard {
+            copied: Mutex::new(Vec::new()),
+            error: None,
+        });
+        let mut controller =
+            Controller::with_clipboard(dir.path().join("wt.json"), catalog, app, clipboard.clone());
+        for section in [InlineSection::UntrackedFiles, InlineSection::IgnoredFiles] {
+            let selected = RowId::File(BranchId::Worktree(root.clone()), section, relative.clone());
+            controller.app.selected = Some(selected.clone());
+            let intent = controller
+                .app
+                .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+            assert_eq!(intent, Intent::BeginAction(Action::CopyFilePath));
+            controller.handle_intent(intent).unwrap();
+            finish_clipboard(&mut controller);
+            assert_eq!(controller.app.selected, Some(selected));
+            assert_eq!(
+                controller.app.progress.as_deref(),
+                Some("copied relative file path")
+            );
+        }
+        assert_eq!(
+            *clipboard.copied.lock().unwrap(),
+            vec![
+                relative.to_string_lossy().into_owned(),
+                relative.to_string_lossy().into_owned(),
+            ]
+        );
     }
 
     #[test]

@@ -127,7 +127,7 @@ impl FileView {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} ", sanitize(&self.path.to_string_lossy())))
-            .title_bottom(" j/k ↑/↓ scroll · PgUp/PgDn Ctrl-u/d page · g/G ends · Esc back ");
+            .title_bottom(" j/k ↑/↓ scroll · PgUp/PgDn Ctrl-u/d page · g/G ends · q/Esc back ");
         let inner = block.inner(area);
         self.resize(inner.width as usize, inner.height as usize);
         frame.render_widget(block, area);
@@ -386,7 +386,7 @@ mod tests {
             if extension == "txt" {
                 assert!(display.contains("    text"));
             }
-            assert!(display.contains("Esc back"));
+            assert!(display.contains("q/Esc back"));
             assert!(!display.contains('\x1b'));
         }
     }
