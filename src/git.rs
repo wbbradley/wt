@@ -66,8 +66,7 @@ fn system_git(
             .map_err(|source| GitError::Launch { source })?;
         command.stdin(file);
     }
-    let output = command
-        .output()
+    let output = crate::logging::output(&mut command, false)
         .map_err(|source| GitError::Launch { source })?;
     Ok(CommandOutput {
         stdout: output.stdout,

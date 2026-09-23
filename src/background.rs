@@ -285,7 +285,12 @@ impl CancellableGitRunner {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let mut child = command.spawn()?;
+        let span = crate::logging::command_span(&command, self.secret.as_deref());
+        let _entered = span.enter();
+        tracing::info!("subprocess started");
+        let mut child = command.spawn().inspect_err(|error| {
+            tracing::error!(%error, "subprocess failed to launch");
+        })?;
         let stdout = child.stdout.take().expect("piped stdout is available");
         let stderr = child.stderr.take().expect("piped stderr is available");
         let stdout_reader = thread::spawn(move || read_pipe(stdout));
@@ -309,6 +314,7 @@ impl CancellableGitRunner {
                 let _ = child.wait();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
+                tracing::warn!("subprocess cancelled");
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     "Git operation cancelled",
@@ -318,6 +324,14 @@ impl CancellableGitRunner {
         };
         let stdout = join_reader(stdout_reader)?;
         let stderr = join_reader(stderr_reader)?;
+        crate::logging::record_output(
+            status.success(),
+            status.code(),
+            &stdout,
+            &stderr,
+            self.secret.as_deref(),
+            false,
+        );
         Ok(ProcessOutput {
             stdout,
             stderr,

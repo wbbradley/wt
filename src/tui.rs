@@ -1317,7 +1317,7 @@ impl Controller {
         if repository.path.is_dir() {
             command.current_dir(&repository.path);
         }
-        let output = command.output().ok()?;
+        let output = crate::logging::output(&mut command, false).ok()?;
         if !output.status.success() {
             return None;
         }

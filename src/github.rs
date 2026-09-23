@@ -338,12 +338,14 @@ impl CredentialProvider for SystemCredentials {
     }
 
     fn repository_git_config(&self, anchor: &Path, key: &str) -> Option<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(anchor)
-            .args(["config", "--local", "--get", key])
-            .output()
-            .ok()?;
+        let output = crate::logging::output(
+            Command::new("git")
+                .arg("-C")
+                .arg(anchor)
+                .args(["config", "--local", "--get", key]),
+            true,
+        )
+        .ok()?;
         if !output.status.success() {
             return None;
         }
@@ -351,10 +353,11 @@ impl CredentialProvider for SystemCredentials {
     }
 
     fn gh_token(&self, host: &str) -> Option<String> {
-        let output = Command::new("gh")
-            .args(["auth", "token", "--hostname", host])
-            .output()
-            .ok()?;
+        let output = crate::logging::output(
+            Command::new("gh").args(["auth", "token", "--hostname", host]),
+            true,
+        )
+        .ok()?;
         if !output.status.success() {
             return None;
         }

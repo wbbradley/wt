@@ -11,6 +11,7 @@ mod editor;
 mod file_view;
 mod git;
 mod github;
+mod logging;
 mod materialize;
 mod merged_cleanup;
 mod model;
@@ -22,6 +23,9 @@ mod tui;
 mod ui;
 
 fn main() {
+    if let Err(error) = logging::init() {
+        eprintln!("wt: failed to initialize logging: {error}");
+    }
     match cli::run(cli::Cli::parse()) {
         Ok(selection) => {
             if let Err(error) =
@@ -32,6 +36,7 @@ fn main() {
             }
         }
         Err(error) => {
+            tracing::error!(%error, "command failed");
             eprintln!("wt: {error}");
             std::process::exit(1);
         }

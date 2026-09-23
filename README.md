@@ -380,3 +380,5 @@ showing its full path. Enter or `y` permanently deletes it; `n` or Esc cancels.
 The listing refreshes after deletion. Symlinks are removed without deleting their
 targets; directories are never recursively deleted. On worktree rows, `d` keeps
 its existing remove-worktree behavior.
+
+Diagnostics use `tracing` and append to `~/wt.log` by default. Set `WT_LOG_PATH` to change the file and `RUST_LOG` to change the filter (default: `info`). Subprocess logs include arguments, exit status, stdout, and stderr; credential lookup output is suppressed and authenticated Git output redacts the active token. Logs stay out of the TUI and shell selection output.

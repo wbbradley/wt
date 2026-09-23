@@ -141,25 +141,26 @@ pub fn materialize_pull_request(
     let real_fetch = real_remote.map(|remote| {
         let branch = authored.pull_request.head.branch.clone();
         let target = format!("refs/remotes/{remote}/{branch}");
-        let result = ensure_remote_tracking_configuration(runner, &repository.path, &remote)
-            .map_err(MaterializeError::from)
-            .and_then(|()| {
-                let local_target = optional_commit(runner, &repository.path, &target)?;
-                if local_target
-                    .as_deref()
-                    .is_some_and(|commit| commit.eq_ignore_ascii_case(expected_head))
-                {
-                    Ok(())
-                } else {
-                    fetch_ref(
-                        fetch_runner,
-                        &repository.path,
-                        &remote,
-                        &format!("+refs/heads/{branch}:{target}"),
-                        https_token,
-                    )
-                }
-            });
+        let result =
+            ensure_remote_tracking_configuration(runner, &repository.path, &remote, &branch)
+                .map_err(MaterializeError::from)
+                .and_then(|()| {
+                    let local_target = optional_commit(runner, &repository.path, &target)?;
+                    if local_target
+                        .as_deref()
+                        .is_some_and(|commit| commit.eq_ignore_ascii_case(expected_head))
+                    {
+                        Ok(())
+                    } else {
+                        fetch_ref(
+                            fetch_runner,
+                            &repository.path,
+                            &remote,
+                            &format!("+refs/heads/{branch}:{target}"),
+                            https_token,
+                        )
+                    }
+                });
         (
             result,
             branch,
@@ -472,6 +473,7 @@ fn ensure_remote_tracking_configuration(
     runner: &dyn GitRunner,
     repository: &Path,
     remote: &str,
+    branch: &str,
 ) -> Result<(), git::GitError> {
     let key = format!("remote.{remote}.fetch");
     let existing = runner.run(
@@ -482,9 +484,31 @@ fn ensure_remote_tracking_configuration(
             OsString::from(&key),
         ],
     )?;
-    if existing.success && !existing.stdout.is_empty() {
+    let source = format!("refs/heads/{branch}");
+    let target = format!("refs/remotes/{remote}/{branch}");
+    let configured = String::from_utf8_lossy(&existing.stdout);
+    if configured.lines().any(|spec| {
+        let spec = spec.strip_prefix('+').unwrap_or(spec);
+        let Some((from, to)) = spec.split_once(':') else {
+            return false;
+        };
+        if let Some((prefix, suffix)) = from.split_once('*') {
+            source
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+                .is_some_and(|matched| to.replace('*', matched) == target)
+        } else {
+            from == source && to == target
+        }
+    }) {
         return Ok(());
     }
+    // Preserve narrow/custom fetch rules; add only the selected PR branch.
+    let refspec = if configured.trim().is_empty() {
+        format!("+refs/heads/*:refs/remotes/{remote}/*")
+    } else {
+        format!("+{source}:{target}")
+    };
     git::run_git(
         runner,
         repository,
@@ -493,7 +517,7 @@ fn ensure_remote_tracking_configuration(
             OsString::from("--local"),
             OsString::from("--add"),
             OsString::from(key),
-            OsString::from(format!("+refs/heads/*:refs/remotes/{remote}/*")),
+            OsString::from(refspec),
         ],
     )?;
     Ok(())
@@ -1030,6 +1054,65 @@ mod tests {
         assert!(reused.reused);
         assert_eq!(reused.path, materialized.path);
         assert_eq!(fetches.requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn restricted_fetch_configuration_supports_pr_tracking() {
+        for existing in [
+            "+refs/heads/main:refs/remotes/fork/main",
+            "+refs/heads/*:refs/heads/*",
+            "+refs/heads/*:refs/remotes/custom/*",
+        ] {
+            let fixture = Fixture::new();
+            let repository = fixture.local_repository(true);
+            git(&repository.path, &["config", "remote.fork.fetch", existing]);
+            let authored = fixture.authored(42, "feature/topic", "contributor/project");
+            let materialized = materialize_pull_request(
+                &SystemGit,
+                &SystemFetchRunner,
+                &repository,
+                &authored,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                git_stdout(
+                    &materialized.path,
+                    &["config", "branch.feature/topic.remote"]
+                ),
+                "fork"
+            );
+            assert_eq!(
+                git_stdout(
+                    &materialized.path,
+                    &["config", "branch.feature/topic.merge"]
+                ),
+                "refs/heads/feature/topic"
+            );
+            assert_eq!(
+                git_stdout(
+                    &repository.path,
+                    &["config", "--get-all", "remote.fork.fetch"]
+                ),
+                format!("{existing}\n+refs/heads/feature/topic:refs/remotes/fork/feature/topic")
+            );
+            let reused = materialize_pull_request(
+                &SystemGit,
+                &SystemFetchRunner,
+                &repository,
+                &authored,
+                None,
+            )
+            .unwrap();
+            assert!(reused.reused);
+            assert_eq!(
+                git_stdout(
+                    &repository.path,
+                    &["config", "--get-all", "remote.fork.fetch"]
+                ),
+                format!("{existing}\n+refs/heads/feature/topic:refs/remotes/fork/feature/topic")
+            );
+        }
     }
 
     #[test]

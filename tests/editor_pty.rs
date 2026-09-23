@@ -106,7 +106,7 @@ exit "$EDITOR_EXIT"
 
     let mut master_fd = -1;
     let mut slave_fd = -1;
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: 40,
         ws_col: 160,
         ws_xpixel: 0,
@@ -119,8 +119,8 @@ exit "$EDITOR_EXIT"
                 &mut master_fd,
                 &mut slave_fd,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut(),
+                &mut size,
             )
         },
         0
@@ -173,7 +173,7 @@ exit "$EDITOR_EXIT"
     }
     unsafe {
         command.pre_exec(move || {
-            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
