@@ -2996,6 +2996,11 @@ impl App {
         let Some((repository, _)) = self.selected_repository() else {
             return disabled("select a repository or worktree first");
         };
+        if action == Action::RemoveRepository
+            && !matches!(self.selected, Some(RowId::Repository(_)))
+        {
+            return disabled("select the repository node to unregister it");
+        }
         if repository.stale_error.is_some() {
             return match action {
                 Action::EditRepository | Action::RemoveRepository => ActionAvailability {
@@ -8524,6 +8529,48 @@ mod tests {
             app.selected,
             Some(RowId::Worktree(PathBuf::from("/two-topic")))
         );
+    }
+
+    #[test]
+    fn unregister_requires_selecting_the_repository_node() {
+        let mut app = App::new(vec![repository("/repo", true)], PathBuf::from("/elsewhere"));
+        let owner = BranchId::Worktree(PathBuf::from("/repo-topic"));
+        for selected in [
+            RowId::Worktree(PathBuf::from("/repo")),
+            RowId::Worktree(PathBuf::from("/repo-topic")),
+            RowId::Section(owner.clone(), InlineSection::UntrackedFiles),
+            RowId::File(
+                owner.clone(),
+                InlineSection::UntrackedFiles,
+                PathBuf::from("notes.txt"),
+            ),
+            RowId::Metadata(owner, "overview-url".to_owned()),
+        ] {
+            app.selected = Some(selected.clone());
+            assert_eq!(app.handle_key(key(KeyCode::Char('x'))), Intent::None);
+            assert_eq!(
+                app.inline_error.as_deref(),
+                Some("select the repository node to unregister it"),
+                "{selected:?}"
+            );
+            app.modal = Some(Modal::Palette {
+                selected: Action::ALL
+                    .iter()
+                    .position(|action| *action == Action::RemoveRepository)
+                    .unwrap(),
+            });
+            assert_eq!(app.handle_key(key(KeyCode::Enter)), Intent::None);
+            assert!(matches!(app.modal, Some(Modal::Palette { .. })));
+            app.modal = None;
+        }
+
+        app.selected = Some(RowId::Repository(PathBuf::from("/repo")));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('x'))),
+            Intent::BeginAction(Action::RemoveRepository)
+        );
+        app.repositories[0].session_only = true;
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), Intent::None);
     }
 
     #[test]

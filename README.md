@@ -143,7 +143,7 @@ Direct actions:
 - `p`: copy one `{url} - {title}` review-request line per PR in the same structural scope.
 - `b`: toggle the selected PR and GitHub-stacked descendants in Backburner.
 - `n`: common tracked-worktree creation; `m`: move; `L`/`U`: lock/unlock; `d`: remove; `R`: repair; `P`: prune. Advanced create remains available in the action palette. `d` removes in the background: the interface stays usable, the worktree renders dimmed and italicized with a `deleting` marker while Git works, and worktree actions and navigation are refused on it until the removal finishes. A failed removal restores the row and reports why.
-- `a`: register a session repository; `e`: edit/relink; `x`: unregister; `w`: open the associated PR/item URL.
+- `a`: register a session repository; `e`: edit/relink; `x`: unregister (repository node only); `w`: open the associated PR/item URL.
 
 All actions remain in the palette, disabled entries explain why, and mutating forms show exact inputs before a separate confirmation. `n` pre-fills `<github-user>/`, accepts an optional starting branch, and defaults a blank start to the preferred remote's trunk. A successful tracked-worktree creation exits so the shell wrapper can enter it.
 
