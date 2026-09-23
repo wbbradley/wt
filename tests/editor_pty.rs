@@ -53,7 +53,9 @@ fn run_editor(editor: Option<&str>, zsh: bool, ignored: bool, disappear: bool) {
 
 fn run_session(editor: Option<&str>, zsh: bool, ignored: bool, disappear: bool, viewer: bool) {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path();
+    // macOS exposes the temporary directory through a /var -> /private/var symlink.
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let root = root.as_path();
     let repo = root.join("repo");
     fs::create_dir(&repo).unwrap();
     assert!(
@@ -128,14 +130,20 @@ exit "$EDITOR_EXIT"
     let mut master = unsafe { File::from_raw_fd(master_fd) };
     let slave = unsafe { File::from_raw_fd(slave_fd) };
     unsafe {
-        libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        assert_ne!(
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK),
+            -1
+        );
+        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+            assert_ne!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), -1);
+        }
     }
     let shell = if zsh { "zsh" } else { "bash" };
     let wrapper = format!("{}/shell/wt.{shell}", env!("CARGO_MANIFEST_DIR"));
     let mut command = Command::new(shell);
     command.args([
         "-c",
-        r#"source "$WRAPPER"; wt; result=$?; printf 'RESULT=%s\n' "$result"; pwd"#,
+        r#"source "$WRAPPER"; wt; result=$?; printf 'RESULT=%s\n' "$result"; pwd; printf 'WT_TEST_DONE\n' >&2; read -r acknowledgement"#,
     ]);
     command
         .current_dir(root)
@@ -146,6 +154,7 @@ exit "$EDITOR_EXIT"
         )
         .env("WT_CONFIG_PATH", config)
         .env("WT_STATE_PATH", root.join("state.json"))
+        .env("WT_LOG_PATH", root.join("wt.log"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env(
             "EDITOR_EXIT",
@@ -186,6 +195,7 @@ exit "$EDITOR_EXIT"
     let mut viewed = false;
     let mut returned = false;
     let mut after_close = 0;
+    let mut restored_termios = None;
     loop {
         let mut buffer = [0; 65536];
         while let Ok(n) = master.read(&mut buffer) {
@@ -231,6 +241,19 @@ exit "$EDITOR_EXIT"
                 returned = true;
             }
         }
+        if restored_termios.is_none() && String::from_utf8_lossy(&output).contains("WT_TEST_DONE") {
+            // Inspect restoration while the session leader still owns the PTY.
+            // macOS rejects tcgetattr on the slave after that process exits.
+            let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+            assert_eq!(
+                unsafe { libc::tcgetattr(slave.as_raw_fd(), termios.as_mut_ptr()) },
+                0,
+                "cannot inspect restored terminal: {}",
+                std::io::Error::last_os_error()
+            );
+            restored_termios = Some(unsafe { termios.assume_init() });
+            master.write_all(b"\n").unwrap();
+        }
         if child.try_wait().unwrap().is_some() {
             break;
         }
@@ -260,12 +283,7 @@ exit "$EDITOR_EXIT"
     let terminal_output = String::from_utf8_lossy(&output);
     assert!(terminal_output.contains("\x1b[?1049l"));
     assert!(terminal_output.contains("\x1b[?25h"));
-    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
-    assert_eq!(
-        unsafe { libc::tcgetattr(slave.as_raw_fd(), termios.as_mut_ptr()) },
-        0
-    );
-    let termios = unsafe { termios.assume_init() };
+    let termios = restored_termios.expect("shell must wait for terminal inspection");
     assert_ne!(termios.c_lflag & libc::ICANON, 0);
     assert_ne!(termios.c_lflag & libc::ECHO, 0);
     if viewer {
