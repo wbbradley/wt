@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -329,11 +329,23 @@ struct SystemUrlOpener;
 impl UrlOpener for SystemUrlOpener {
     fn open(&self, url: &str) -> Result<(), String> {
         #[cfg(target_os = "macos")]
-        let status = Command::new("open").arg(url).status();
+        let mut command = Command::new("open");
         #[cfg(target_os = "windows")]
-        let status = Command::new("cmd").args(["/C", "start", "", url]).status();
+        let mut command = {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "start", ""]);
+            command
+        };
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let status = Command::new("xdg-open").arg(url).status();
+        let mut command = Command::new("xdg-open");
+        // Browser descendants can keep these handles after the opener exits.
+        // Keep their diagnostics and input away from the active TUI.
+        let status = command
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let status = status.map_err(|error| format!("cannot launch URL opener: {error}"))?;
         if status.success() {
             Ok(())
