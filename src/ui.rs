@@ -1584,6 +1584,59 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: &Modal, area: Rect) {
     let popup = centered_rect(72, 70, area);
     frame.render_widget(Clear, popup);
     match modal {
+        Modal::CreateRepository {
+            identity,
+            path,
+            bare,
+            active,
+        } => {
+            let mut lines = vec![
+                Line::raw(format!(
+                    "Repository: {}/{}",
+                    identity.repository.host,
+                    identity.repository.full_name()
+                )),
+                Line::raw("Choose where the repository should live."),
+                Line::raw(""),
+                Line::styled(
+                    format!("Path: {path}{}", if *active == 0 { "█" } else { "" }),
+                    if *active == 0 {
+                        Style::default().fg(ACCENT)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Line::styled(
+                    format!("[{}] Bare repository", if *bare { "x" } else { " " }),
+                    if *active == 1 {
+                        Style::default().fg(ACCENT)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Line::raw(""),
+                Line::styled(
+                    "Use an absolute path or ~/path. Tab changes field; Space toggles.",
+                    Style::default().fg(MUTED),
+                ),
+                Line::raw("Enter creates repository · Esc cancels"),
+            ];
+            if let Some(error) = &app.inline_error {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!("error: {error}"),
+                    Style::default().fg(DANGER),
+                ));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .title(" Create repository ")
+                        .borders(Borders::ALL),
+                ),
+                popup,
+            );
+        }
         Modal::Palette { selected } => {
             let items: Vec<ListItem<'_>> = crate::app::Action::ALL
                 .iter()
@@ -3144,6 +3197,43 @@ mod tests {
         assert!(!stale.contains("network unavailable"));
         assert!(!stale.contains("12 remaining"));
         assert!(!stale.contains("warning: partial response"));
+    }
+
+    #[test]
+    fn repository_dialog_shows_destination_checkbox_and_errors() {
+        let mut app = App::new(Vec::new(), PathBuf::from("/outside"));
+        app.modal = Some(Modal::CreateRepository {
+            identity: crate::model::CanonicalPullRequestId {
+                repository: crate::model::GitHubRepositoryIdentity::canonical(
+                    "github.com",
+                    "team",
+                    "project",
+                ),
+                number: 42,
+            },
+            path: "/chosen/project".to_owned(),
+            bare: false,
+            active: 0,
+        });
+        app.inline_error = Some("destination is occupied".to_owned());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let content = buffer_text(terminal.backend().buffer());
+        for expected in [
+            "Create repository",
+            "github.com/team/project",
+            "Path: /chosen/project█",
+            "[ ] Bare repository",
+            "error: destination is occupied",
+            "Esc cancels",
+        ] {
+            assert!(content.contains(expected), "missing {expected:?}");
+        }
+        if let Some(Modal::CreateRepository { bare, .. }) = &mut app.modal {
+            *bare = true;
+        }
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("[x] Bare repository"));
     }
 
     #[test]

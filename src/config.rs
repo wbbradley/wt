@@ -168,6 +168,38 @@ fn resolve_repository_root_with(
     expression: &str,
     environment: impl Fn(&str) -> Option<OsString>,
 ) -> Result<PathBuf, ConfigError> {
+    let normalized = expand_repository_path_with(expression, environment)?;
+    fs::create_dir_all(&normalized).map_err(|source| ConfigError::RepositoryRoot {
+        path: normalized.clone(),
+        source,
+    })?;
+    let canonical =
+        fs::canonicalize(&normalized).map_err(|source| ConfigError::RepositoryRoot {
+            path: normalized.clone(),
+            source,
+        })?;
+    if !canonical.is_dir() {
+        return Err(ConfigError::InvalidRepositoryRoot {
+            expression: expression.to_owned(),
+            message: format!("expanded path {} is not a directory", canonical.display()),
+        });
+    }
+    NamedTempFile::new_in(&canonical).map_err(|source| ConfigError::RepositoryRoot {
+        path: canonical.clone(),
+        source,
+    })?;
+    Ok(canonical)
+}
+
+/// Expand and normalize a destination without creating any filesystem entries.
+pub fn expand_repository_path(expression: &str) -> Result<PathBuf, ConfigError> {
+    expand_repository_path_with(expression, |name| env::var_os(name))
+}
+
+fn expand_repository_path_with(
+    expression: &str,
+    environment: impl Fn(&str) -> Option<OsString>,
+) -> Result<PathBuf, ConfigError> {
     let invalid = |message: String| ConfigError::InvalidRepositoryRoot {
         expression: expression.to_owned(),
         message,
@@ -221,26 +253,7 @@ fn resolve_repository_root_with(
             path: expanded.clone(),
             source,
         })?;
-    fs::create_dir_all(&normalized).map_err(|source| ConfigError::RepositoryRoot {
-        path: normalized.clone(),
-        source,
-    })?;
-    let canonical =
-        fs::canonicalize(&normalized).map_err(|source| ConfigError::RepositoryRoot {
-            path: normalized.clone(),
-            source,
-        })?;
-    if !canonical.is_dir() {
-        return Err(invalid(format!(
-            "expanded path {} is not a directory",
-            canonical.display()
-        )));
-    }
-    NamedTempFile::new_in(&canonical).map_err(|source| ConfigError::RepositoryRoot {
-        path: canonical.clone(),
-        source,
-    })?;
-    Ok(canonical)
+    Ok(normalized)
 }
 
 fn validate_variable_name(name: &str) -> Result<(), String> {
@@ -350,6 +363,22 @@ mod tests {
     use crate::model::{DEFAULT_GITHUB_REFRESH_INTERVAL_SECS, RepositoryConfig};
     use std::collections::HashMap;
     use std::sync::mpsc;
+
+    #[test]
+    fn destination_expansion_does_not_create_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = expand_repository_path_with("~/new/project", |name| {
+            (name == "HOME").then(|| directory.path().as_os_str().to_owned())
+        })
+        .unwrap();
+        assert_eq!(
+            path,
+            fs::canonicalize(directory.path())
+                .unwrap()
+                .join("new/project")
+        );
+        assert!(!directory.path().join("new").exists());
+    }
 
     #[test]
     fn ignored_files_defaults_validation_and_round_trip() {

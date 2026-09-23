@@ -51,7 +51,14 @@ pub struct BootstrapResult {
     pub created: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryCreation {
+    pub path: PathBuf,
+    pub bare: bool,
+}
+
 pub struct BootstrapOptions<'a> {
+    pub creation: Option<&'a RepositoryCreation>,
     pub base_branch: &'a str,
     pub https_token: Option<&'a ResolvedToken>,
     pub mapped_repository_path: Option<&'a Path>,
@@ -59,8 +66,12 @@ pub struct BootstrapOptions<'a> {
 
 #[derive(Debug, Error)]
 pub enum BootstrapError {
-    #[error("all repository bootstrap paths are occupied by unrelated files")]
-    CandidateCollision,
+    #[error("repository creation requires an explicit destination and repository type")]
+    CreationRequired,
+    #[error("repository destination is occupied by unrelated files: {0}")]
+    DestinationOccupied(PathBuf),
+    #[error("repository destination must be an absolute path")]
+    InvalidDestination,
     #[error("failed to prepare repository bootstrap directory {path}: {source}")]
     Filesystem {
         path: PathBuf,
@@ -82,7 +93,6 @@ pub fn bootstrap_repository(
     git_runner: &dyn GitRunner,
     clone_runner: &dyn CloneRunner,
     catalog: &mut Catalog,
-    repository_root: &Path,
     identity: &GitHubRepositoryIdentity,
     options: BootstrapOptions<'_>,
 ) -> Result<BootstrapResult, BootstrapError> {
@@ -101,31 +111,20 @@ pub fn bootstrap_repository(
         });
     }
 
-    fs::create_dir_all(repository_root).map_err(|source| BootstrapError::Filesystem {
-        path: repository_root.to_owned(),
-        source,
-    })?;
-    let mut target = None;
-    let mut reused = false;
-    for candidate in repository_candidates(repository_root, identity) {
-        if path_is_occupied(&candidate) {
-            if repository_matches(git_runner, &candidate, identity) {
-                target = Some(candidate);
-                reused = true;
-                break;
-            }
-            continue;
-        }
-        target = Some(candidate);
-        break;
-    }
-    let target = target.ok_or(BootstrapError::CandidateCollision)?;
+    let creation = options.creation.ok_or(BootstrapError::CreationRequired)?;
+    let target = creation.path.clone();
+    validate_destination(git_runner, &target, identity)?;
+    let reused = path_is_occupied(&target);
     if !reused {
+        let repository_root = target.parent().ok_or(BootstrapError::InvalidDestination)?;
+        fs::create_dir_all(repository_root).map_err(|source| BootstrapError::Filesystem {
+            path: repository_root.to_owned(),
+            source,
+        })?;
         clone_repository(
             clone_runner,
             git_runner,
-            repository_root,
-            &target,
+            creation,
             identity,
             options.base_branch,
             options.https_token,
@@ -222,29 +221,30 @@ pub fn bootstrap_repository(
     })
 }
 
-pub fn repository_candidates(
-    repository_root: &Path,
+pub fn validate_destination(
+    runner: &dyn GitRunner,
+    path: &Path,
     identity: &GitHubRepositoryIdentity,
-) -> Vec<PathBuf> {
-    let repository = filesystem_component(&identity.repository);
-    let owner = filesystem_component(&identity.owner);
-    let host = filesystem_component(&identity.host);
-    vec![
-        repository_root.join(format!("{repository}.git")),
-        repository_root.join(format!("{owner}-{repository}.git")),
-        repository_root.join(format!("{host}-{owner}-{repository}.git")),
-    ]
+) -> Result<(), BootstrapError> {
+    if !path.is_absolute() {
+        return Err(BootstrapError::InvalidDestination);
+    }
+    if path_is_occupied(path) && !repository_matches(runner, path, identity) {
+        return Err(BootstrapError::DestinationOccupied(path.to_owned()));
+    }
+    Ok(())
 }
 
 fn clone_repository(
     clone_runner: &dyn CloneRunner,
     git_runner: &dyn GitRunner,
-    repository_root: &Path,
-    target: &Path,
+    creation: &RepositoryCreation,
     identity: &GitHubRepositoryIdentity,
     base_branch: &str,
     https_token: Option<&ResolvedToken>,
 ) -> Result<(), BootstrapError> {
+    let target = &creation.path;
+    let repository_root = target.parent().ok_or(BootstrapError::InvalidDestination)?;
     let staging = tempfile::Builder::new()
         .prefix(".wt-incomplete-clone-")
         .tempdir_in(repository_root)
@@ -257,7 +257,14 @@ fn clone_repository(
         "git@{}:{}/{}.git",
         identity.host, identity.owner, identity.repository
     );
-    let ssh_partial = clone_request(&ssh_url, &clone_path, base_branch, true, None);
+    let ssh_partial = clone_request(
+        &ssh_url,
+        &clone_path,
+        base_branch,
+        creation.bare,
+        true,
+        None,
+    );
     let ssh_output = run_clone(clone_runner, &ssh_partial, https_token)?;
     let mut success = ssh_output.success;
     let mut last_error = ssh_output.stderr;
@@ -265,7 +272,14 @@ fn clone_repository(
         clean_clone_path(&clone_path, staging.path())?;
         let output = run_clone(
             clone_runner,
-            &clone_request(&ssh_url, &clone_path, base_branch, false, None),
+            &clone_request(
+                &ssh_url,
+                &clone_path,
+                base_branch,
+                creation.bare,
+                false,
+                None,
+            ),
             https_token,
         )?;
         success = output.success;
@@ -282,7 +296,14 @@ fn clone_repository(
         );
         let output = run_clone(
             clone_runner,
-            &clone_request(&https_url, &clone_path, base_branch, true, Some(token)),
+            &clone_request(
+                &https_url,
+                &clone_path,
+                base_branch,
+                creation.bare,
+                true,
+                Some(token),
+            ),
             https_token,
         )?;
         success = output.success;
@@ -291,7 +312,14 @@ fn clone_repository(
             clean_clone_path(&clone_path, staging.path())?;
             let output = run_clone(
                 clone_runner,
-                &clone_request(&https_url, &clone_path, base_branch, false, Some(token)),
+                &clone_request(
+                    &https_url,
+                    &clone_path,
+                    base_branch,
+                    creation.bare,
+                    false,
+                    Some(token),
+                ),
                 https_token,
             )?;
             success = output.success;
@@ -321,12 +349,12 @@ fn clone_request(
     url: &str,
     destination: &Path,
     base_branch: &str,
+    bare: bool,
     partial: bool,
     token: Option<&ResolvedToken>,
 ) -> CloneRequest {
     let mut arguments = vec![
         OsString::from("clone"),
-        OsString::from("--bare"),
         // Git only draws progress on a tty unless it is asked to; the runner
         // reads stderr through a pipe.
         OsString::from("--progress"),
@@ -335,9 +363,16 @@ fn clone_request(
         OsString::from("--single-branch"),
         OsString::from("--branch"),
         OsString::from(base_branch),
-        OsString::from("--config"),
-        OsString::from("remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*"),
     ];
+    if bare {
+        // Normal clones configure their own fetch refspec. Adding another at
+        // clone time would ask Git to update the same remote ref twice.
+        arguments.extend([
+            OsString::from("--bare"),
+            OsString::from("--config"),
+            OsString::from("remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*"),
+        ]);
+    }
     if partial {
         arguments.push(OsString::from("--filter=blob:none"));
     }
@@ -390,7 +425,7 @@ fn run_clone(
         .map_err(BootstrapError::CloneLaunch)
 }
 
-fn repository_matches(
+pub fn repository_matches(
     runner: &dyn GitRunner,
     path: &Path,
     expected: &GitHubRepositoryIdentity,
@@ -442,19 +477,6 @@ fn filter_unsupported(stderr: &str) -> bool {
         || message.contains("does not support filter")
         || message.contains("filter-spec")
         || message.contains("unsupported filter")
-}
-
-fn filesystem_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -523,15 +545,154 @@ mod tests {
     }
 
     #[test]
-    fn candidates_follow_required_collision_order() {
-        assert_eq!(
-            repository_candidates(Path::new("/repos"), &identity()),
-            vec![
-                PathBuf::from("/repos/project.git"),
-                PathBuf::from("/repos/team-project.git"),
-                PathBuf::from("/repos/github.com-team-project.git"),
-            ]
+    fn missing_or_stale_mapping_never_authorizes_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let stale = directory.path().join("gone");
+        let mut catalog = Catalog {
+            repositories: vec![RepositoryConfig {
+                path: stale.clone(),
+                label: None,
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            }],
+            ..Catalog::default()
+        };
+        let runner = FixtureCloneRunner::new(Vec::new());
+        for mapped_repository_path in [None, Some(stale.as_path())] {
+            let result = bootstrap_repository(
+                &SystemGit,
+                &runner,
+                &mut catalog,
+                &identity(),
+                BootstrapOptions {
+                    creation: None,
+                    base_branch: "main",
+                    https_token: None,
+                    mapped_repository_path,
+                },
+            );
+            assert!(matches!(result, Err(BootstrapError::CreationRequired)));
+        }
+        assert!(runner.requests.lock().unwrap().is_empty());
+        assert_eq!(directory.path().read_dir().unwrap().count(), 0);
+        assert_eq!(catalog.repositories.len(), 1);
+        assert_eq!(catalog.repositories[0].path, stale);
+    }
+
+    struct LocalCloneRunner(PathBuf);
+
+    impl CloneRunner for LocalCloneRunner {
+        fn run(&self, request: &CloneRequest) -> Result<CloneOutput, std::io::Error> {
+            let mut arguments = request.arguments.clone();
+            let url_index = arguments.len() - 2;
+            let url = arguments[url_index].clone();
+            arguments[url_index] = self.0.as_os_str().to_owned();
+            let output = Command::new("git")
+                .args(&arguments)
+                .envs(request.environment.iter().cloned())
+                .output()?;
+            if output.status.success() {
+                assert!(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(arguments.last().unwrap())
+                        .args(["remote", "set-url", "origin"])
+                        .arg(url)
+                        .status()?
+                        .success()
+                );
+            }
+            Ok(CloneOutput {
+                success: output.status.success(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn explicit_destination_creates_normal_or_bare_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        assert!(
+            Command::new("git")
+                .args(["init", "-b", "main"])
+                .arg(&source)
+                .output()
+                .unwrap()
+                .status
+                .success()
         );
+        fs::write(source.join("tracked"), "content").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(["add", "."])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial"
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        for bare in [false, true] {
+            let path = directory.path().join(if bare {
+                "custom/bare"
+            } else {
+                "custom/checkout"
+            });
+            let result = bootstrap_repository(
+                &SystemGit,
+                &LocalCloneRunner(source.clone()),
+                &mut Catalog::default(),
+                &identity(),
+                BootstrapOptions {
+                    creation: Some(&RepositoryCreation {
+                        path: path.clone(),
+                        bare,
+                    }),
+                    base_branch: "main",
+                    https_token: None,
+                    mapped_repository_path: None,
+                },
+            )
+            .unwrap();
+            assert!(result.created);
+            assert_eq!(result.repository.path, fs::canonicalize(&path).unwrap());
+            assert_eq!(
+                git::resolve_repository(&SystemGit, &path).unwrap().bare,
+                bare
+            );
+            assert_eq!(path.join("tracked").exists(), !bare);
+            if !bare {
+                assert_eq!(fs::read_to_string(path.join("tracked")).unwrap(), "content");
+            }
+            assert!(path.parent().unwrap().read_dir().unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".wt-incomplete-clone-")
+            }));
+        }
     }
 
     #[test]
@@ -591,9 +752,9 @@ mod tests {
             &SystemGit,
             &FixtureCloneRunner::new(Vec::new()),
             &mut catalog,
-            &directory.path().join("repositories"),
             &identity(),
             BootstrapOptions {
+                creation: None,
                 base_branch: "main",
                 https_token: None,
                 mapped_repository_path: Some(&mapped),
@@ -612,9 +773,12 @@ mod tests {
             &SystemGit,
             &clone_runner,
             &mut catalog,
-            &directory.path().join("repositories"),
             &identity(),
             BootstrapOptions {
+                creation: Some(&RepositoryCreation {
+                    path: directory.path().join("project.git"),
+                    bare: true,
+                }),
                 base_branch: "main",
                 https_token: None,
                 mapped_repository_path: Some(&unrelated),
@@ -627,54 +791,47 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_candidates_are_never_adopted_or_overwritten() {
+    fn occupied_destination_is_never_overwritten() {
         let directory = tempfile::tempdir().unwrap();
-        for candidate in repository_candidates(directory.path(), &identity()) {
-            fs::write(&candidate, b"unrelated").unwrap();
-        }
+        let path = directory.path().join("project");
+        fs::write(&path, b"unrelated").unwrap();
         let runner = FixtureCloneRunner::new(Vec::new());
         let result = bootstrap_repository(
             &SystemGit,
             &runner,
             &mut Catalog::default(),
-            directory.path(),
             &identity(),
             BootstrapOptions {
+                creation: Some(&RepositoryCreation {
+                    path: path.clone(),
+                    bare: false,
+                }),
                 base_branch: "main",
                 https_token: None,
                 mapped_repository_path: None,
             },
         );
-        assert!(matches!(result, Err(BootstrapError::CandidateCollision)));
-        for candidate in repository_candidates(directory.path(), &identity()) {
-            assert_eq!(fs::read(candidate).unwrap(), b"unrelated");
-        }
+        assert!(matches!(
+            result,
+            Err(BootstrapError::DestinationOccupied(_))
+        ));
+        assert_eq!(fs::read(path).unwrap(), b"unrelated");
         assert!(runner.requests.lock().unwrap().is_empty());
     }
 
     #[cfg(unix)]
     #[test]
-    fn broken_symlink_is_occupied_and_uses_the_next_candidate() {
+    fn broken_symlink_is_occupied_without_guessing_another_path() {
         use std::os::unix::fs::symlink;
-
         let directory = tempfile::tempdir().unwrap();
-        symlink("missing", directory.path().join("project.git")).unwrap();
-        let runner = FixtureCloneRunner::new(vec![success()]);
-        let result = bootstrap_repository(
-            &SystemGit,
-            &runner,
-            &mut Catalog::default(),
-            directory.path(),
-            &identity(),
-            BootstrapOptions {
-                base_branch: "main",
-                https_token: None,
-                mapped_repository_path: None,
-            },
-        )
-        .unwrap();
-        assert!(result.repository.path.ends_with("team-project.git"));
-        assert!(directory.path().join("project.git").is_symlink());
+        let path = directory.path().join("project");
+        symlink("missing", &path).unwrap();
+        assert!(matches!(
+            validate_destination(&SystemGit, &path, &identity()),
+            Err(BootstrapError::DestinationOccupied(_))
+        ));
+        assert!(path.is_symlink());
+        assert_eq!(directory.path().read_dir().unwrap().count(), 1);
     }
 
     #[test]
@@ -690,9 +847,12 @@ mod tests {
             &SystemGit,
             &runner,
             &mut Catalog::default(),
-            directory.path(),
             &identity(),
             BootstrapOptions {
+                creation: Some(&RepositoryCreation {
+                    path: directory.path().join("project.git"),
+                    bare: true,
+                }),
                 base_branch: "main",
                 https_token: Some(&token),
                 mapped_repository_path: None,
@@ -770,9 +930,12 @@ mod tests {
             &SystemGit,
             &runner,
             &mut Catalog::default(),
-            directory.path(),
             &identity(),
             BootstrapOptions {
+                creation: Some(&RepositoryCreation {
+                    path: directory.path().join("project.git"),
+                    bare: true,
+                }),
                 base_branch: "main",
                 https_token: Some(&token),
                 mapped_repository_path: None,
@@ -815,9 +978,12 @@ mod tests {
             &SystemGit,
             &FixtureCloneRunner::new(vec![success()]),
             &mut catalog,
-            directory.path(),
             &identity(),
             BootstrapOptions {
+                creation: Some(&RepositoryCreation {
+                    path: directory.path().join("project.git"),
+                    bare: true,
+                }),
                 base_branch: "main",
                 https_token: None,
                 mapped_repository_path: None,
@@ -884,9 +1050,12 @@ mod tests {
             &SystemGit,
             &runner,
             &mut catalog,
-            directory.path(),
             &identity(),
             BootstrapOptions {
+                creation: Some(&RepositoryCreation {
+                    path: directory.path().join("project.git"),
+                    bare: true,
+                }),
                 base_branch: "main",
                 https_token: None,
                 mapped_repository_path: None,

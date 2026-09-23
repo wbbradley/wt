@@ -422,6 +422,12 @@ pub struct FormField {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Modal {
+    CreateRepository {
+        identity: CanonicalPullRequestId,
+        path: String,
+        bare: bool,
+        active: usize,
+    },
     Palette {
         selected: usize,
     },
@@ -446,9 +452,17 @@ pub enum Intent {
     Refresh,
     RefreshGitHub,
     BeginAction(Action),
-    SubmitForm { action: Action, values: Vec<String> },
+    SubmitForm {
+        action: Action,
+        values: Vec<String>,
+    },
     ConfirmAction(Action),
     MaterializePullRequest(CanonicalPullRequestId),
+    CreateRepository {
+        identity: CanonicalPullRequestId,
+        path: String,
+        bare: bool,
+    },
     OpenUrl(String),
     PersistBackburner,
     PersistFocus,
@@ -2747,6 +2761,53 @@ impl App {
 
     fn handle_modal_key(&mut self, modal: Modal, key: KeyEvent) -> Intent {
         match modal {
+            Modal::CreateRepository {
+                identity,
+                mut path,
+                mut bare,
+                mut active,
+            } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.modal = None;
+                        return Intent::None;
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.modal = None;
+                        return Intent::None;
+                    }
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {
+                        active = 1 - active;
+                    }
+                    KeyCode::Char(' ') if active == 1 => bare = !bare,
+                    KeyCode::Backspace if active == 0 => {
+                        path.pop();
+                    }
+                    KeyCode::Char(character)
+                        if active == 0
+                            && !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        path.push(character);
+                    }
+                    KeyCode::Enter => {
+                        return Intent::CreateRepository {
+                            identity,
+                            path,
+                            bare,
+                        };
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::CreateRepository {
+                    identity,
+                    path,
+                    bare,
+                    active,
+                });
+                Intent::None
+            }
             Modal::Palette { mut selected } => match key.code {
                 KeyCode::Esc => {
                     self.modal = None;

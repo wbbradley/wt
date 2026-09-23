@@ -72,7 +72,7 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum ConfigSetting {
-    /// Set the root used to bootstrap repositories for virtual pull requests.
+    /// Set the legacy repository root (repository creation now requires a dialog).
     RepositoryRoot { expression: String },
 }
 

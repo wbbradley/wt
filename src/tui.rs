@@ -656,7 +656,21 @@ impl Controller {
                 Ok(ControlFlow::Continue)
             }
             Intent::MaterializePullRequest(identity) => {
-                self.start_pull_request_materialization(identity)?;
+                self.start_pull_request_materialization(identity, None)?;
+                Ok(ControlFlow::Continue)
+            }
+            Intent::CreateRepository {
+                identity,
+                path,
+                bare,
+            } => {
+                let path = config::expand_repository_path(path.trim())?;
+                bootstrap::validate_destination(&SystemGit, &path, &identity.repository)?;
+                self.start_pull_request_materialization(
+                    identity,
+                    Some(bootstrap::RepositoryCreation { path, bare }),
+                )?;
+                self.app.modal = None;
                 Ok(ControlFlow::Continue)
             }
             Intent::OpenUrl(url) => {
@@ -2171,6 +2185,7 @@ impl Controller {
     fn start_pull_request_materialization(
         &mut self,
         identity: crate::model::CanonicalPullRequestId,
+        creation: Option<bootstrap::RepositoryCreation>,
     ) -> Result<(), TuiError> {
         let mapping = self
             .app
@@ -2178,6 +2193,22 @@ impl Controller {
             .iter()
             .find(|mapping| mapping.identity == identity)
             .and_then(|mapping| mapping.mapped_repository.clone());
+        let reusable = mapping.as_ref().is_some_and(|path| {
+            self.catalog
+                .repositories
+                .iter()
+                .any(|repository| repository.path == *path)
+                && bootstrap::repository_matches(&SystemGit, path, &identity.repository)
+        });
+        if !reusable && creation.is_none() {
+            self.app.modal = Some(crate::app::Modal::CreateRepository {
+                identity,
+                path: String::new(),
+                bare: false,
+                active: 0,
+            });
+            return Ok(());
+        }
         let credential_anchor = mapping
             .as_ref()
             .and_then(|path| {
@@ -2226,16 +2257,14 @@ impl Controller {
             )
             .map_err(|error| error.to_string())?;
             let mut catalog = config::load(&catalog_path).map_err(|error| error.to_string())?;
-            let repository_root =
-                config::repository_root(&catalog).map_err(|error| error.to_string())?;
             let runner = context.git_runner(Some(&token));
             let result = bootstrap::bootstrap_repository(
                 &runner,
                 &runner,
                 &mut catalog,
-                &repository_root,
                 &identity.repository,
                 bootstrap::BootstrapOptions {
+                    creation: creation.as_ref(),
                     base_branch: &refreshed.pull_request.base.branch,
                     https_token: Some(&token),
                     mapped_repository_path: mapping.as_deref(),
@@ -4439,6 +4468,100 @@ mod tests {
         controller.publish_deletion_progress();
 
         assert_eq!(controller.app.progress.as_deref(), Some("materializing"));
+    }
+
+    #[test]
+    fn unmapped_materialization_requires_path_and_defaults_to_non_bare() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            prompt_app(),
+        );
+        let identity = test_authored_pull_request("viewer").identity;
+        controller
+            .handle_intent(Intent::MaterializePullRequest(identity.clone()))
+            .unwrap();
+        assert!(matches!(&controller.app.modal,
+            Some(Modal::CreateRepository { identity: selected, path, bare: false, active: 0 })
+                if selected == &identity && path.is_empty()));
+        assert!(controller.materialization_job.is_none());
+        let submit = controller
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(controller.handle_intent(submit).is_err());
+        assert!(controller.app.modal.is_some());
+        assert!(controller.materialization_job.is_none());
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('界'),
+            KeyCode::Backspace,
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+        ] {
+            assert_eq!(
+                controller
+                    .app
+                    .handle_key(KeyEvent::new(code, KeyModifiers::NONE)),
+                Intent::None
+            );
+        }
+        assert_eq!(
+            controller
+                .app
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Intent::CreateRepository {
+                identity: identity.clone(),
+                path: "/".to_owned(),
+                bare: true
+            }
+        );
+        let cancel = controller
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        controller.handle_intent(cancel).unwrap();
+        assert!(controller.app.modal.is_none());
+        assert!(controller.materialization_job.is_none());
+        assert!(controller.completed_materialization.is_none());
+        assert_eq!(directory.path().read_dir().unwrap().count(), 0);
+        controller
+            .handle_intent(Intent::MaterializePullRequest(identity))
+            .unwrap();
+        assert!(matches!(
+            controller.app.modal,
+            Some(Modal::CreateRepository { bare: false, .. })
+        ));
+    }
+
+    #[test]
+    fn repository_dialog_rejects_occupied_path_without_starting_a_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let occupied = directory.path().join("occupied");
+        std::fs::write(&occupied, "keep").unwrap();
+        let mut controller = Controller::new(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            prompt_app(),
+        );
+        let identity = test_authored_pull_request("viewer").identity;
+        controller
+            .handle_intent(Intent::MaterializePullRequest(identity.clone()))
+            .unwrap();
+        let result = controller.handle_intent(Intent::CreateRepository {
+            identity,
+            path: occupied.display().to_string(),
+            bare: false,
+        });
+        assert!(matches!(
+            result,
+            Err(TuiError::Bootstrap(
+                bootstrap::BootstrapError::DestinationOccupied(_)
+            ))
+        ));
+        assert!(controller.app.modal.is_some());
+        assert!(controller.materialization_job.is_none());
+        assert_eq!(std::fs::read_to_string(occupied).unwrap(), "keep");
     }
 
     #[test]
