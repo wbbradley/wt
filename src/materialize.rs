@@ -503,12 +503,11 @@ fn ensure_remote_tracking_configuration(
     }) {
         return Ok(());
     }
-    // Preserve narrow/custom fetch rules; add only the selected PR branch.
-    let refspec = if configured.trim().is_empty() {
-        format!("+refs/heads/*:refs/remotes/{remote}/*")
-    } else {
-        format!("+{source}:{target}")
-    };
+    // Preserve existing rules, but never persist an exact PR-head requirement:
+    // Git fails an ordinary fetch once that branch is deleted after merge.
+    // A wildcard supplies upstream tracking while tolerating deleted heads.
+    // The initial transfer still uses fetch_ref's explicit, narrow refspec.
+    let refspec = format!("+refs/heads/*:refs/remotes/{remote}/*");
     git::run_git(
         runner,
         repository,
@@ -1094,7 +1093,7 @@ mod tests {
                     &repository.path,
                     &["config", "--get-all", "remote.fork.fetch"]
                 ),
-                format!("{existing}\n+refs/heads/feature/topic:refs/remotes/fork/feature/topic")
+                format!("{existing}\n+refs/heads/*:refs/remotes/fork/*")
             );
             let reused = materialize_pull_request(
                 &SystemGit,
@@ -1110,9 +1109,68 @@ mod tests {
                     &repository.path,
                     &["config", "--get-all", "remote.fork.fetch"]
                 ),
-                format!("{existing}\n+refs/heads/feature/topic:refs/remotes/fork/feature/topic")
+                format!("{existing}\n+refs/heads/*:refs/remotes/fork/*")
             );
+
+            // GitHub deletes merged PR heads. Fetching from the main checkout
+            // must still succeed, including with pruning enabled.
+            git(&fixture.source, &["branch", "-D", "feature/topic"]);
+            git(&repository.path, &["fetch", "fork"]);
+            git(&repository.path, &["fetch", "--prune", "fork"]);
+            // A custom refs/heads/* destination intentionally prunes local
+            // branches too; preserve that user policy rather than overriding it.
+            if !existing.ends_with(":refs/heads/*") {
+                assert_eq!(
+                    resolve_commit(&SystemGit, &materialized.path, "HEAD").unwrap(),
+                    fixture.target
+                );
+            }
         }
+    }
+
+    #[test]
+    fn single_branch_clone_can_pull_after_pr_head_is_deleted() {
+        let fixture = Fixture::new();
+        let mut repository = fixture.local_repository(true);
+        let clone = fixture.repository_root.join("checkout");
+        git(
+            &fixture.repository_root,
+            &[
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                "--origin",
+                "fork",
+                fixture.source.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        repository.path = clone;
+        let authored = fixture.authored(42, "feature/topic", "contributor/project");
+        let materialized =
+            materialize_pull_request(&SystemGit, &SystemFetchRunner, &repository, &authored, None)
+                .unwrap();
+        assert_eq!(
+            git_stdout(
+                &materialized.path,
+                &["rev-parse", "--abbrev-ref", "@{upstream}"]
+            ),
+            "fork/feature/topic"
+        );
+        git(&fixture.source, &["checkout", "main"]);
+        git(&fixture.source, &["merge", "--ff-only", "feature/topic"]);
+        git(&fixture.source, &["branch", "-d", "feature/topic"]);
+        git(&repository.path, &["pull", "--ff-only"]);
+        git(&repository.path, &["fetch", "--prune", "fork"]);
+        assert_eq!(
+            resolve_commit(&SystemGit, &repository.path, "HEAD").unwrap(),
+            fixture.target
+        );
+        assert_eq!(
+            resolve_commit(&SystemGit, &materialized.path, "HEAD").unwrap(),
+            fixture.target
+        );
     }
 
     #[test]
