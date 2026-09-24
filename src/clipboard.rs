@@ -21,7 +21,36 @@ impl Clipboard for SystemClipboard {
         let mut command = Command::new("clip");
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let mut command = Command::new("wl-copy");
-        copy_with_command(&mut command, contents, context, COPY_TIMEOUT)
+        let mut tmux = std::env::var_os("TMUX")
+            .filter(|value| !value.is_empty())
+            .map(|_| {
+                let mut command = Command::new("tmux");
+                command.args(["load-buffer", "-"]);
+                command
+            });
+        copy_to_clipboards(tmux.as_mut(), &mut command, contents, context)
+    }
+}
+
+fn copy_to_clipboards(
+    tmux: Option<&mut Command>,
+    system: &mut Command,
+    contents: &str,
+    context: &JobContext,
+) -> Result<(), String> {
+    let tmux_result =
+        tmux.map(|command| copy_with_command(command, contents, context, COPY_TIMEOUT));
+    if context.is_cancelled() {
+        return Err("clipboard copy cancelled".to_owned());
+    }
+    let system_result = copy_with_command(system, contents, context, COPY_TIMEOUT);
+    if context.is_cancelled() {
+        return Err("clipboard copy cancelled".to_owned());
+    }
+    match (tmux_result, system_result) {
+        (_, Ok(())) | (Some(Ok(())), _) => Ok(()),
+        (Some(Err(tmux)), Err(system)) => Err(format!("tmux: {tmux}; system: {system}")),
+        (None, Err(error)) => Err(error),
     }
 }
 
@@ -113,6 +142,63 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "clipboard worker stuck");
             std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    #[test]
+    fn tmux_receives_exact_text_before_system_clipboard() {
+        let directory = tempfile::tempdir().unwrap();
+        let tmux_path = directory.path().join("tmux");
+        let system_path = directory.path().join("system");
+        let contents = "quotes ' \" $HOME\nUnicode: λ\n\n";
+        let tmux_output = tmux_path.clone();
+        let system_output = system_path.clone();
+        let job = BackgroundJob::spawn("clipboard-order", move |context| {
+            copy_to_clipboards(
+                Some(
+                    Command::new("sh")
+                        .args(["-c", "cat > \"$1\"", "test"])
+                        .arg(&tmux_output),
+                ),
+                Command::new("sh")
+                    .args(["-c", "test -f \"$1\" && cat > \"$2\"", "test"])
+                    .arg(&tmux_output)
+                    .arg(system_output),
+                contents,
+                &context,
+            )
+        })
+        .unwrap();
+        assert!(finish(&job).is_ok());
+        assert_eq!(std::fs::read_to_string(tmux_path).unwrap(), contents);
+        assert_eq!(std::fs::read_to_string(system_path).unwrap(), contents);
+    }
+
+    #[test]
+    fn either_clipboard_can_succeed_but_both_failures_are_reported() {
+        for (tmux_status, system_status, succeeds) in [(0, 7, true), (7, 0, true), (7, 8, false)] {
+            let job = BackgroundJob::spawn("clipboard-fallback", move |context| {
+                copy_to_clipboards(
+                    Some(
+                        Command::new("sh")
+                            .arg("-c")
+                            .arg(format!("exit {tmux_status}")),
+                    ),
+                    Command::new("sh")
+                        .arg("-c")
+                        .arg(format!("exit {system_status}")),
+                    "text",
+                    &context,
+                )
+            })
+            .unwrap();
+            let result = finish(&job);
+            if succeeds {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(matches!(result, Err(JobError::Failed(error))
+                    if error.contains("tmux:") && error.contains("system:")));
+            }
         }
     }
 
