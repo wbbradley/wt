@@ -89,7 +89,7 @@ pub fn format_agent_prompt(pull_requests: &[PromptPullRequest]) -> Option<String
     }
     output.truncate(output.trim_end_matches('\n').len());
     if has_thread_comments {
-        output.push_str("\n\nPlease investigate the above.");
+        output.push_str("\n\nPlease investigate the above and identify the salient points in the review comments. Use your judgment to distinguish issues worth addressing from comments that can reasonably be dismissed, and explain your recommendations. Check with me and wait for approval before making changes, replying, or resolving comments. Once approved, carry out the agreed changes and resolve all reviewed comment threads appropriately, explaining any dismissals.");
     }
     Some(output)
 }
@@ -388,7 +388,7 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "In feature (#42 Fix feedback):\n\nUse this existing checkout:\n```bash\ncd -- '/worktrees/feature'\n```\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nReview comments:\n  - Comment 91 by reviewer on `src/lib.rs`\n    URL: https://git.example.com/comment/91\n    Body:\n~~~\nSummary\nsplit this line\nfollow up\n~~~\n\nReview summaries:\n  - Review 92 by lead\n    Body:\n~~~\nPlease add coverage\n~~~\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nPlease investigate the above."
+            "In feature (#42 Fix feedback):\n\nUse this existing checkout:\n```bash\ncd -- '/worktrees/feature'\n```\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nReview comments:\n  - Comment 91 by reviewer on `src/lib.rs`\n    URL: https://git.example.com/comment/91\n    Body:\n~~~\nSummary\nsplit this line\nfollow up\n~~~\n\nReview summaries:\n  - Review 92 by lead\n    Body:\n~~~\nPlease add coverage\n~~~\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nPlease investigate the above and identify the salient points in the review comments. Use your judgment to distinguish issues worth addressing from comments that can reasonably be dismissed, and explain your recommendations. Check with me and wait for approval before making changes, replying, or resolving comments. Once approved, carry out the agreed changes and resolve all reviewed comment threads appropriately, explaining any dismissals."
         );
         assert!(!actual.contains("gh api"));
         assert!(!actual.contains("not merge-required"));
