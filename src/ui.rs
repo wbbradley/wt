@@ -2407,7 +2407,11 @@ mod tests {
             list_selection_hint(&app, &app.visible_rows()),
             "Enter/w opens Checks"
         );
-        app.selected = Some(RowId::Check(pull_request_id.clone(), "required".to_owned()));
+        app.selected = Some(RowId::Check(
+            pull_request_id.clone(),
+            "required".to_owned(),
+            BranchId::VirtualPullRequest(pull_request_id.clone()),
+        ));
         assert_eq!(
             list_selection_hint(&app, &app.visible_rows()),
             "Enter/w opens Check"
@@ -2415,6 +2419,7 @@ mod tests {
         app.selected = Some(RowId::OpenComment(
             pull_request_id.clone(),
             "comment".to_owned(),
+            BranchId::VirtualPullRequest(pull_request_id.clone()),
         ));
         assert_eq!(
             list_selection_hint(&app, &app.visible_rows()),

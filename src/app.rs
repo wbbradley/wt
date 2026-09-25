@@ -60,9 +60,9 @@ pub enum RowId {
     Section(BranchId, InlineSection),
     Metadata(BranchId, String),
     File(BranchId, InlineSection, PathBuf),
-    Check(CanonicalPullRequestId, String),
-    Reviewer(CanonicalPullRequestId, String),
-    OpenComment(CanonicalPullRequestId, String),
+    Check(CanonicalPullRequestId, String, BranchId),
+    Reviewer(CanonicalPullRequestId, String, BranchId),
+    OpenComment(CanonicalPullRequestId, String, BranchId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2088,7 +2088,7 @@ impl App {
                         text,
                         Some(target_url),
                         None,
-                        RowId::Check(identity.clone(), check.name.clone()),
+                        RowId::Check(identity.clone(), check.name.clone(), owner.clone()),
                     );
                 }
 
@@ -2149,7 +2149,7 @@ impl App {
                                 ),
                                 Some(target_url),
                                 None,
-                                RowId::Check(identity.clone(), check.name.clone()),
+                                RowId::Check(identity.clone(), check.name.clone(), owner.clone()),
                             );
                         }
                     }
@@ -2212,7 +2212,11 @@ impl App {
                             ),
                             Some(pr_url.clone()),
                             None,
-                            RowId::Reviewer(identity.clone(), reviewer.identity.clone()),
+                            RowId::Reviewer(
+                                identity.clone(),
+                                reviewer.identity.clone(),
+                                owner.clone(),
+                            ),
                         );
                     }
                 }
@@ -2256,7 +2260,7 @@ impl App {
                         text,
                         Some(url),
                         None,
-                        RowId::OpenComment(identity.clone(), feedback.id),
+                        RowId::OpenComment(identity.clone(), feedback.id, owner.clone()),
                     );
                 }
             }
@@ -3380,7 +3384,7 @@ impl App {
     pub fn agent_prompt(&self) -> Option<String> {
         let all = self.prompt_pull_requests();
         let scoped = match self.selected.as_ref() {
-            Some(RowId::Check(identity, name)) => all
+            Some(RowId::Check(identity, name, _)) => all
                 .get(identity)
                 .map(|pull_request| PromptPullRequest {
                     identity: identity.clone(),
@@ -3398,7 +3402,7 @@ impl App {
                 })
                 .into_iter()
                 .collect(),
-            Some(RowId::OpenComment(identity, id)) => all
+            Some(RowId::OpenComment(identity, id, _)) => all
                 .get(identity)
                 .map(|pull_request| PromptPullRequest {
                     identity: identity.clone(),
@@ -3413,7 +3417,7 @@ impl App {
                 })
                 .into_iter()
                 .collect(),
-            Some(RowId::Reviewer(identity, reviewer)) => all
+            Some(RowId::Reviewer(identity, reviewer, _)) => all
                 .get(identity)
                 .map(|pull_request| PromptPullRequest {
                     identity: identity.clone(),
@@ -3536,9 +3540,9 @@ impl App {
             RowId::Section(owner, _) | RowId::Metadata(owner, _) | RowId::File(owner, _, _) => {
                 self.pull_request_identity_for_branch(owner)
             }
-            RowId::Check(identity, _)
-            | RowId::Reviewer(identity, _)
-            | RowId::OpenComment(identity, _) => Some(identity.clone()),
+            RowId::Check(identity, _, _)
+            | RowId::Reviewer(identity, _, _)
+            | RowId::OpenComment(identity, _, _) => Some(identity.clone()),
             RowId::VirtualRepository(_) | RowId::Backburner(_) => None,
         }
     }
@@ -3931,9 +3935,9 @@ impl App {
                     .into_iter()
                     .collect()
             }
-            RowId::Check(identity, _)
-            | RowId::Reviewer(identity, _)
-            | RowId::OpenComment(identity, _)
+            RowId::Check(identity, _, _)
+            | RowId::Reviewer(identity, _, _)
+            | RowId::OpenComment(identity, _, _)
                 if non_container_owns_pull_request =>
             {
                 vec![identity.clone()]
@@ -3941,9 +3945,9 @@ impl App {
             RowId::Section(_, _)
             | RowId::Metadata(_, _)
             | RowId::File(_, _, _)
-            | RowId::Check(_, _)
-            | RowId::Reviewer(_, _)
-            | RowId::OpenComment(_, _) => Vec::new(),
+            | RowId::Check(_, _, _)
+            | RowId::Reviewer(_, _, _)
+            | RowId::OpenComment(_, _, _) => Vec::new(),
         }
     }
 
@@ -4504,7 +4508,7 @@ impl App {
             RowId::Metadata(owner, _) => {
                 candidates.push(RowId::Section(owner.clone(), InlineSection::Overview));
             }
-            RowId::Check(identity, name) => {
+            RowId::Check(identity, name, owner) => {
                 if let Some(section) = self
                     .pull_request_details
                     .get(identity)
@@ -4523,23 +4527,16 @@ impl App {
                         }
                         CheckState::Failure | CheckState::Error | CheckState::Unknown => None,
                     })
-                    && let Some(owner) = self.branch_for_pull_request(identity)
                 {
-                    candidates.push(RowId::Section(owner, section));
+                    candidates.push(RowId::Section(owner.clone(), section));
                 }
-                if let Some(owner) = self.branch_for_pull_request(identity) {
-                    candidates.push(RowId::Section(owner, InlineSection::Checks));
-                }
+                candidates.push(RowId::Section(owner.clone(), InlineSection::Checks));
             }
-            RowId::Reviewer(identity, _) => {
-                if let Some(owner) = self.branch_for_pull_request(identity) {
-                    candidates.push(RowId::Section(owner, InlineSection::Reviewers));
-                }
+            RowId::Reviewer(_, _, owner) => {
+                candidates.push(RowId::Section(owner.clone(), InlineSection::Reviewers));
             }
-            RowId::OpenComment(identity, _) => {
-                if let Some(owner) = self.branch_for_pull_request(identity) {
-                    candidates.push(RowId::Section(owner, InlineSection::OpenComments));
-                }
+            RowId::OpenComment(_, _, owner) => {
+                candidates.push(RowId::Section(owner.clone(), InlineSection::OpenComments));
             }
             RowId::Section(owner, section) => {
                 if matches!(
@@ -4611,34 +4608,11 @@ impl App {
             RowId::Section(owner, _) | RowId::Metadata(owner, _) | RowId::File(owner, _, _) => {
                 Some(owner.clone())
             }
-            RowId::Check(identity, _)
-            | RowId::Reviewer(identity, _)
-            | RowId::OpenComment(identity, _) => self.branch_for_pull_request(identity),
+            RowId::Check(_, _, owner)
+            | RowId::Reviewer(_, _, owner)
+            | RowId::OpenComment(_, _, owner) => Some(owner.clone()),
             RowId::Repository(_) | RowId::VirtualRepository(_) | RowId::Backburner(_) => None,
         }
-    }
-
-    fn branch_for_pull_request(&self, identity: &CanonicalPullRequestId) -> Option<BranchId> {
-        for repository in &self.repositories {
-            for worktree in &repository.worktrees {
-                let matches = self
-                    .github
-                    .get(&worktree.path)
-                    .and_then(GitHubState::data)
-                    .and_then(|data| data.pull_request.as_ref())
-                    .and_then(|pull_request| self.pull_request_identity(repository, pull_request))
-                    .as_ref()
-                    == Some(identity);
-                if matches {
-                    return Some(BranchId::Worktree(worktree.path.clone()));
-                }
-            }
-        }
-        self.virtual_repositories
-            .iter()
-            .flat_map(|repository| &repository.pull_requests)
-            .find(|pull_request| pull_request.identity == *identity)
-            .map(|_| BranchId::VirtualPullRequest(identity.clone()))
     }
 
     fn ensure_selected_in_view(&mut self) {
@@ -6923,7 +6897,7 @@ mod tests {
                 if found_owner == &owner)
         }));
         assert!(initial_rows.iter().any(|row| {
-            matches!(row, VisibleRow::Inline { id: RowId::OpenComment(found, _), text, .. }
+            matches!(row, VisibleRow::Inline { id: RowId::OpenComment(found, _, _), text, .. }
                 if found == &identity
                     && text == "@reviewer Summary • line one • first item • second item (src/lib.rs)")
         }));
@@ -6943,7 +6917,7 @@ mod tests {
         assert!(
             app.visible_rows()
                 .iter()
-                .any(|row| matches!(row.id(), RowId::Check(_, name) if name == "failure"))
+                .any(|row| matches!(row.id(), RowId::Check(_, name, _) if name == "failure"))
         );
         app.selected = Some(RowId::Section(owner.clone(), InlineSection::Checks));
         app.handle_key(key(KeyCode::Char('l')));
@@ -6951,7 +6925,7 @@ mod tests {
         let check_names: Vec<_> = rows
             .iter()
             .filter_map(|row| match row.id() {
-                RowId::Check(_, name) => Some(name.as_str()),
+                RowId::Check(_, name, _) => Some(name.as_str()),
                 _ => None,
             })
             .collect();
@@ -6985,7 +6959,11 @@ mod tests {
             Intent::OpenUrl(format!("{}/checks", authored.pull_request.url))
         );
 
-        app.selected = Some(RowId::Check(identity.clone(), "failure".to_owned()));
+        app.selected = Some(RowId::Check(
+            identity.clone(),
+            "failure".to_owned(),
+            BranchId::VirtualPullRequest(identity.clone()),
+        ));
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(
             app.selected,
@@ -6994,22 +6972,34 @@ mod tests {
         assert!(
             !app.visible_rows()
                 .iter()
-                .any(|row| matches!(row.id(), RowId::Check(_, _)))
+                .any(|row| matches!(row.id(), RowId::Check(_, _, _)))
         );
         app.handle_key(key(KeyCode::Char('l')));
-        app.selected = Some(RowId::Check(identity.clone(), "failure".to_owned()));
+        app.selected = Some(RowId::Check(
+            identity.clone(),
+            "failure".to_owned(),
+            BranchId::VirtualPullRequest(identity.clone()),
+        ));
         assert_eq!(
             app.handle_key(key(KeyCode::Char('w'))),
             Intent::OpenUrl("https://checks/failure".to_owned())
         );
         app.selected = Some(RowId::Section(owner.clone(), InlineSection::ValidResults));
         app.handle_key(key(KeyCode::Char('l')));
-        app.selected = Some(RowId::Check(identity.clone(), "success".to_owned()));
+        app.selected = Some(RowId::Check(
+            identity.clone(),
+            "success".to_owned(),
+            BranchId::VirtualPullRequest(identity.clone()),
+        ));
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             Intent::OpenUrl(authored.pull_request.url.clone())
         );
-        app.selected = Some(RowId::OpenComment(identity.clone(), feedback_id));
+        app.selected = Some(RowId::OpenComment(
+            identity.clone(),
+            feedback_id,
+            BranchId::VirtualPullRequest(identity.clone()),
+        ));
         assert_eq!(
             app.handle_key(key(KeyCode::Char('w'))),
             Intent::OpenUrl("https://comments/7".to_owned())
@@ -7037,6 +7027,114 @@ mod tests {
             matches!(row, VisibleRow::Inline { id: RowId::Section(_, InlineSection::Checks), text, .. }
                 if text == "Checks · counts:0:0:0")
         }));
+    }
+
+    #[test]
+    fn shared_pull_request_details_keep_selection_in_the_owning_worktree() {
+        for state in [
+            crate::model::PullRequestState::Open,
+            crate::model::PullRequestState::Merged,
+        ] {
+            let (mut app, identity) = filter_test_app();
+            let mut pull_request = app
+                .virtual_repositories
+                .remove(0)
+                .pull_requests
+                .remove(0)
+                .pull_request;
+            pull_request.state = state;
+            let mut repo = repository("/repo", true);
+            repo.config
+                .github_remotes
+                .insert("origin".to_owned(), identity.repository.clone());
+            app.repositories = vec![repo];
+            for path in ["/repo", "/repo-topic"] {
+                app.github.insert(
+                    PathBuf::from(path),
+                    GitHubState::Ready(GitHubBranchData {
+                        pull_request: Some(pull_request.clone()),
+                        warnings: Vec::new(),
+                        rate_limit: None,
+                    }),
+                );
+                for section in [
+                    InlineSection::Checks,
+                    InlineSection::PendingChecks,
+                    InlineSection::ValidResults,
+                    InlineSection::Reviewers,
+                    InlineSection::OpenComments,
+                ] {
+                    app.set_disclosure_expanded(
+                        DisclosureKey::Section(BranchId::Worktree(PathBuf::from(path)), section),
+                        true,
+                    );
+                }
+            }
+            let rows = app.visible_rows();
+            let ids: HashSet<_> = rows.iter().map(|row| row.id()).collect();
+            assert_eq!(
+                ids.len(),
+                rows.len(),
+                "each displayed row must have a distinct identity"
+            );
+            let lower_owner = BranchId::Worktree(PathBuf::from("/repo-topic"));
+            let leaves: Vec<_> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    VisibleRow::Inline {
+                        id, owner, section, ..
+                    } if owner == &lower_owner
+                        && matches!(
+                            id,
+                            RowId::Check(..) | RowId::Reviewer(..) | RowId::OpenComment(..)
+                        ) =>
+                    {
+                        Some((id.clone(), *section))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                leaves
+                    .iter()
+                    .any(|(id, _)| matches!(id, RowId::OpenComment(..)))
+            );
+
+            // Exercise the actual navigation reducer in both directions across both copies.
+            app.selected = Some(rows[0].id().clone());
+            for row in rows.iter().skip(1) {
+                app.handle_key(key(KeyCode::Down));
+                assert_eq!(app.selected_row().unwrap().id(), row.id());
+            }
+            for row in rows.iter().rev().skip(1) {
+                app.handle_key(key(KeyCode::Up));
+                assert_eq!(app.selected_row().unwrap().id(), row.id());
+            }
+
+            for (id, section) in leaves {
+                app.selected = Some(id.clone());
+                assert_eq!(
+                    app.selected_worktree().unwrap().1.path,
+                    PathBuf::from("/repo-topic")
+                );
+                assert_eq!(
+                    app.semantic_fallback_ids(&id)[0],
+                    RowId::Section(lower_owner.clone(), section)
+                );
+                app.repositories[0].worktrees.reverse();
+                app.ensure_selection_visible();
+                assert_eq!(app.selected, Some(id));
+                app.handle_key(key(KeyCode::Left));
+                assert_eq!(
+                    app.selected,
+                    Some(RowId::Section(lower_owner.clone(), section))
+                );
+                app.set_disclosure_expanded(
+                    DisclosureKey::Section(lower_owner.clone(), section),
+                    true,
+                );
+            }
+        }
     }
 
     #[test]
@@ -7101,7 +7199,7 @@ mod tests {
         }
         assert!(rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline {
-                id: RowId::OpenComment(found, _), text, ..
+                id: RowId::OpenComment(found, _, _), text, ..
             } if found == &identity && text == "@reviewer still relevant • after merge")
         }));
         assert!(rows.iter().any(|row| {
@@ -7223,7 +7321,12 @@ mod tests {
         }));
         for reviewer in ["alice", "bob", "carol"] {
             assert!(!rows.iter().any(|row| {
-                row.id() == &RowId::Reviewer(identity.clone(), reviewer.to_owned())
+                row.id()
+                    == &RowId::Reviewer(
+                        identity.clone(),
+                        reviewer.to_owned(),
+                        BranchId::VirtualPullRequest(identity.clone()),
+                    )
             }));
         }
         assert!(!rows.iter().any(|row| {
@@ -7236,7 +7339,12 @@ mod tests {
         let rows = app.visible_rows();
         for reviewer in ["alice", "bob", "carol"] {
             assert!(rows.iter().any(|row| {
-                row.id() == &RowId::Reviewer(identity.clone(), reviewer.to_owned())
+                row.id()
+                    == &RowId::Reviewer(
+                        identity.clone(),
+                        reviewer.to_owned(),
+                        BranchId::VirtualPullRequest(identity.clone()),
+                    )
             }));
         }
         assert!(!rows.iter().any(|row| {
@@ -7244,7 +7352,7 @@ mod tests {
         }));
         assert!(rows.iter().any(|row| {
             matches!(row, VisibleRow::Inline {
-                id: RowId::OpenComment(found, id), text, url: Some(url), ..
+                id: RowId::OpenComment(found, id, _), text, url: Some(url), ..
             } if found == &identity
                 && id == "thread"
                 && text == "@Carol Old code needs fixing (src/lib.rs) [outdated]"
@@ -7260,7 +7368,7 @@ mod tests {
             assert!(rows.iter().any(|row| {
                 matches!(row, VisibleRow::Inline {
                     section: InlineSection::Checks,
-                    id: RowId::Check(found, name), ..
+                    id: RowId::Check(found, name, _), ..
                 } if found == &identity && name == direct)
             }));
         }
@@ -7285,7 +7393,7 @@ mod tests {
             )
         }));
         assert!(!rows.iter().any(|row| {
-            matches!(row.id(), RowId::Check(_, name) if name == "pending" || name == "success")
+            matches!(row.id(), RowId::Check(_, name, _) if name == "pending" || name == "success")
         }));
 
         app.pull_request_details
@@ -7299,7 +7407,7 @@ mod tests {
         assert!(app.visible_rows().iter().any(|row| {
             matches!(row, VisibleRow::Inline {
                 section: InlineSection::Checks,
-                id: RowId::Check(found, name), ..
+                id: RowId::Check(found, name, _), ..
             } if found == &identity && name == "pending")
         }));
 
@@ -7434,7 +7542,11 @@ mod tests {
         app.virtual_repositories[0].expanded = false;
         assert_eq!(app.agent_prompt().unwrap(), expanded);
 
-        app.selected = Some(RowId::Check(parent.identity.clone(), "check-1".to_owned()));
+        app.selected = Some(RowId::Check(
+            parent.identity.clone(),
+            "check-1".to_owned(),
+            BranchId::VirtualPullRequest(parent.identity.clone()),
+        ));
         let single = app.agent_prompt().unwrap();
         assert!(single.contains("Checks (all failed):"));
         assert!(single.contains("check-1"));
@@ -7455,6 +7567,7 @@ mod tests {
         app.selected = Some(RowId::Reviewer(
             parent.identity.clone(),
             "reviewer".to_owned(),
+            BranchId::VirtualPullRequest(parent.identity.clone()),
         ));
         let reviewer = app.agent_prompt().unwrap();
         assert!(reviewer.contains("review-1"));
@@ -7466,7 +7579,11 @@ mod tests {
         ));
         assert_eq!(app.agent_prompt().as_deref(), Some(reviewer.as_str()));
 
-        app.selected = Some(RowId::Check(parent.identity.clone(), "valid-1".to_owned()));
+        app.selected = Some(RowId::Check(
+            parent.identity.clone(),
+            "valid-1".to_owned(),
+            BranchId::VirtualPullRequest(parent.identity.clone()),
+        ));
         let valid = app.agent_prompt().unwrap();
         assert!(valid.contains("Checks:\n  - valid-1 ("));
         assert!(!valid.contains("check-1"));
@@ -7515,7 +7632,11 @@ mod tests {
             Some(format!("{} - child title - DRAFT", child.pull_request.url).as_str())
         );
 
-        app.selected = Some(RowId::Check(parent.identity.clone(), "check-1".to_owned()));
+        app.selected = Some(RowId::Check(
+            parent.identity.clone(),
+            "check-1".to_owned(),
+            BranchId::VirtualPullRequest(parent.identity.clone()),
+        ));
         assert_eq!(
             app.review_request().as_deref(),
             Some(format!("{} - parent title", parent.pull_request.url).as_str())
@@ -8167,7 +8288,11 @@ mod tests {
                     branch.clone(),
                     RowId::Section(owner.clone(), InlineSection::Checks),
                     RowId::Section(owner.clone(), InlineSection::PendingChecks),
-                    RowId::Check(identity.clone(), "pending-needle".to_owned()),
+                    RowId::Check(
+                        identity.clone(),
+                        "pending-needle".to_owned(),
+                        BranchId::VirtualPullRequest(identity.clone()),
+                    ),
                 ],
             ),
             (
@@ -8177,7 +8302,11 @@ mod tests {
                     branch.clone(),
                     RowId::Section(owner.clone(), InlineSection::Checks),
                     RowId::Section(owner.clone(), InlineSection::ValidResults),
-                    RowId::Check(identity.clone(), "valid-needle".to_owned()),
+                    RowId::Check(
+                        identity.clone(),
+                        "valid-needle".to_owned(),
+                        BranchId::VirtualPullRequest(identity.clone()),
+                    ),
                 ],
             ),
             (
@@ -8186,7 +8315,11 @@ mod tests {
                     repository.clone(),
                     branch.clone(),
                     RowId::Section(owner.clone(), InlineSection::Reviewers),
-                    RowId::Reviewer(identity.clone(), "alice".to_owned()),
+                    RowId::Reviewer(
+                        identity.clone(),
+                        "alice".to_owned(),
+                        BranchId::VirtualPullRequest(identity.clone()),
+                    ),
                 ],
             ),
             (
@@ -8195,7 +8328,11 @@ mod tests {
                     repository.clone(),
                     branch.clone(),
                     RowId::Section(owner.clone(), InlineSection::OpenComments),
-                    RowId::OpenComment(identity.clone(), "comment-hidden-id".to_owned()),
+                    RowId::OpenComment(
+                        identity.clone(),
+                        "comment-hidden-id".to_owned(),
+                        BranchId::VirtualPullRequest(identity.clone()),
+                    ),
                 ],
             ),
             (
@@ -8222,7 +8359,11 @@ mod tests {
                     repository.clone(),
                     branch.clone(),
                     RowId::Section(owner.clone(), InlineSection::Checks),
-                    RowId::Check(identity.clone(), "failure-needle".to_owned()),
+                    RowId::Check(
+                        identity.clone(),
+                        "failure-needle".to_owned(),
+                        BranchId::VirtualPullRequest(identity.clone()),
+                    ),
                 ],
             ),
             ("review required", vec![repository.clone(), branch.clone()]),
@@ -8253,7 +8394,11 @@ mod tests {
             RowId::Section(owner.clone(), InlineSection::Checks),
             RowId::Section(owner.clone(), InlineSection::Reviewers),
             RowId::Section(owner.clone(), InlineSection::OpenComments),
-            RowId::OpenComment(identity.clone(), "comment-hidden-id".to_owned()),
+            RowId::OpenComment(
+                identity.clone(),
+                "comment-hidden-id".to_owned(),
+                BranchId::VirtualPullRequest(identity.clone()),
+            ),
         ] {
             assert!(
                 committed.contains(&restored),
@@ -8261,9 +8406,21 @@ mod tests {
             );
         }
         for still_collapsed in [
-            RowId::Check(identity.clone(), "failure-needle".to_owned()),
-            RowId::Check(identity.clone(), "pending-needle".to_owned()),
-            RowId::Reviewer(identity.clone(), "alice".to_owned()),
+            RowId::Check(
+                identity.clone(),
+                "failure-needle".to_owned(),
+                BranchId::VirtualPullRequest(identity.clone()),
+            ),
+            RowId::Check(
+                identity.clone(),
+                "pending-needle".to_owned(),
+                BranchId::VirtualPullRequest(identity.clone()),
+            ),
+            RowId::Reviewer(
+                identity.clone(),
+                "alice".to_owned(),
+                BranchId::VirtualPullRequest(identity.clone()),
+            ),
         ] {
             assert!(!committed.contains(&still_collapsed));
         }
@@ -8291,7 +8448,11 @@ mod tests {
         let saved = app.disclosure_expanded.clone();
 
         app.filter = "failure-needle".to_owned();
-        let check_id = RowId::Check(identity.clone(), "failure-needle".to_owned());
+        let check_id = RowId::Check(
+            identity.clone(),
+            "failure-needle".to_owned(),
+            BranchId::VirtualPullRequest(identity.clone()),
+        );
         assert!(app.visible_rows().iter().any(|row| row.id() == &check_id));
         app.selected = Some(check_id.clone());
         app.handle_key(key(KeyCode::Char('h')));
@@ -8370,7 +8531,12 @@ mod tests {
         ));
         assert_eq!(app.filter, "PENDING-(needle|other)");
         assert!(app.visible_rows().iter().any(|row| {
-            row.id() == &RowId::Check(identity.clone(), "pending-needle".to_owned())
+            row.id()
+                == &RowId::Check(
+                    identity.clone(),
+                    "pending-needle".to_owned(),
+                    BranchId::VirtualPullRequest(identity.clone()),
+                )
         }));
 
         app.handle_key(key(KeyCode::Char('/')));
@@ -8425,19 +8591,35 @@ mod tests {
                 InlineSection::Overview,
             ),
             (
-                RowId::Check(identity.clone(), "pending-needle".to_owned()),
+                RowId::Check(
+                    identity.clone(),
+                    "pending-needle".to_owned(),
+                    BranchId::VirtualPullRequest(identity.clone()),
+                ),
                 InlineSection::PendingChecks,
             ),
             (
-                RowId::Check(identity.clone(), "valid-needle".to_owned()),
+                RowId::Check(
+                    identity.clone(),
+                    "valid-needle".to_owned(),
+                    BranchId::VirtualPullRequest(identity.clone()),
+                ),
                 InlineSection::ValidResults,
             ),
             (
-                RowId::Reviewer(identity.clone(), "alice".to_owned()),
+                RowId::Reviewer(
+                    identity.clone(),
+                    "alice".to_owned(),
+                    BranchId::VirtualPullRequest(identity.clone()),
+                ),
                 InlineSection::Reviewers,
             ),
             (
-                RowId::OpenComment(identity.clone(), "comment-hidden-id".to_owned()),
+                RowId::OpenComment(
+                    identity.clone(),
+                    "comment-hidden-id".to_owned(),
+                    BranchId::VirtualPullRequest(identity.clone()),
+                ),
                 InlineSection::OpenComments,
             ),
         ] {
@@ -8460,7 +8642,11 @@ mod tests {
             DisclosureKey::Section(owner.clone(), InlineSection::PendingChecks),
             true,
         );
-        let leaf = RowId::Check(identity.clone(), "pending-needle".to_owned());
+        let leaf = RowId::Check(
+            identity.clone(),
+            "pending-needle".to_owned(),
+            BranchId::VirtualPullRequest(identity.clone()),
+        );
         app.selected = Some(leaf.clone());
         let disclosures = app.disclosure_expanded.clone();
         app.handle_key(key(KeyCode::Char('l')));
@@ -8490,7 +8676,11 @@ mod tests {
     fn filtered_check_category_changes_keep_identity_selection_and_new_ancestors() {
         let (mut app, identity) = filter_test_app();
         let owner = BranchId::VirtualPullRequest(identity.clone());
-        let check_id = RowId::Check(identity.clone(), "pending-needle".to_owned());
+        let check_id = RowId::Check(
+            identity.clone(),
+            "pending-needle".to_owned(),
+            BranchId::VirtualPullRequest(identity.clone()),
+        );
         app.filter = "pending-needle".to_owned();
         app.selected = Some(check_id.clone());
         app.set_viewport_height(2);
