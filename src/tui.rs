@@ -194,17 +194,56 @@ pub fn run_with_deletion(
     run_with_startup_deletion("", Some((repository, worktree)))
 }
 
+/// Recover only picker startup: commands targeting the current worktree must
+/// not silently operate on a different directory.
+fn picker_directory() -> Result<(PathBuf, bool), TuiError> {
+    let error = match env::current_dir() {
+        Ok(path) => return Ok((path, false)),
+        Err(error) => error,
+    };
+    let mut candidates = Vec::new();
+    if let Some(pwd) = env::var_os("PWD")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        candidates.extend(
+            pwd.ancestors()
+                .skip(1)
+                .filter(|p| p.parent().is_some())
+                .map(Path::to_owned),
+        );
+    }
+    if let Some(home) = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        candidates.push(home);
+    }
+    candidates.push(PathBuf::from("/"));
+    for candidate in candidates {
+        if env::set_current_dir(&candidate).is_ok()
+            && let Ok(path) = env::current_dir()
+        {
+            tracing::warn!(%error, directory = %path.display(), "recovered unavailable current directory");
+            return Ok((path, true));
+        }
+    }
+    Err(TuiError::CurrentDirectory(error))
+}
+
 fn run_with_startup_deletion(
     initial_filter: &str,
     deletion: Option<(&Path, PathBuf)>,
 ) -> Result<Option<PathBuf>, TuiError> {
+    let (current_directory, relocated) = picker_directory()?;
     let catalog_path = config::catalog_path()?;
     let catalog = config::load(&catalog_path)?;
-    let current_directory = env::current_dir().map_err(TuiError::CurrentDirectory)?;
+    let relocation_destination = relocated.then(|| current_directory.clone());
     let repositories = load_repository_views(&catalog, &current_directory);
     let mut app = App::new(repositories, current_directory);
     app.set_committed_filter(initial_filter);
     let mut controller = Controller::new(catalog_path, catalog, app);
+    controller.relocation_destination = relocation_destination;
     controller.load_remote_cache();
     let _panic_hook = PanicHookGuard::install();
     let mut terminal = InteractiveTerminal::open()?;
@@ -2530,6 +2569,7 @@ fn absolute_path(current_directory: &Path, value: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::app::{Modal, RowId, VirtualRepositoryView};
     use crate::model::{
         AuthoredPullRequest, CanonicalPullRequestId, CheckRollup, CheckState,
@@ -2538,6 +2578,70 @@ mod tests {
     };
     use std::process::Command;
     use std::sync::Mutex;
+
+    #[test]
+    fn picker_directory_recovers_in_an_isolated_process() {
+        const CASE: &str = "WT_TEST_PICKER_DIRECTORY";
+        let Ok(case) = env::var(CASE) else {
+            for case in ["valid", "parent", "home", "relative_pwd", "root"] {
+                let output = Command::new(env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tui::tests::picker_directory_recovers_in_an_isolated_process",
+                        "--nocapture",
+                    ])
+                    .env(CASE, case)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let removed = root.join("gone/nested");
+        let home = root.join("home");
+        std::fs::create_dir_all(&removed).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        env::set_current_dir(&removed).unwrap();
+        // Environment and cwd changes are confined to this single-test child.
+        unsafe {
+            env::set_var("HOME", &home);
+            env::set_var("PWD", &removed);
+        }
+        if case == "valid" {
+            unsafe {
+                env::set_var("PWD", &home);
+            }
+            assert_eq!(picker_directory().unwrap(), (removed, false));
+        } else {
+            std::fs::remove_dir_all(root.join("gone")).unwrap();
+            assert!(env::current_dir().is_err());
+            unsafe {
+                match case.as_str() {
+                    "home" => env::remove_var("PWD"),
+                    "relative_pwd" => env::set_var("PWD", "relative/gone"),
+                    "root" => {
+                        env::remove_var("PWD");
+                        env::set_var("HOME", root.join("missing home"));
+                    }
+                    _ => {}
+                }
+            }
+            let expected = match case.as_str() {
+                "parent" => root.clone(),
+                "root" => PathBuf::from("/"),
+                _ => home,
+            };
+            assert_eq!(picker_directory().unwrap(), (expected.clone(), true));
+            assert_eq!(env::current_dir().unwrap(), expected);
+        }
+        env::set_current_dir("/").unwrap();
+    }
 
     struct FakeUrlOpener {
         opened: Mutex<Vec<String>>,

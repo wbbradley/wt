@@ -64,6 +64,8 @@ eval "$(wt shell-init zsh)"
 
 Restart your shell to load the navigation wrapper and tab completion.
 
+If the current directory was deleted, the picker starts from the nearest surviving parent in `$PWD`, falling back to `$HOME` or `/`. Quitting the picker also returns that destination so the shell wrapper can leave the deleted directory.
+
 ### First run
 
 Register repositories, including normal checkouts, linked worktrees, and bare repositories:

@@ -51,7 +51,25 @@ fn run_editor(editor: Option<&str>, zsh: bool, ignored: bool, disappear: bool) {
     run_session(editor, zsh, ignored, disappear, false);
 }
 
+#[test]
+fn picker_recovers_from_a_directory_deleted_before_startup() {
+    for zsh in [false, true] {
+        run_session_with_deleted_cwd(Some("valid"), zsh, false, false, false, true);
+    }
+}
+
 fn run_session(editor: Option<&str>, zsh: bool, ignored: bool, disappear: bool, viewer: bool) {
+    run_session_with_deleted_cwd(editor, zsh, ignored, disappear, viewer, false);
+}
+
+fn run_session_with_deleted_cwd(
+    editor: Option<&str>,
+    zsh: bool,
+    ignored: bool,
+    disappear: bool,
+    viewer: bool,
+    deleted_cwd: bool,
+) {
     let temp = tempfile::tempdir().unwrap();
     // macOS exposes the temporary directory through a /var -> /private/var symlink.
     let root = fs::canonicalize(temp.path()).unwrap();
@@ -140,14 +158,18 @@ exit "$EDITOR_EXIT"
     }
     let shell = if zsh { "zsh" } else { "bash" };
     let wrapper = format!("{}/shell/wt.{shell}", env!("CARGO_MANIFEST_DIR"));
+    let removed = root.join("deleted directory");
+    fs::create_dir(&removed).unwrap();
     let mut command = Command::new(shell);
     command.args([
         "-c",
-        r#"source "$WRAPPER"; wt; result=$?; printf 'RESULT=%s\n' "$result"; pwd; printf 'WT_TEST_DONE\n' >&2; read -r acknowledgement"#,
+        r#"source "$WRAPPER"; if [ "$DELETE_CWD" = 1 ]; then cd "$REMOVED" && rmdir "$REMOVED" || exit 1; fi; wt; result=$?; printf 'RESULT=%s\n' "$result"; pwd; printf 'WT_TEST_DONE\n' >&2; read -r acknowledgement"#,
     ]);
     command
         .current_dir(root)
         .env("WRAPPER", wrapper)
+        .env("DELETE_CWD", if deleted_cwd { "1" } else { "0" })
+        .env("REMOVED", removed)
         .env(
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
