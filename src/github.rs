@@ -2133,6 +2133,15 @@ fn prefer_pull_request(
     mut pull_requests: Vec<PullRequest>,
     target: &BranchTarget,
 ) -> Option<PullRequest> {
+    // Commit associations also include PRs that merely contain this commit.
+    // Those PRs do not belong to this worktree unless their branch or tip matches.
+    pull_requests.retain(|pull_request| {
+        pull_request.head.branch == target.branch
+            || target
+                .head
+                .as_deref()
+                .is_some_and(|head| pull_request.head.oid.as_deref() == Some(head))
+    });
     pull_requests.sort_by(|left, right| {
         let match_priority = |pull_request: &PullRequest| {
             if pull_request.head.branch == target.branch {
@@ -3435,6 +3444,31 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_commit_associations_do_not_select_a_worktree_pr() {
+        let mut merged = authored_node(1, "viewer", false);
+        merged["state"] = Value::String("MERGED".to_owned());
+        let open = authored_node(2, "viewer", false);
+        let data = serde_json::json!({
+            "repository": {
+                "branch0": {"associatedPullRequests": {"nodes": [merged, open]}}
+            }
+        });
+
+        for head in [Some("different-head".to_owned()), None] {
+            let target = BranchTarget {
+                worktree: PathBuf::from("/tree"),
+                branch: "unrelated-local-branch".to_owned(),
+                head,
+            };
+            let (display, associations) =
+                parse_batch_data(&data, &[target], &[], &[], None, "github.com").unwrap();
+
+            assert!(display[0].as_ref().unwrap().pull_request.is_none());
+            assert_eq!(associations[0].as_ref().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
     fn exact_head_oid_selects_the_parent_pr_for_a_repointed_branch() {
         let target = BranchTarget {
             worktree: PathBuf::from("/tree"),
@@ -3999,7 +4033,7 @@ mod tests {
         merged.updated_at = "2026-12-01T00:00:00Z".to_owned();
         let target = BranchTarget {
             worktree: PathBuf::from("/tree"),
-            branch: "unmatched".to_owned(),
+            branch: "topic".to_owned(),
             head: Some("unmatched".to_owned()),
         };
         assert_eq!(
