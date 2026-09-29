@@ -1581,11 +1581,17 @@ impl App {
     ) -> Vec<usize> {
         let mut indexes = indexes.collect::<Vec<_>>();
         indexes.sort_by(|left, right| {
-            alphabetical_cmp(
-                &self.branch_sort_label(&forest.nodes[*left]),
-                &self.branch_sort_label(&forest.nodes[*right]),
-            )
-            .then_with(|| forest.nodes[*left].id.cmp(&forest.nodes[*right].id))
+            forest.nodes[*left]
+                .pull_request
+                .is_some()
+                .cmp(&forest.nodes[*right].pull_request.is_some())
+                .then_with(|| {
+                    alphabetical_cmp(
+                        &self.branch_sort_label(&forest.nodes[*left]),
+                        &self.branch_sort_label(&forest.nodes[*right]),
+                    )
+                })
+                .then_with(|| forest.nodes[*left].id.cmp(&forest.nodes[*right].id))
         });
         indexes
     }
@@ -5641,6 +5647,59 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(branch_names, vec!["Alpha", "bravo", "zulu"]);
+    }
+
+    #[test]
+    fn tree_sorts_pr_less_worktrees_before_local_and_virtual_pull_requests() {
+        let mut local = repository("/repo", true);
+        local.worktrees = vec![
+            worktree("/repo-zulu", "zulu", false),
+            worktree("/repo-alpha", "Alpha", false),
+            worktree("/repo-yankee", "Yankee", false),
+        ];
+        let mut local_pr = authored("team", "project", 10, "2026-01-01");
+        local_pr.pull_request.head.branch = "Alpha".to_owned();
+        let mut virtual_pr = authored("team", "project", 11, "2026-01-02");
+        virtual_pr.pull_request.head.branch = "bravo".to_owned();
+        local
+            .config
+            .github_remotes
+            .insert("origin".to_owned(), local_pr.identity.repository.clone());
+        let mut app = App::new(vec![local], PathBuf::from("/elsewhere"));
+        app.github.insert(
+            PathBuf::from("/repo-alpha"),
+            GitHubState::Ready(GitHubBranchData {
+                pull_request: Some(local_pr.pull_request),
+                warnings: Vec::new(),
+                rate_limit: None,
+            }),
+        );
+        app.virtual_repositories = vec![VirtualRepositoryView {
+            identity: virtual_pr.identity.repository.clone(),
+            mapped_repository: Some(PathBuf::from("/repo")),
+            expanded: true,
+            pull_requests: vec![virtual_pr.clone()],
+        }];
+
+        let branches = app
+            .visible_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                VisibleRow::Worktree { id, .. } | VisibleRow::VirtualPullRequest { id, .. } => {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            branches,
+            vec![
+                RowId::Worktree(PathBuf::from("/repo-yankee")),
+                RowId::Worktree(PathBuf::from("/repo-zulu")),
+                RowId::Worktree(PathBuf::from("/repo-alpha")),
+                RowId::VirtualPullRequest(virtual_pr.identity),
+            ]
+        );
     }
 
     #[test]
