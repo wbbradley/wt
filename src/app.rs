@@ -18,7 +18,6 @@ use crate::prompt::{
     PromptPullRequest, PromptWorktree, concise_comment_text, format_agent_prompt,
     format_review_request,
 };
-use crate::state::PersistentFocusTarget;
 
 const LIST_SCROLL_MARGIN: usize = 5;
 
@@ -465,7 +464,6 @@ pub enum Intent {
     },
     OpenUrl(String),
     PersistBackburner,
-    PersistFocus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2453,55 +2451,6 @@ impl App {
         self.focus_target.is_some()
     }
 
-    pub(crate) fn persistent_focus(&self) -> Option<PersistentFocusTarget> {
-        self.focus_target.as_ref().map(|target| match target {
-            FocusTarget::Repository(path) => {
-                PersistentFocusTarget::Repository { path: path.clone() }
-            }
-            FocusTarget::VirtualRepository(repository) => {
-                PersistentFocusTarget::VirtualRepository {
-                    repository: repository.clone(),
-                }
-            }
-            FocusTarget::Backburner(repository) => PersistentFocusTarget::Backburner {
-                repository: repository.clone(),
-            },
-            FocusTarget::Branch(BranchId::Worktree(path)) => {
-                PersistentFocusTarget::Worktree { path: path.clone() }
-            }
-            FocusTarget::Branch(BranchId::VirtualPullRequest(pull_request)) => {
-                PersistentFocusTarget::PullRequest {
-                    pull_request: pull_request.clone(),
-                }
-            }
-        })
-    }
-
-    pub(crate) fn restore_focus(&mut self, target: &PersistentFocusTarget) -> bool {
-        let target = match target {
-            PersistentFocusTarget::Repository { path } => FocusTarget::Repository(path.clone()),
-            PersistentFocusTarget::VirtualRepository { repository } => {
-                FocusTarget::VirtualRepository(repository.clone())
-            }
-            PersistentFocusTarget::Backburner { repository } => {
-                FocusTarget::Backburner(repository.clone())
-            }
-            PersistentFocusTarget::Worktree { path } => {
-                FocusTarget::Branch(BranchId::Worktree(path.clone()))
-            }
-            PersistentFocusTarget::PullRequest { pull_request } => {
-                FocusTarget::Branch(BranchId::VirtualPullRequest(pull_request.clone()))
-            }
-        };
-        if self.focused_rows(&target).is_none() {
-            return false;
-        }
-        self.focus_target = Some(target);
-        self.scroll = 0;
-        self.ensure_selection_visible();
-        true
-    }
-
     pub fn focus_label(&self) -> Option<String> {
         match self.focus_target.as_ref()? {
             FocusTarget::Repository(path) => self
@@ -2631,7 +2580,7 @@ impl App {
             KeyCode::Char('b') => self.toggle_selected_backburner(),
             KeyCode::Char('f') => {
                 self.focus_selected();
-                Intent::PersistFocus
+                Intent::None
             }
             KeyCode::Char(']') => {
                 self.navigate_attention(true);
@@ -2661,7 +2610,7 @@ impl App {
             KeyCode::Enter => self.accept_or_toggle(),
             KeyCode::Esc if self.is_focused() => {
                 self.clear_focus();
-                Intent::PersistFocus
+                Intent::None
             }
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.clear_search_preserving_selection();
@@ -6149,10 +6098,7 @@ mod tests {
         app.selected = Some(RowId::Repository(PathBuf::from("/alpha")));
         assert_eq!(app.handle_key(key(KeyCode::Char('F'))), Intent::None);
         assert!(!app.is_focused());
-        assert_eq!(
-            app.handle_key(key(KeyCode::Char('f'))),
-            Intent::PersistFocus
-        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('f'))), Intent::None);
         assert_eq!(app.focus_label().as_deref(), Some("alpha"));
         assert!(app.visible_rows().iter().all(|row| match row {
             VisibleRow::Repository {
@@ -6171,10 +6117,7 @@ mod tests {
 
         let branch = RowId::Worktree(PathBuf::from("/alpha-topic"));
         app.selected = Some(branch.clone());
-        assert_eq!(
-            app.handle_key(key(KeyCode::Char('f'))),
-            Intent::PersistFocus
-        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('f'))), Intent::None);
         assert_eq!(app.focus_label().as_deref(), Some("alpha: topic"));
         assert_eq!(
             app.visible_rows()
@@ -6188,7 +6131,7 @@ mod tests {
             Some(VisibleRow::Worktree { depth: 0, .. })
         ));
 
-        assert_eq!(app.handle_key(key(KeyCode::Esc)), Intent::PersistFocus);
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Intent::None);
         assert!(!app.is_focused());
         assert!(
             app.visible_rows()
@@ -6335,45 +6278,6 @@ mod tests {
             vec![(unrelated.identity.clone(), None)],
         );
         assert!(!app.is_focused());
-    }
-
-    #[test]
-    fn focus_round_trips_by_canonical_pull_request_identity() {
-        let pull_request = authored("team", "project", 42, "2026-01-01");
-        let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));
-        replace_authored(
-            &mut app,
-            vec![pull_request.clone()],
-            vec![(pull_request.identity.clone(), None)],
-        );
-        app.selected = Some(RowId::VirtualPullRequest(pull_request.identity.clone()));
-        assert_eq!(
-            app.handle_key(key(KeyCode::Char('f'))),
-            Intent::PersistFocus
-        );
-        let persisted = app.persistent_focus().unwrap();
-        assert_eq!(
-            persisted,
-            PersistentFocusTarget::PullRequest {
-                pull_request: pull_request.identity.clone()
-            }
-        );
-
-        let mut restored = App::new(Vec::new(), PathBuf::from("/elsewhere"));
-        replace_authored(
-            &mut restored,
-            vec![pull_request.clone()],
-            vec![(pull_request.identity.clone(), None)],
-        );
-        assert!(restored.restore_focus(&persisted));
-        assert_eq!(
-            restored.focus_label().as_deref(),
-            Some("team/project: topic-42")
-        );
-        assert_eq!(
-            restored.selected,
-            Some(RowId::VirtualPullRequest(pull_request.identity))
-        );
     }
 
     #[test]

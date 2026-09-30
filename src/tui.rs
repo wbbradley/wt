@@ -25,7 +25,7 @@ use crate::github::{
 };
 use crate::model::{Catalog, RepositoryConfig, Worktree};
 use crate::operations::{self, CreateMode};
-use crate::state::{self, PersistentFocusTarget, PersistentState};
+use crate::state::{self, PersistentState};
 use crate::terminal::{InteractiveTerminal, PanicHookGuard};
 use crate::ui;
 
@@ -454,7 +454,6 @@ struct Controller {
     clipboard: Arc<dyn Clipboard>,
     clipboard_copy: Option<ClipboardCopy>,
     state_path: PathBuf,
-    pending_focus: Option<PersistentFocusTarget>,
 }
 
 impl Controller {
@@ -466,11 +465,9 @@ impl Controller {
         let (github_sender, github_receiver) = mpsc::channel();
         let remote_cache_path = cache::path(&catalog_path);
         let state_path = state::path(&catalog_path);
-        let mut pending_focus = None;
         match state::load(&state_path) {
             Ok(state) => {
                 app.backburner = state.backburner;
-                pending_focus = state.focus;
             }
             Err(error) => app.inline_error = Some(format!("UI state ignored: {error}")),
         }
@@ -508,25 +505,13 @@ impl Controller {
             clipboard: Arc::new(SystemClipboard),
             clipboard_copy: None,
             state_path,
-            pending_focus,
         };
-        controller.restore_pending_focus();
         controller.github_bindings = controller
             .current_github_bindings()
             .into_iter()
             .filter(|(path, _)| controller.app.github.contains_key(path))
             .collect();
         controller
-    }
-
-    fn restore_pending_focus(&mut self) {
-        if self
-            .pending_focus
-            .as_ref()
-            .is_some_and(|target| self.app.restore_focus(target))
-        {
-            self.pending_focus = None;
-        }
     }
 
     #[cfg(test)]
@@ -719,24 +704,11 @@ impl Controller {
             Intent::PersistBackburner => {
                 let persistent = PersistentState {
                     backburner: self.app.backburner.clone(),
-                    focus: self.app.persistent_focus(),
                     ..PersistentState::default()
                 };
                 if let Err(error) = state::save(&self.state_path, &persistent) {
                     self.app.inline_error =
                         Some(format!("unable to save Backburner state: {error}"));
-                }
-                Ok(ControlFlow::Continue)
-            }
-            Intent::PersistFocus => {
-                self.pending_focus = None;
-                let persistent = PersistentState {
-                    backburner: self.app.backburner.clone(),
-                    focus: self.app.persistent_focus(),
-                    ..PersistentState::default()
-                };
-                if let Err(error) = state::save(&self.state_path, &persistent) {
-                    self.app.inline_error = Some(format!("unable to save focus state: {error}"));
                 }
                 Ok(ControlFlow::Continue)
             }
@@ -2218,7 +2190,6 @@ impl Controller {
             |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
         );
         self.app.rebuild_virtual_repositories();
-        self.restore_pending_focus();
     }
 
     fn start_pull_request_materialization(
@@ -3258,23 +3229,42 @@ mod tests {
     }
 
     #[test]
-    fn controller_persists_and_restores_named_focus_target() {
+    fn controller_keeps_focus_in_the_current_session_only() {
         let directory = tempfile::tempdir().unwrap();
         let catalog_path = directory.path().join("wt.json");
-        let mut app = prompt_app();
-        let intent = app.handle_key(crossterm::event::KeyEvent::new(
+        let mut controller =
+            Controller::new(catalog_path.clone(), Catalog::default(), prompt_app());
+        let focus_key = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('f'),
             crossterm::event::KeyModifiers::NONE,
-        ));
-        let mut controller = Controller::new(catalog_path.clone(), Catalog::default(), app);
+        );
+        let intent = controller.app.handle_key(focus_key);
         controller.handle_intent(intent).unwrap();
+        assert!(controller.app.is_focused());
+        assert!(!controller.state_path.exists());
+
+        controller.handle_intent(Intent::PersistBackburner).unwrap();
+        let saved = std::fs::read_to_string(&controller.state_path).unwrap();
+        assert!(!saved.contains("\"focus\""));
+        assert!(controller.app.is_focused());
 
         let restored = Controller::new(catalog_path, Catalog::default(), prompt_app());
-        assert!(restored.app.is_focused());
-        assert_eq!(
-            restored.app.focus_label().as_deref(),
-            Some("team/project: fix-ci")
-        );
+        assert!(!restored.app.is_focused());
+    }
+
+    #[test]
+    fn controller_ignores_legacy_saved_focus() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog_path = directory.path().join("wt.json");
+        std::fs::write(
+            state::path(&catalog_path),
+            r#"{"version":1,"backburner":[],"focus":{"kind":"pull_request","pull_request":{"repository":{"host":"github.com","owner":"team","repository":"project"},"number":42}}}"#,
+        )
+        .unwrap();
+
+        let controller = Controller::new(catalog_path, Catalog::default(), prompt_app());
+        assert!(!controller.app.is_focused());
+        assert!(controller.app.inline_error.is_none());
     }
 
     impl UrlOpener for FakeUrlOpener {

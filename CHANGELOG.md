@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Keep focus mode ephemeral within the current `wt` session instead of saving it across restarts. Previously saved focus is ignored.
+
 - Remove worktrees (`d`) on a background thread instead of inline, so the interface keeps rendering and responding while Git works. The worktree renders dimmed and italicized with a `deleting` marker until the removal finishes, several removals can run at once, and the header reports the removal with a spinner and its age.
 
 ### Fixed
