@@ -589,7 +589,12 @@ mod tests {
         symlink("target", root.join("link")).unwrap();
         symlink("absent", root.join("broken")).unwrap();
         symlink("loop", root.join("loop")).unwrap();
-        let raw = PathBuf::from(OsString::from_vec(b"raw\xff\nname".to_vec()));
+        // macOS requires UTF-8 filenames; still exercise newline preservation there.
+        let raw = PathBuf::from(OsString::from_vec(if cfg!(target_os = "macos") {
+            b"raw\nname".to_vec()
+        } else {
+            b"raw\xff\nname".to_vec()
+        }));
         fs::write(root.join(&raw), "").unwrap();
         let result = ignored_files(
             &SystemGit,

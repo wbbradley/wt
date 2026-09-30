@@ -22,6 +22,7 @@ const SUCCESS: Color = Color::Green;
 const WARNING: Color = Color::Yellow;
 const DANGER: Color = Color::Red;
 const PR_NUMBER: Color = Color::Rgb(255, 165, 0);
+const MERGED_PR_NUMBER: Color = Color::Rgb(177, 98, 134);
 const COMMENTS: Color = Color::Rgb(255, 140, 0);
 const MUTED: Color = Color::DarkGray;
 const SELECTION: Color = Color::Rgb(45, 55, 72);
@@ -1069,7 +1070,7 @@ fn truncate_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>>
 }
 
 fn color_for_login(login: &str) -> Color {
-    let hue = (raw_login_hue(login) + login_hue_offset()).rem_euclid(360.0);
+    let hue = (raw_login_hue(login) + 39.0).rem_euclid(360.0);
     let (red, green, blue) = hsl_to_rgb(hue, 0.80, 0.60);
     Color::Rgb(red, green, blue)
 }
@@ -1082,12 +1083,6 @@ fn raw_login_hue(login: &str) -> f32 {
         .to_ascii_lowercase()
         .hash(&mut hasher);
     (hasher.finish() % 360) as f32
-}
-
-fn login_hue_offset() -> f32 {
-    const ANCHOR_LOGIN: &str = "wbbradley";
-    const ANCHOR_HUE: f32 = 27.0;
-    (ANCHOR_HUE - raw_login_hue(ANCHOR_LOGIN)).rem_euclid(360.0)
 }
 
 fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
@@ -1113,14 +1108,15 @@ fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
 }
 
 fn pull_request_prefix_spans(pull_request: &crate::model::PullRequest) -> Vec<Span<'static>> {
-    if pull_request.state == PullRequestState::Merged {
-        return Vec::new();
-    }
+    let style = if pull_request.state == PullRequestState::Merged {
+        Style::default()
+            .fg(MERGED_PR_NUMBER)
+            .add_modifier(Modifier::ITALIC)
+    } else {
+        Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD)
+    };
     vec![
-        Span::styled(
-            format!("PR #{}", pull_request.number),
-            Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("PR #{}", pull_request.number), style),
         Span::styled(" · ", Style::default().fg(MUTED)),
     ]
 }
@@ -3115,7 +3111,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let trunk = buffer_text(terminal.backend().buffer());
         assert!(!trunk.contains("· merged"));
-        assert!(!trunk.contains("PR #42"));
+        assert!(trunk.contains("PR #42"));
         assert!(!trunk.contains("merged change"));
         assert!(!trunk.contains("auto-merge"));
 
@@ -3124,7 +3120,8 @@ mod tests {
         let merged_buffer = terminal.backend().buffer();
         let merged = buffer_text(merged_buffer);
         assert!(merged.contains("· merged"));
-        assert!(!merged.contains("PR #42"));
+        assert!(merged.contains("PR #42"));
+        assert!(colored_text(merged_buffer, MERGED_PR_NUMBER).contains("PR #42"));
         assert!(!merged.contains("merged change"));
         assert!(!merged.contains("auto-merge"));
         assert!(colored_text(merged_buffer, Color::Green).contains("merged"));
@@ -3135,6 +3132,16 @@ mod tests {
             .and_then(GitHubState::data)
             .and_then(|data| data.pull_request.as_ref())
             .unwrap();
+        let prefix = pull_request_prefix_spans(merged_pull_request);
+        assert_eq!(prefix[0].style.fg, Some(MERGED_PR_NUMBER));
+        assert!(prefix[0].style.add_modifier.contains(Modifier::ITALIC));
+        assert!(!prefix[0].style.add_modifier.contains(Modifier::BOLD));
+        let mut open_pull_request = merged_pull_request.clone();
+        open_pull_request.state = PullRequestState::Open;
+        let open_prefix = pull_request_prefix_spans(&open_pull_request);
+        assert_eq!(open_prefix[0].style.fg, Some(PR_NUMBER));
+        assert!(open_prefix[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(!open_prefix[0].style.add_modifier.contains(Modifier::ITALIC));
         let stale_active_details = PullRequestDetails {
             checks: vec![PullRequestCheck {
                 name: "build".to_owned(),

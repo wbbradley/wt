@@ -3476,14 +3476,12 @@ mod tests {
             head: Some("shared-parent-head".to_owned()),
         };
         let mut parent = authored_node(33580, "viewer", false);
-        parent["headRefName"] =
-            Value::String("wbbradley/context-hub-fleet-path-validation".to_owned());
+        parent["headRefName"] = Value::String("viewer/parent-topic".to_owned());
         parent["headRefOid"] = Value::String("shared-parent-head".to_owned());
         parent["updatedAt"] = Value::String("2026-01-01T00:00:00Z".to_owned());
         let mut child = authored_node(33902, "viewer", false);
-        child["baseRefName"] =
-            Value::String("wbbradley/context-hub-fleet-path-validation".to_owned());
-        child["headRefName"] = Value::String("context-hub-materialization-hardening".to_owned());
+        child["baseRefName"] = Value::String("viewer/parent-topic".to_owned());
+        child["headRefName"] = Value::String("child-topic".to_owned());
         child["headRefOid"] = Value::String("child-head".to_owned());
         child["updatedAt"] = Value::String("2026-02-01T00:00:00Z".to_owned());
         let data = serde_json::json!({

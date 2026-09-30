@@ -454,9 +454,10 @@ mod tests {
         assert!(rendered(&mut view, 40, 5).contains("LAST"));
     }
 
-    #[cfg(unix)]
+    // macOS filesystems reject filenames containing invalid UTF-8 bytes.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
-    fn non_utf8_paths_and_regular_symlinks_are_supported() {
+    fn non_utf8_paths_are_supported() {
         use std::os::unix::ffi::OsStringExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir
@@ -464,6 +465,14 @@ mod tests {
             .join(std::ffi::OsString::from_vec(vec![b'f', 0xff]));
         std::fs::write(&path, "content").unwrap();
         assert_eq!(FileView::load(path.clone()).unwrap().path, path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_symlinks_are_supported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target.md");
+        std::fs::write(&path, "content").unwrap();
         let link = dir.path().join("link.md");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(FileView::load(link).is_ok());

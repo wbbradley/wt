@@ -2757,6 +2757,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("repo");
             std::fs::create_dir(&root).unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
             git::run_git(&SystemGit, &root, &["init".into(), "-q".into()]).unwrap();
             let relative = PathBuf::from("file ;$(literal) with spaces");
             let path = root.join(&relative);
@@ -2886,6 +2887,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
         git::run_git(&SystemGit, &root, &["init".into(), "-q".into()]).unwrap();
         std::fs::write(root.join(".git/info/exclude"), "old\nnew\n").unwrap();
         std::fs::write(root.join("old"), "").unwrap();
@@ -3048,6 +3050,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("repo");
         std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
         git::run_git(&SystemGit, &root, &["init".into(), "-q".into()]).unwrap();
         let mut catalog = Catalog::default();
         catalog.repositories.push(RepositoryConfig {

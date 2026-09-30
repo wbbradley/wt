@@ -123,7 +123,8 @@ fn run_configured(_value: &str, _path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    // macOS filesystems reject filenames containing invalid UTF-8 bytes.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn editor_argument_preserves_non_utf8_filename_bytes() {
         use std::ffi::OsString;

@@ -38,7 +38,7 @@ Use Conventional Commits commit message style. If there are pre-existing modifie
 
 ### Update the plan file
 
-Read the plan file at `/home/wbbradley/src/wt/PLAN.md`. **Remove** the completed task entirely from the "Next Up" section — do not leave it in place with a [DONE] tag, strikethrough, or any other marker. The task and its related subsections should no longer appear in the plan file at all. The plan file should not have any sort of "Done" section. Then append a new entry to the completed file at `/home/wbbradley/src/wt/COMPLETED.md` with two parts, in this order:
+Read the plan file at `PLAN.md`. **Remove** the completed task entirely from the "Next Up" section — do not leave it in place with a [DONE] tag, strikethrough, or any other marker. The task and its related subsections should no longer appear in the plan file at all. The plan file should not have any sort of "Done" section. Then append a new entry to the completed file at `COMPLETED.md` with two parts, in this order:
 
 1. A brief summary, written now, of what was actually implemented.
 2. The full text of the plan entry as it existed before work began, verbatim, not paraphrased, to preserve the original.
