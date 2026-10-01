@@ -1216,7 +1216,7 @@ fn pull_request_detail_query(number: u64) -> String {
           }}
           reviewThreads(first: 100) {{
             nodes {{
-              id isResolved isOutdated path
+              id isResolved isOutdated path line originalLine
               comments(last: 100) {{
                 nodes {{ id databaseId author {{ login }} body url }}
                 pageInfo {{ hasPreviousPage }}
@@ -1314,6 +1314,10 @@ fn parse_pull_request_attention(node: &Value, details: &mut PullRequestDetails) 
                         database_id: comment.get("databaseId").and_then(Value::as_u64),
                         thread_id: thread_id.clone(),
                         kind: FeedbackKind::InlineThread,
+                        line: thread
+                            .get("line")
+                            .and_then(Value::as_u64)
+                            .or_else(|| thread.get("originalLine").and_then(Value::as_u64)),
                         author: actor_name(comment.get("author")),
                         body: body.to_owned(),
                         path: path.clone(),
@@ -1393,6 +1397,7 @@ fn parse_review_summary(node: &Value) -> Option<PullRequestFeedback> {
         database_id: node.get("databaseId").and_then(Value::as_u64),
         thread_id: None,
         kind: FeedbackKind::ReviewSummary,
+        line: None,
         author: actor_name(node.get("author")),
         body: body.to_owned(),
         path: None,
@@ -2599,6 +2604,7 @@ mod tests {
                                 {
                                     "id": "THREAD_1", "isResolved": false,
                                     "isOutdated": false, "path": "src/lib.rs",
+                                    "line": 42, "originalLine": 40,
                                     "comments": {
                                         "nodes": [{
                                             "id": "COMMENT_1", "databaseId": 101,
@@ -2954,6 +2960,7 @@ mod tests {
                 .contains("isRequired(pullRequestNumber: 42)")
         );
         let query = first["query"].as_str().unwrap();
+        assert!(query.contains("path line originalLine"));
         assert_eq!(query.matches('{').count(), query.matches('}').count());
         assert_eq!(
             request_json(&second_request)["variables"]["contextsCursor"],
@@ -2981,7 +2988,7 @@ mod tests {
             details
                 .feedback
                 .iter()
-                .any(|feedback| feedback.database_id == Some(101))
+                .any(|feedback| feedback.database_id == Some(101) && feedback.line == Some(42))
         );
         assert!(
             details
@@ -2989,6 +2996,30 @@ mod tests {
                 .iter()
                 .all(|feedback| feedback.database_id != Some(102))
         );
+    }
+
+    #[test]
+    fn review_thread_lines_use_current_then_original_and_allow_missing_locations() {
+        for (line, original_line, expected) in [
+            (Some(42), Some(40), Some(42)),
+            (None, Some(40), Some(40)),
+            (None, None, None),
+        ] {
+            let node = serde_json::json!({
+                "reviewThreads": {"nodes": [{
+                    "id": "thread", "isResolved": false,
+                    "isOutdated": line.is_none(), "path": "src/lib.rs",
+                    "line": line, "originalLine": original_line,
+                    "comments": {"nodes": [{
+                        "id": "comment", "author": {"login": "reviewer"}, "body": "Fix this"
+                    }]}
+                }]}
+            });
+            let mut details = PullRequestDetails::default();
+            parse_pull_request_attention(&node, &mut details);
+            assert_eq!(details.feedback.len(), 1);
+            assert_eq!(details.feedback[0].line, expected);
+        }
     }
 
     #[test]

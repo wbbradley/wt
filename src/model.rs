@@ -228,6 +228,8 @@ pub struct PullRequestFeedback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permalink: Option<String>,
     #[serde(default)]
     pub outdated: bool,
@@ -784,6 +786,7 @@ mod tests {
                     database_id: Some(7),
                     thread_id: Some("thread".to_owned()),
                     kind: FeedbackKind::InlineThread,
+                    line: None,
                     author: "octocat".to_owned(),
                     body: "please fix".to_owned(),
                     path: Some("src/lib.rs".to_owned()),
@@ -795,6 +798,7 @@ mod tests {
                     database_id: Some(8),
                     thread_id: None,
                     kind: FeedbackKind::ReviewSummary,
+                    line: None,
                     author: "octocat".to_owned(),
                     body: "earlier review summary".to_owned(),
                     path: None,

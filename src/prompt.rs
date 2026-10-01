@@ -110,7 +110,12 @@ fn format_feedback(
             feedback.author
         ));
         if let Some(path) = &feedback.path {
-            output.push_str(&format!(" on `{path}`"));
+            output.push_str(" on `");
+            output.push_str(path);
+            if let Some(line) = feedback.line {
+                output.push_str(&format!(":{line}"));
+            }
+            output.push('`');
         }
         if feedback.kind == FeedbackKind::InlineThread && feedback.outdated {
             output.push_str(" (outdated)");
@@ -352,6 +357,7 @@ mod tests {
                     database_id: Some(91),
                     thread_id: Some("PRRT_thread".to_owned()),
                     kind: FeedbackKind::InlineThread,
+                    line: Some(42),
                     author: "reviewer".to_owned(),
                     body: concat!(
                         "<!-- review metadata -->\n",
@@ -369,6 +375,7 @@ mod tests {
                     database_id: Some(92),
                     thread_id: None,
                     kind: FeedbackKind::ReviewSummary,
+                    line: None,
                     author: "lead".to_owned(),
                     body: "Please add coverage".to_owned(),
                     path: None,
@@ -389,7 +396,7 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "In feature (#42 Fix feedback):\n\nThere is an existing worktree at '/worktrees/feature'\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nReview comments:\n  - Comment 91 by reviewer on `src/lib.rs`\n    URL: https://git.example.com/comment/91\n    Body:\n~~~\nSummary\nsplit this line\nfollow up\n~~~\n\nReview summaries:\n  - Review 92 by lead\n    Body:\n~~~\nPlease add coverage\n~~~\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nPlease investigate the above and identify the salient points in the review comments. Use your judgment to distinguish issues worth addressing from comments that can reasonably be dismissed, and explain your recommendations. Check with me and wait for approval before making changes, replying, or resolving comments. Once approved, carry out the agreed changes and resolve all reviewed comment threads appropriately, explaining any dismissals."
+            "In feature (#42 Fix feedback):\n\nThere is an existing worktree at '/worktrees/feature'\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nReview comments:\n  - Comment 91 by reviewer on `src/lib.rs:42`\n    URL: https://git.example.com/comment/91\n    Body:\n~~~\nSummary\nsplit this line\nfollow up\n~~~\n\nReview summaries:\n  - Review 92 by lead\n    Body:\n~~~\nPlease add coverage\n~~~\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nPlease investigate the above and identify the salient points in the review comments. Use your judgment to distinguish issues worth addressing from comments that can reasonably be dismissed, and explain your recommendations. Check with me and wait for approval before making changes, replying, or resolving comments. Once approved, carry out the agreed changes and resolve all reviewed comment threads appropriately, explaining any dismissals."
         );
         assert!(!actual.contains("gh api"));
         assert!(!actual.contains("not merge-required"));
@@ -402,6 +409,28 @@ mod tests {
         pull_request.feedback.clear();
         assert_eq!(format_agent_prompt(&[pull_request]), None);
         assert_eq!(format_agent_prompt(&[]), None);
+    }
+
+    #[test]
+    fn comment_locations_allow_missing_lines_and_preserve_outdated_markers() {
+        for (path, line, outdated, expected) in [
+            (Some("src/lib.rs"), None, false, " on `src/lib.rs`"),
+            (
+                Some("src/lib.rs"),
+                Some(42),
+                true,
+                " on `src/lib.rs:42` (outdated)",
+            ),
+            (None, None, false, ""),
+        ] {
+            let mut pull_request = pull_request();
+            let comment = &mut pull_request.feedback[0];
+            comment.path = path.map(str::to_owned);
+            comment.line = line;
+            comment.outdated = outdated;
+            let prompt = format_agent_prompt(&[pull_request]).unwrap();
+            assert!(prompt.contains(&format!("  - Comment 91 by reviewer{expected}\n")));
+        }
     }
 
     #[test]
@@ -444,6 +473,7 @@ mod tests {
                 database_id: None,
                 thread_id: None,
                 kind: FeedbackKind::InlineThread,
+                line: None,
                 author: "reviewer".to_owned(),
                 body: format!("\n  {} trailing", "x".repeat(101)),
                 path: None,
@@ -455,6 +485,7 @@ mod tests {
                 database_id: None,
                 thread_id: None,
                 kind: FeedbackKind::ReviewSummary,
+                line: None,
                 author: "lead".to_owned(),
                 body: "  review\n summary  ".to_owned(),
                 path: None,
