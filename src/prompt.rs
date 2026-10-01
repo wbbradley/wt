@@ -128,18 +128,19 @@ fn format_feedback(
 
 fn format_worktree_guidance(output: &mut String, pull_request: &PromptPullRequest) {
     let Some(worktree) = &pull_request.worktree else {
-        output.push_str("No existing worktree is mapped to this pull request.\n");
+        // No existing worktree is mapped to this pull request.
         return;
     };
 
-    let branch = worktree
+    output.push_str("There is an existing worktree at ");
+    output.push_str(&shell_quote(&worktree.path.to_string_lossy()));
+    output.push('\n');
+
+    if let Some(branch) = worktree
         .branch
         .as_deref()
-        .and_then(|branch| branch.strip_prefix("refs/heads/").or(Some(branch)));
-    output.push_str("Use this existing checkout:\n```bash\ncd -- ");
-    output.push_str(&shell_quote(&worktree.path.to_string_lossy()));
-    output.push_str("\n```\n");
-    if let Some(branch) = branch {
+        .and_then(|branch| branch.strip_prefix("refs/heads/").or(Some(branch)))
+    {
         output.push_str("Branch `");
         output.push_str(branch);
         output.push_str("` is checked out there. ");
@@ -388,7 +389,7 @@ mod tests {
         let actual = format_agent_prompt(&[pull_request()]).unwrap();
         assert_eq!(
             actual,
-            "In feature (#42 Fix feedback):\n\nUse this existing checkout:\n```bash\ncd -- '/worktrees/feature'\n```\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nReview comments:\n  - Comment 91 by reviewer on `src/lib.rs`\n    URL: https://git.example.com/comment/91\n    Body:\n~~~\nSummary\nsplit this line\nfollow up\n~~~\n\nReview summaries:\n  - Review 92 by lead\n    Body:\n~~~\nPlease add coverage\n~~~\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nPlease investigate the above and identify the salient points in the review comments. Use your judgment to distinguish issues worth addressing from comments that can reasonably be dismissed, and explain your recommendations. Check with me and wait for approval before making changes, replying, or resolving comments. Once approved, carry out the agreed changes and resolve all reviewed comment threads appropriately, explaining any dismissals."
+            "In feature (#42 Fix feedback):\n\nThere is an existing worktree at '/worktrees/feature'\nBranch `feature` is checked out there. Local HEAD `98c549d2` matches the PR head.\n\nReview comments:\n  - Comment 91 by reviewer on `src/lib.rs`\n    URL: https://git.example.com/comment/91\n    Body:\n~~~\nSummary\nsplit this line\nfollow up\n~~~\n\nReview summaries:\n  - Review 92 by lead\n    Body:\n~~~\nPlease add coverage\n~~~\n\nChecks (all failed):\n  - build (https://checks/build)\n  - lint (https://git.example.com/base/project/pull/42)\n\nPlease investigate the above and identify the salient points in the review comments. Use your judgment to distinguish issues worth addressing from comments that can reasonably be dismissed, and explain your recommendations. Check with me and wait for approval before making changes, replying, or resolving comments. Once approved, carry out the agreed changes and resolve all reviewed comment threads appropriately, explaining any dismissals."
         );
         assert!(!actual.contains("gh api"));
         assert!(!actual.contains("not merge-required"));
@@ -404,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_stale_and_missing_worktree_state_without_guessing() {
+    fn reports_stale_head_and_omits_missing_worktree_guidance() {
         let mut stale = pull_request();
         stale.worktree.as_mut().unwrap().head =
             Some("0123456789abcdef0123456789abcdef01234567".to_owned());
@@ -416,18 +417,21 @@ mod tests {
 
         let mut missing = pull_request();
         missing.worktree = None;
+        let mut guidance = String::new();
+        format_worktree_guidance(&mut guidance, &missing);
+        assert_eq!(guidance, "");
+
         let missing_prompt = format_agent_prompt(&[missing]).unwrap();
-        assert!(missing_prompt.contains("No existing worktree is mapped to this pull request."));
-        assert!(!missing_prompt.contains("Use a worktree if"));
+        assert!(missing_prompt.starts_with("In feature (#42 Fix feedback):\n\n\nReview comments:"));
     }
 
     #[test]
-    fn checkout_command_shell_quotes_the_worktree_path() {
+    fn worktree_guidance_shell_quotes_the_worktree_path() {
         let mut pull_request = pull_request();
         pull_request.worktree.as_mut().unwrap().path = PathBuf::from("/work trees/reviewer's");
 
         let prompt = format_agent_prompt(&[pull_request]).unwrap();
-        assert!(prompt.contains("cd -- '/work trees/reviewer'\\''s'"));
+        assert!(prompt.contains("There is an existing worktree at '/work trees/reviewer'\\''s'"));
     }
 
     #[test]
