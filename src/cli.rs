@@ -1036,7 +1036,7 @@ fn remove_merged_worktrees(
         ]
     };
     let current = env::current_dir().map_err(CliError::CurrentDirectory)?;
-    let lookup = LivePullRequestLookup::new();
+    let lookup = LivePullRequestLookup::new(crate::cache::path(&config::catalog_path()?));
     let plan = merged_cleanup::plan(runner, &lookup, &repositories, &current);
     let eligible = plan.iter().filter(|record| record.eligible()).count();
     for record in &plan {

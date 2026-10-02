@@ -23,12 +23,14 @@ pub trait PullRequestLookup {
 
 pub struct LivePullRequestLookup {
     service: GitHubService,
+    cache_path: PathBuf,
 }
 
 impl LivePullRequestLookup {
-    pub fn new() -> Self {
+    pub fn new(cache_path: PathBuf) -> Self {
         Self {
             service: GitHubService::new(),
+            cache_path,
         }
     }
 }
@@ -39,6 +41,8 @@ impl PullRequestLookup for LivePullRequestLookup {
         repository: &RepositoryConfig,
         worktree: &Worktree,
     ) -> Result<Vec<AssociatedPullRequest>, String> {
+        let _lock = crate::refresh::acquire_lock(&self.cache_path, || false)
+            .map_err(|error| error.to_string())?;
         self.service
             .fetch_associated_pull_requests_with(
                 &SystemGit,
@@ -54,6 +58,8 @@ impl PullRequestLookup for LivePullRequestLookup {
         repository: &RepositoryConfig,
         identity: &CanonicalPullRequestId,
     ) -> Result<AssociatedPullRequest, String> {
+        let _lock = crate::refresh::acquire_lock(&self.cache_path, || false)
+            .map_err(|error| error.to_string())?;
         let host = AuthoredHost::inferred(&identity.repository.host, repository.path.clone());
         self.service
             .fetch_pull_request_with(&SystemCredentials, &host, identity)

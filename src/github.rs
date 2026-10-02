@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::git::{GitRunner, SystemGit};
+use crate::git::GitRunner;
 use crate::model::{
     AuthoredPullRequest, CanonicalPullRequestId, Catalog, CheckRollup, CheckState, FeedbackKind,
     GitHubBranchData, GitHubRepositoryIdentity, MergeConflictState, PullRequest, PullRequestCheck,
@@ -365,7 +365,7 @@ impl CredentialProvider for SystemCredentials {
     }
 }
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum GitHubError {
     #[error("remote is not a supported GitHub SSH/HTTPS remote")]
     UnsupportedRemote,
@@ -416,7 +416,7 @@ impl RepositoryGitHubInput {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct GitHubRefresh {
     pub branches: HashMap<PathBuf, Result<GitHubBranchData, GitHubError>>,
     pub active_pull_requests: HashSet<CanonicalPullRequestId>,
@@ -465,6 +465,32 @@ struct FetchGroupKey {
 }
 
 impl GitHubService {
+    pub(crate) fn rate_limits(&self) -> Vec<(String, u64, String)> {
+        self.suppressed_until
+            .lock()
+            .expect("rate gate poisoned")
+            .iter()
+            .map(|(host, suppression)| {
+                (
+                    host.clone(),
+                    suppression.epoch_seconds,
+                    suppression.reset_at.clone(),
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn import_rate_limit(&self, host: &str, until: u64, reset_at: &str) {
+        self.suppress(host, reset_at, Some(until));
+    }
+
+    pub(crate) fn clear_rate_limits(&self) {
+        self.suppressed_until
+            .lock()
+            .expect("rate gate poisoned")
+            .clear();
+    }
+
     pub fn new() -> Self {
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -476,10 +502,6 @@ impl GitHubService {
             agent,
             suppressed_until: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    pub fn fetch_catalog(&self, inputs: &[RepositoryGitHubInput]) -> GitHubRefresh {
-        self.fetch_catalog_with(&SystemGit, &SystemCredentials, inputs)
     }
 
     pub fn fetch_catalog_with(
@@ -1789,7 +1811,7 @@ pub fn resolve_token(
     })
 }
 
-fn resolve_branch_remote(
+pub(crate) fn resolve_branch_remote(
     runner: &dyn GitRunner,
     repository: &RepositoryConfig,
     branch: &str,

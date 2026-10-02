@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(test))]
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -68,6 +68,10 @@ pub struct RemoteCache {
     pub active_pull_requests: Vec<CanonicalPullRequestId>,
     #[serde(default)]
     pub pull_request_details: Vec<CachedPullRequestDetails>,
+    #[serde(default)]
+    pub refreshes: Vec<crate::refresh::CachedRefresh>,
+    #[serde(default)]
+    pub rate_limits: Vec<crate::refresh::CachedRateLimit>,
 }
 
 impl Default for RemoteCache {
@@ -79,6 +83,8 @@ impl Default for RemoteCache {
             authored_pull_requests: Vec::new(),
             active_pull_requests: Vec::new(),
             pull_request_details: Vec::new(),
+            refreshes: Vec::new(),
+            rate_limits: Vec::new(),
         }
     }
 }
@@ -121,7 +127,17 @@ impl RemoteCache {
                     })
             })
             .collect();
+        let observed_worktrees: BTreeSet<_> = inputs
+            .iter()
+            .flat_map(|input| input.worktrees.iter().map(|tree| &tree.path))
+            .collect();
         self.branches.retain(|cached| {
+            // A worktree absent from this request may belong to another pane's
+            // catalog, or have been created while this request was in flight.
+            if cached.repository_binding.is_some() && !observed_worktrees.contains(&cached.worktree)
+            {
+                return true;
+            }
             current_branches
                 .get(&cached.worktree)
                 .is_some_and(|(branch, binding)| {
@@ -291,6 +307,8 @@ pub enum CacheError {
     Encode(#[from] serde_json::Error),
     #[error("cannot lock remote cache {path}: {source}")]
     Lock { path: PathBuf, source: io::Error },
+    #[error("remote refresh lock acquisition was cancelled")]
+    LockCancelled,
 }
 
 pub fn path(catalog_path: &Path) -> PathBuf {
@@ -313,6 +331,60 @@ pub fn path(catalog_path: &Path) -> PathBuf {
 
 pub fn load(path: &Path) -> Result<RemoteCache, CacheError> {
     load_existing(path).map(Option::unwrap_or_default)
+}
+
+/// Identifies the published file, independently of remote-data freshness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheRevision {
+    modified: SystemTime,
+    length: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+pub fn load_changed(
+    path: &Path,
+    previous: Option<&CacheRevision>,
+) -> Result<Option<(CacheRevision, RemoteCache)>, CacheError> {
+    let read_error = |source| CacheError::Read {
+        path: path.to_owned(),
+        source,
+    };
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(read_error(error)),
+    };
+    let metadata = file.metadata().map_err(read_error)?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    let revision = CacheRevision {
+        modified: metadata.modified().map_err(read_error)?,
+        length: metadata.len(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    };
+    if previous == Some(&revision) {
+        return Ok(None);
+    }
+    // Read the same opened file we inspected, even if another process replaces
+    // the pathname meanwhile. Atomic publication keeps this snapshot complete.
+    let cache: RemoteCache =
+        serde_json::from_reader(BufReader::new(file)).map_err(|source| CacheError::Parse {
+            path: path.to_owned(),
+            source,
+        })?;
+    if cache.version > CACHE_VERSION {
+        return Err(CacheError::FutureVersion {
+            found: cache.version,
+            supported: CACHE_VERSION,
+        });
+    }
+    Ok(Some((revision, cache)))
 }
 
 pub fn update(path: &Path, mutate: impl FnOnce(&mut RemoteCache)) -> Result<(), CacheError> {
@@ -499,6 +571,43 @@ mod tests {
             }],
             trunk_branch: None,
         }
+    }
+
+    #[test]
+    fn branch_refresh_preserves_unobserved_and_concurrently_created_worktrees() {
+        let observed = input(Path::new("/repo"), "topic");
+        let other = input(Path::new("/other"), "other");
+        let mut cache = RemoteCache::default();
+        cache.record_created_worktree(&observed.repository, Path::new("/repo/new"), "new");
+        cache.record_created_worktree(&other.repository, Path::new("/other"), "other");
+        cache.merge_branch_refresh(&[observed], &GitHubRefresh::default());
+        assert_eq!(cache.branches.len(), 2);
+    }
+
+    #[test]
+    fn changed_cache_tracks_publication_and_rejects_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("github.json");
+        assert!(load_changed(&path, None).unwrap().is_none());
+        update(&path, |cache| cache.replace_authored(vec![authored(1)])).unwrap();
+        let (revision, first) = load_changed(&path, None).unwrap().unwrap();
+        assert_eq!(first.authored_pull_requests[0].identity.number, 1);
+        assert!(load_changed(&path, Some(&revision)).unwrap().is_none());
+
+        update(&path, |cache| cache.replace_authored(vec![authored(2)])).unwrap();
+        let (next_revision, second) = load_changed(&path, Some(&revision)).unwrap().unwrap();
+        assert_ne!(revision, next_revision);
+        assert_eq!(second.authored_pull_requests[0].identity.number, 2);
+        fs::write(&path, "invalid JSON").unwrap();
+        assert!(matches!(
+            load_changed(&path, Some(&next_revision)),
+            Err(CacheError::Parse { .. })
+        ));
+        fs::write(&path, r#"{"version":999}"#).unwrap();
+        assert!(matches!(
+            load_changed(&path, None),
+            Err(CacheError::FutureVersion { .. })
+        ));
     }
 
     #[test]

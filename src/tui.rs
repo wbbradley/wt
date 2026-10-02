@@ -4,8 +4,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event, KeyEventKind};
 use thiserror::Error;
@@ -33,13 +34,14 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
 /// A materialization phase only reports its age once it looks slow.
 const MATERIALIZATION_ELAPSED_THRESHOLD: Duration = Duration::from_secs(3);
-const LOCAL_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const LOCAL_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 const MIN_GITHUB_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LocalGitHubBinding {
     worktree_path: PathBuf,
     branch: String,
+    head: Option<String>,
     repository: cache::CachedRepositoryBinding,
 }
 
@@ -48,9 +50,16 @@ struct LocalSnapshot {
     catalog: Catalog,
     repositories: Vec<RepositoryView>,
     github_bindings: HashMap<PathBuf, LocalGitHubBinding>,
+    remote_cache: Option<(u64, cache::CacheRevision, cache::RemoteCache)>,
 }
 
 enum GitHubMessage {
+    Baseline {
+        generation: u64,
+        cache: cache::RemoteCache,
+        cache_updates: Vec<RepositoryConfig>,
+        bindings: HashMap<PathBuf, LocalGitHubBinding>,
+    },
     Branches {
         generation: u64,
         paths: Vec<PathBuf>,
@@ -421,6 +430,8 @@ struct ClipboardCopy {
 struct Controller {
     catalog_path: PathBuf,
     remote_cache_path: PathBuf,
+    remote_cache_revision: Option<cache::CacheRevision>,
+    github_last_shared_success: Option<(String, u64)>,
     catalog: Catalog,
     app: App,
     status_pool: StatusPool,
@@ -430,6 +441,7 @@ struct Controller {
     github_receiver: Receiver<GitHubMessage>,
     github_in_flight: bool,
     github_refresh_queued: bool,
+    github_cancelled: Arc<AtomicBool>,
     github_refresh_interval: Duration,
     next_github_refresh: Instant,
     github_bindings: HashMap<PathBuf, LocalGitHubBinding>,
@@ -456,6 +468,12 @@ struct Controller {
     state_path: PathBuf,
 }
 
+impl Drop for Controller {
+    fn drop(&mut self) {
+        self.github_cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Controller {
     fn new(catalog_path: PathBuf, catalog: Catalog, mut app: App) -> Self {
         let workers = std::thread::available_parallelism()
@@ -474,6 +492,8 @@ impl Controller {
         let mut controller = Self {
             catalog_path,
             remote_cache_path,
+            remote_cache_revision: None,
+            github_last_shared_success: None,
             catalog,
             app,
             status_pool: StatusPool::with_git(workers),
@@ -483,6 +503,7 @@ impl Controller {
             github_receiver,
             github_in_flight: false,
             github_refresh_queued: false,
+            github_cancelled: Arc::new(AtomicBool::new(false)),
             github_refresh_interval,
             next_github_refresh: Instant::now(),
             github_bindings: HashMap::new(),
@@ -539,15 +560,28 @@ impl Controller {
     }
 
     fn load_remote_cache(&mut self) {
-        let remote_cache = match cache::load(&self.remote_cache_path) {
-            Ok(cache) => cache,
+        let (revision, remote_cache) = match cache::load_changed(&self.remote_cache_path, None) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return,
             Err(error) => {
                 self.app.inline_error = Some(format!("remote cache ignored: {error}"));
                 return;
             }
         };
-        let inputs = self.github_inputs();
-        let current_bindings = github_bindings(&inputs);
+        if !remote_cache.refreshes.is_empty() {
+            // Scope resolution can consult Git/gh credentials. Defer it to the
+            // background refresh rather than blocking startup or mixing viewers.
+            return;
+        }
+        self.remote_cache_revision = Some(revision);
+        self.apply_remote_cache(remote_cache, &self.current_github_bindings());
+    }
+
+    fn apply_remote_cache(
+        &mut self,
+        remote_cache: cache::RemoteCache,
+        current_bindings: &HashMap<PathBuf, LocalGitHubBinding>,
+    ) {
         self.app.github_hosts = crate::github::inferred_github_hosts(&self.catalog);
         self.app.pull_request_details = remote_cache
             .pull_request_details
@@ -583,6 +617,66 @@ impl Controller {
                 })
                 .collect(),
         );
+        if let Some(shared) = remote_cache.refreshes.first() {
+            if let Some(completed_at) = shared.successful_at {
+                let now_epoch = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if completed_at <= now_epoch
+                    && self
+                        .github_last_shared_success
+                        .as_ref()
+                        .is_none_or(|(scope, epoch)| {
+                            scope != shared.scope_id() || completed_at > *epoch
+                        })
+                {
+                    let age = Duration::from_secs(now_epoch - completed_at);
+                    let now = Instant::now();
+                    self.app.last_refresh = now.checked_sub(age);
+                    self.next_github_refresh =
+                        now + self.github_refresh_interval.saturating_sub(age);
+                    self.github_last_shared_success =
+                        Some((shared.scope_id().to_owned(), completed_at));
+                }
+            }
+            // Failed attempts retain their last good snapshot, but must still
+            // render as stale when another pane ingests the publication.
+            for (path, result) in &shared.outcome.branches.branches {
+                if let Err(error) = result
+                    && let Some(binding) = current_bindings.get(path)
+                {
+                    let previous = self
+                        .app
+                        .github
+                        .get(path)
+                        .and_then(crate::app::GitHubState::data)
+                        .cloned();
+                    self.app.github.insert(
+                        path.clone(),
+                        crate::app::GitHubState::Stale {
+                            previous,
+                            error: error.to_string(),
+                        },
+                    );
+                    self.github_bindings.insert(path.clone(), binding.clone());
+                }
+            }
+            for (identity, result) in &shared.outcome.details {
+                match result {
+                    Ok(_) => {
+                        self.app.pull_request_detail_errors.remove(identity);
+                    }
+                    Err(error) => {
+                        self.app
+                            .pull_request_detail_errors
+                            .insert(identity.clone(), error.to_string());
+                    }
+                }
+            }
+            self.app.authored_pull_requests.stale_error = shared.outcome.error.clone();
+            self.app.authored_pull_requests.warnings = shared.outcome.warnings.clone();
+        }
         self.refresh_authored_mappings();
     }
 
@@ -1373,6 +1467,7 @@ impl Controller {
     }
 
     fn apply_local_snapshot(&mut self, snapshot: LocalSnapshot) {
+        let remote_cache = snapshot.remote_cache;
         self.replace_catalog(snapshot.catalog);
         self.github_refresh_interval = github_refresh_interval(&self.catalog);
         self.app.replace_repositories(snapshot.repositories);
@@ -1393,6 +1488,14 @@ impl Controller {
             .github
             .retain(|path, _| self.github_bindings.contains_key(path));
         self.refresh_authored_mappings();
+        if let Some((generation, revision, cache)) = remote_cache
+            && !self.github_in_flight
+            && generation == self.app.github_generation
+            && self.materialization_job.is_none()
+        {
+            self.apply_remote_cache(cache, &current_bindings);
+            self.remote_cache_revision = Some(revision);
+        }
     }
 
     fn request_local_refresh(&mut self, refresh_github: bool) -> Result<(), TuiError> {
@@ -1411,9 +1514,38 @@ impl Controller {
             self.app.progress = Some("refreshing local state".to_owned());
         }
         self.next_local_refresh = Instant::now() + LOCAL_REFRESH_INTERVAL;
+        let remote_cache_path = self.remote_cache_path.clone();
+        let remote_cache_revision = self.remote_cache_revision.clone();
+        let generation = self.app.github_generation;
+        let discover = self.discover_authored_pull_requests;
         self.local_refresh_job = Some(BackgroundJob::spawn("wt-local-refresh", move |_context| {
-            collect_local_snapshot(&catalog_path, &current_directory)
-                .map_err(|error| error.to_string())
+            let mut snapshot = collect_local_snapshot(&catalog_path, &current_directory)
+                .map_err(|error| error.to_string())?;
+            match cache::load_changed(&remote_cache_path, remote_cache_revision.as_ref()) {
+                Ok(Some((revision, cache))) => {
+                    if cache.refreshes.is_empty() {
+                        snapshot.remote_cache = Some((generation, revision, cache));
+                    } else {
+                        let inputs = github_inputs_for_repositories(&snapshot.repositories);
+                        let hosts = crate::refresh::hosts(&snapshot.catalog, &catalog_path);
+                        let credentials = crate::refresh::Credentials::new(&SystemCredentials);
+                        let scope = crate::refresh::scope(
+                            &SystemGit,
+                            &credentials,
+                            &inputs,
+                            &hosts,
+                            discover,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        if let Some(cache) = crate::refresh::select(&cache, &scope) {
+                            snapshot.remote_cache = Some((generation, revision, cache));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(%error, "shared remote cache ignored"),
+            }
+            Ok(snapshot)
         })?);
         Ok(())
     }
@@ -1487,6 +1619,7 @@ impl Controller {
         let remote_cache_path = self.remote_cache_path.clone();
         let fallback_catalog = self.catalog.clone();
         let discover_authored_pull_requests = self.discover_authored_pull_requests;
+        let cancelled = self.github_cancelled.clone();
         std::thread::spawn(move || {
             let mut inputs = inputs;
             let refreshable_paths = inputs
@@ -1495,7 +1628,12 @@ impl Controller {
                 .collect();
             let mut cache_updates = Vec::new();
             let mut warnings = Vec::new();
-            let catalog = match config::acquire_catalog_lock(&catalog_path).and_then(|_lock| {
+            let catalog = match config::acquire_catalog_lock_with(
+                &catalog_path,
+                || cancelled.load(Ordering::Relaxed),
+                || {},
+            )
+            .and_then(|_lock| {
                 let mut catalog = config::load(&catalog_path)?;
                 let refresh = crate::github::refresh_catalog_remote_identities(
                     &SystemGit,
@@ -1547,116 +1685,75 @@ impl Controller {
                 }
             };
             let bindings = github_bindings(&inputs);
-            let refresh = service.fetch_catalog(&inputs);
-            let mut identities = refresh.active_pull_requests.clone();
-            if let Err(error) = cache::update(&remote_cache_path, |cache| {
-                cache.merge_branch_refresh(&inputs, &refresh);
-            }) {
-                warnings.push(format!("unable to persist remote cache: {error}"));
-            }
-            let _ = sender.send(GitHubMessage::Branches {
-                generation,
-                paths,
-                bindings,
-                refresh,
-                cache_updates,
-                warnings,
-            });
-            let fallback_anchor = catalog_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_owned();
-            let hosts: Vec<AuthoredHost> = crate::github::inferred_github_hosts(&catalog)
-                .into_iter()
-                .map(|host| {
-                    let anchor = catalog
-                        .repositories
-                        .iter()
-                        .find(|repository| {
-                            repository
-                                .github_remotes
-                                .values()
-                                .any(|identity| identity.host == host)
-                        })
-                        .map(|repository| repository.path.clone())
-                        .unwrap_or_else(|| fallback_anchor.clone());
-                    AuthoredHost::inferred(&host, anchor)
-                })
-                .collect();
-            if discover_authored_pull_requests {
-                let mut refreshed_pull_requests = Vec::new();
-                let mut finished = None;
-                service.fetch_authored_with(&SystemCredentials, &hosts, |event| match event {
-                    AuthoredRefreshEvent::Page {
-                        host,
-                        page,
-                        pull_requests,
-                        warnings,
-                    } => {
-                        identities.extend(
-                            pull_requests
-                                .iter()
-                                .map(|pull_request| pull_request.identity.clone()),
-                        );
-                        refreshed_pull_requests.extend(pull_requests.clone());
-                        let _ = sender.send(GitHubMessage::Authored {
+            let hosts = crate::refresh::hosts(&catalog, &catalog_path);
+            let result = crate::refresh::run(
+                &remote_cache_path,
+                &service,
+                &SystemGit,
+                &SystemCredentials,
+                &inputs,
+                &hosts,
+                discover_authored_pull_requests,
+                || cancelled.load(Ordering::Relaxed),
+                |event| {
+                    let message = match event {
+                        crate::refresh::Event::Baseline(cache) => GitHubMessage::Baseline {
+                            generation,
+                            cache,
+                            cache_updates: cache_updates.clone(),
+                            bindings: bindings.clone(),
+                        },
+                        crate::refresh::Event::Branches(refresh) => GitHubMessage::Branches {
+                            generation,
+                            paths: paths.clone(),
+                            bindings: bindings.clone(),
+                            refresh,
+                            cache_updates: std::mem::take(&mut cache_updates),
+                            warnings: std::mem::take(&mut warnings),
+                        },
+                        crate::refresh::Event::Authored(event) => GitHubMessage::Authored {
                             generation: authored_generation,
-                            event: AuthoredRefreshEvent::Page {
-                                host,
-                                page,
-                                pull_requests,
-                                warnings,
-                            },
-                        });
-                    }
-                    event @ AuthoredRefreshEvent::Finished { .. } => finished = Some(event),
-                });
-                let mut finished = finished.unwrap_or(AuthoredRefreshEvent::Finished {
-                    complete: false,
-                    warnings: Vec::new(),
-                    error: Some("authored pull request refresh did not finish".to_owned()),
-                });
-                if matches!(
-                    finished,
-                    AuthoredRefreshEvent::Finished { complete: true, .. }
-                ) && let Err(error) = cache::update(&remote_cache_path, |cache| {
-                    cache.replace_authored(refreshed_pull_requests);
-                }) && let AuthoredRefreshEvent::Finished { warnings, .. } = &mut finished
-                {
-                    warnings.push(format!("unable to persist remote cache: {error}"));
-                }
-                let details =
-                    service.hydrate_pull_requests_with(&SystemCredentials, &hosts, identities);
-                if let Err(error) = cache::update(&remote_cache_path, |cache| {
-                    cache.merge_pull_request_details(&details);
-                }) && let AuthoredRefreshEvent::Finished { warnings, .. } = &mut finished
-                {
-                    warnings.push(format!("unable to persist pull request details: {error}"));
-                }
-                let _ = sender.send(GitHubMessage::Details {
+                            event,
+                        },
+                        crate::refresh::Event::Details(results) => GitHubMessage::Details {
+                            generation,
+                            results,
+                        },
+                    };
+                    let _ = sender.send(message);
+                },
+            );
+            if let Err(error) = result {
+                let refresh = GitHubRefresh {
+                    branches: paths
+                        .iter()
+                        .map(|path| {
+                            (
+                                path.clone(),
+                                Err(crate::github::GitHubError::LocalGit(error.to_string())),
+                            )
+                        })
+                        .collect(),
+                    ..GitHubRefresh::default()
+                };
+                let _ = sender.send(GitHubMessage::Branches {
                     generation,
-                    results: details,
-                });
-                let _ = sender.send(GitHubMessage::Authored {
-                    generation: authored_generation,
-                    event: finished,
-                });
-            } else {
-                let details =
-                    service.hydrate_pull_requests_with(&SystemCredentials, &hosts, identities);
-                let _ = cache::update(&remote_cache_path, |cache| {
-                    cache.merge_pull_request_details(&details);
+                    paths,
+                    bindings,
+                    refresh,
+                    cache_updates,
+                    warnings,
                 });
                 let _ = sender.send(GitHubMessage::Details {
                     generation,
-                    results: details,
+                    results: Default::default(),
                 });
                 let _ = sender.send(GitHubMessage::Authored {
                     generation: authored_generation,
                     event: AuthoredRefreshEvent::Finished {
-                        complete: true,
+                        complete: false,
                         warnings: Vec::new(),
-                        error: None,
+                        error: Some(error.to_string()),
                     },
                 });
             }
@@ -1691,6 +1788,29 @@ impl Controller {
         true
     }
 
+    fn apply_repository_cache_updates(&mut self, cache_updates: Vec<RepositoryConfig>) {
+        for update in cache_updates {
+            if let Some(repository) = self
+                .catalog
+                .repositories
+                .iter_mut()
+                .find(|repository| repository.path == update.path)
+            {
+                repository.github_remotes = update.github_remotes.clone();
+                repository.github_preferred_remote = update.github_preferred_remote.clone();
+            }
+            if let Some(repository) = self
+                .app
+                .repositories
+                .iter_mut()
+                .find(|repository| repository.config.path == update.path)
+            {
+                repository.config.github_remotes = update.github_remotes;
+                repository.config.github_preferred_remote = update.github_preferred_remote;
+            }
+        }
+    }
+
     fn pump_background_results(&mut self) -> bool {
         let mut changed = self.pump_clipboard();
         changed |= self.pump_local_refresh();
@@ -1710,6 +1830,30 @@ impl Controller {
         }
         while let Ok(message) = self.github_receiver.try_recv() {
             match message {
+                GitHubMessage::Baseline {
+                    generation,
+                    cache,
+                    cache_updates,
+                    bindings,
+                } => {
+                    if generation == self.app.github_generation {
+                        self.apply_repository_cache_updates(cache_updates);
+                        let mut cache = cache;
+                        let current_bindings = self.current_github_bindings();
+                        cache.branches.retain(|cached| {
+                            bindings.get(&cached.worktree).is_some_and(|binding| {
+                                current_bindings.get(&cached.worktree) == Some(binding)
+                            })
+                        });
+                        let authored = cache.authored_pull_requests.clone();
+                        self.app.github.clear();
+                        self.github_bindings.clear();
+                        self.apply_remote_cache(cache, &current_bindings);
+                        self.app.authored_pull_requests.hydrate_baseline(authored);
+                        self.refresh_authored_mappings();
+                        changed = true;
+                    }
+                }
                 GitHubMessage::Branches {
                     generation,
                     paths,
@@ -1718,28 +1862,7 @@ impl Controller {
                     cache_updates,
                     warnings,
                 } => {
-                    for update in cache_updates {
-                        if let Some(repository) = self
-                            .catalog
-                            .repositories
-                            .iter_mut()
-                            .find(|repository| repository.path == update.path)
-                        {
-                            repository.github_remotes = update.github_remotes.clone();
-                            repository.github_preferred_remote =
-                                update.github_preferred_remote.clone();
-                        }
-                        if let Some(repository) = self
-                            .app
-                            .repositories
-                            .iter_mut()
-                            .find(|repository| repository.config.path == update.path)
-                        {
-                            repository.config.github_remotes = update.github_remotes;
-                            repository.config.github_preferred_remote =
-                                update.github_preferred_remote;
-                        }
-                    }
+                    self.apply_repository_cache_updates(cache_updates);
                     if !warnings.is_empty() {
                         self.app.inline_error =
                             Some(format!("GitHub remote warning: {}", warnings.join("; ")));
@@ -2247,9 +2370,16 @@ impl Controller {
         let job = BackgroundJob::spawn("wt-pr-materialization", move |context| {
             context.progress("refreshing selected pull request");
             let host = AuthoredHost::inferred(&identity.repository.host, credential_anchor.clone());
-            let refreshed = service
-                .fetch_pull_request_with(&SystemCredentials, &host, &identity)
-                .map_err(|error| error.to_string())?;
+            let refreshed = {
+                context.progress("waiting for another wt refresh");
+                let _refresh_lock =
+                    crate::refresh::acquire_lock(&remote_cache_path, || context.is_cancelled())
+                        .map_err(|error| error.to_string())?;
+                context.progress("refreshing selected pull request");
+                service
+                    .fetch_pull_request_with(&SystemCredentials, &host, &identity)
+                    .map_err(|error| error.to_string())?
+            };
             if context.is_cancelled() {
                 return Err("materialization cancelled".to_owned());
             }
@@ -2336,6 +2466,7 @@ fn collect_local_snapshot(
         catalog,
         repositories,
         github_bindings,
+        remote_cache: None,
     })
 }
 
@@ -2354,6 +2485,7 @@ fn github_bindings(inputs: &[RepositoryGitHubInput]) -> HashMap<PathBuf, LocalGi
                         LocalGitHubBinding {
                             worktree_path: worktree.path.clone(),
                             branch,
+                            head: worktree.head.clone(),
                             repository: cache::CachedRepositoryBinding::from(&input.repository),
                         },
                     ))
@@ -3661,13 +3793,45 @@ mod tests {
 
     #[test]
     fn periodic_local_refresh_runs_without_scheduling_github() {
+        assert_eq!(LOCAL_REFRESH_INTERVAL, Duration::from_secs(15));
         let directory = tempfile::tempdir().unwrap();
         let mut controller = Controller::new(
             directory.path().join("wt.json"),
             Catalog::default(),
             App::new(Vec::new(), directory.path().to_owned()),
         );
+        let identity = crate::model::CanonicalPullRequestId {
+            repository: crate::model::GitHubRepositoryIdentity::canonical(
+                "github.com",
+                "team",
+                "project",
+            ),
+            number: 1,
+        };
+        let initial_details = crate::model::PullRequestDetails::default();
+        cache::update(&controller.remote_cache_path, |cache| {
+            cache.merge_pull_request_details(&std::collections::BTreeMap::from([(
+                identity.clone(),
+                Ok(initial_details.clone()),
+            )]));
+        })
+        .unwrap();
+        controller.load_remote_cache();
+        let initial_revision = controller.remote_cache_revision.clone();
+        let updated_details = crate::model::PullRequestDetails {
+            feedback_complete: true,
+            ..initial_details
+        };
+        // Simulate another pane publishing data between local refreshes.
+        cache::update(&controller.remote_cache_path, |cache| {
+            cache.merge_pull_request_details(&std::collections::BTreeMap::from([(
+                identity.clone(),
+                Ok(updated_details.clone()),
+            )]));
+        })
+        .unwrap();
         controller.next_github_refresh = Instant::now() + Duration::from_secs(300);
+        let next_github_refresh = controller.next_github_refresh;
         controller.next_local_refresh = Instant::now();
 
         assert!(!controller.pump_background_results());
@@ -3684,6 +3848,106 @@ mod tests {
         assert!(controller.local_refresh_job.is_none());
         assert!(!controller.github_in_flight);
         assert!(controller.next_local_refresh > Instant::now());
+        assert_eq!(controller.next_github_refresh, next_github_refresh);
+        assert_eq!(
+            controller.app.pull_request_details[&identity],
+            updated_details
+        );
+        assert_ne!(controller.remote_cache_revision, initial_revision);
+    }
+
+    #[test]
+    fn local_refresh_adopts_matching_shared_scope_and_uses_its_refresh_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog_path = directory.path().join("wt.json");
+        let mut controller = Controller::new(
+            catalog_path.clone(),
+            Catalog::default(),
+            App::new(Vec::new(), directory.path().to_owned()),
+        );
+        controller.discover_authored_pull_requests = false;
+        let hosts = crate::refresh::hosts(&controller.catalog, &catalog_path);
+        crate::refresh::run(
+            &controller.remote_cache_path,
+            &GitHubService::new(),
+            &SystemGit,
+            &SystemCredentials,
+            &[],
+            &hosts,
+            false,
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        let identity = crate::model::CanonicalPullRequestId {
+            repository: crate::model::GitHubRepositoryIdentity::canonical(
+                "github.com",
+                "team",
+                "project",
+            ),
+            number: 1,
+        };
+        let details = crate::model::PullRequestDetails {
+            feedback_complete: true,
+            ..crate::model::PullRequestDetails::default()
+        };
+        cache::update(&controller.remote_cache_path, |cache| {
+            let mut retained = cache.refreshes[0].snapshot.cache();
+            retained.merge_pull_request_details(&std::collections::BTreeMap::from([(
+                identity.clone(),
+                Ok(details.clone()),
+            )]));
+            cache.refreshes[0].snapshot = crate::refresh::Snapshot::from_cache(retained);
+        })
+        .unwrap();
+        controller.next_github_refresh = Instant::now() + Duration::from_secs(10);
+        let old_deadline = controller.next_github_refresh;
+        controller.request_local_refresh(false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.local_refresh_job.is_some() && Instant::now() < deadline {
+            controller.pump_background_results();
+            std::thread::yield_now();
+        }
+        assert!(controller.local_refresh_job.is_none());
+        assert!(!controller.github_in_flight);
+        assert!(controller.remote_cache_revision.is_some());
+        assert_eq!(controller.app.pull_request_details[&identity], details);
+        assert!(controller.next_github_refresh > old_deadline);
+        assert_eq!(controller.app.minutes_since_last_refresh(), Some(0));
+
+        std::fs::write(&controller.remote_cache_path, "corrupt cache").unwrap();
+        controller.request_local_refresh(false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while controller.local_refresh_job.is_some() && Instant::now() < deadline {
+            controller.pump_background_results();
+            std::thread::yield_now();
+        }
+        assert!(controller.local_refresh_job.is_none());
+        assert_eq!(controller.app.pull_request_details[&identity], details);
+        assert!(!controller.github_in_flight);
+    }
+
+    #[test]
+    fn local_cache_snapshot_cannot_replace_a_newer_github_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            App::new(Vec::new(), directory.path().to_owned()),
+        );
+        cache::update(&controller.remote_cache_path, |_| {}).unwrap();
+        let (revision, cache) = cache::load_changed(&controller.remote_cache_path, None)
+            .unwrap()
+            .unwrap();
+        let mut snapshot =
+            collect_local_snapshot(&controller.catalog_path, directory.path()).unwrap();
+        snapshot.remote_cache = Some((controller.app.github_generation, revision, cache));
+        controller.app.begin_github_refresh(&[]);
+        controller.apply_local_snapshot(snapshot);
+        assert!(
+            controller.remote_cache_revision.is_none(),
+            "retry after a newer refresh"
+        );
     }
 
     #[test]
@@ -3783,6 +4047,7 @@ mod tests {
             catalog: Catalog::default(),
             repositories: vec![unchanged.clone()],
             github_bindings: github_bindings(&github_inputs_for_repositories(&[unchanged])),
+            remote_cache: None,
         });
         assert!(controller.app.github.contains_key(&worktree_path));
 
@@ -3796,6 +4061,7 @@ mod tests {
             github_bindings: github_bindings(&github_inputs_for_repositories(&[repository(
                 "other",
             )])),
+            remote_cache: None,
         });
 
         assert!(!controller.app.github.contains_key(&worktree_path));

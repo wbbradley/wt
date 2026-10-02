@@ -17,6 +17,7 @@ mod merged_cleanup;
 mod model;
 mod operations;
 mod prompt;
+mod refresh;
 mod state;
 mod terminal;
 mod tui;

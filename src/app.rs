@@ -108,6 +108,10 @@ impl AuthoredPullRequestState {
         if self.loading {
             return;
         }
+        self.hydrate_baseline(pull_requests);
+    }
+
+    pub fn hydrate_baseline(&mut self, pull_requests: Vec<AuthoredPullRequest>) {
         self.baseline = pull_requests
             .into_iter()
             .map(|pull_request| (pull_request.identity.clone(), pull_request))
