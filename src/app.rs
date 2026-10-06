@@ -1992,7 +1992,7 @@ impl App {
                 depth,
                 InlineRowKind::Section,
                 format!(
-                    "Overview · {} · auto-merge {} · conflicts {}",
+                    "Overview · {} · auto-merge {} · conflicts {} · {}",
                     pull_request.state,
                     if pull_request.auto_merge {
                         "enabled"
@@ -2002,6 +2002,7 @@ impl App {
                     summary
                         .map(|summary| debug_label(summary.merge_conflict))
                         .unwrap_or_else(|| "unknown".to_owned()),
+                    pull_request.title,
                 ),
                 Some(pr_url.clone()),
                 Some(overview_expanded),

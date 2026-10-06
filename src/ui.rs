@@ -835,6 +835,22 @@ fn inline_row_spans(
                 .add_modifier(Modifier::BOLD),
         ));
         match section {
+            InlineSection::Overview if !summary.is_empty() => {
+                let mut fields = summary.splitn(4, " · ");
+                let status = fields.by_ref().take(3).collect::<Vec<_>>().join(" · ");
+                spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+                spans.push(Span::styled(
+                    status.clone(),
+                    status_text_style(&status.to_ascii_lowercase()),
+                ));
+                if let Some(title) = fields.next() {
+                    spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+                    spans.push(Span::styled(
+                        title.to_owned(),
+                        Style::default().fg(Color::White),
+                    ));
+                }
+            }
             InlineSection::Checks => append_checks_header_spans(&mut spans, summary),
             InlineSection::Reviewers => append_reviewer_header_spans(&mut spans, summary),
             InlineSection::OpenComments if !summary.is_empty() => {
@@ -1173,9 +1189,6 @@ fn pull_request_tree_spans(
 ) -> Vec<Span<'static>> {
     let summary = details.map(PullRequestDetails::attention_summary);
     let mut spans = Vec::new();
-    if pull_request.state != PullRequestState::Merged {
-        spans.push(tree_label(&pull_request.title, Color::White));
-    }
     match pull_request.state {
         PullRequestState::Draft => spans.push(tree_label("draft", Color::LightBlue)),
         PullRequestState::Merged if !suppress_merged => {
@@ -2496,6 +2509,7 @@ mod tests {
         assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
         assert!(content.contains("PR #42"));
         assert!(content.contains("virtual feature"));
+        assert!(colored_text(buffer, Color::White).contains("virtual feature"));
         assert!(content.contains("changes requested"));
         assert!(content.contains("conflicts present"));
         assert!(content.contains("virtual-only"));
@@ -2515,7 +2529,14 @@ mod tests {
         assert!(content.contains("changes requested"));
         assert!(content.contains("auto-merge: enabled"));
         assert!(content.contains("h/l fold · Enter/w opens PR"));
-        assert!(content.contains("Overview · draft · auto-merge enabled · conflicts conflicting"));
+        assert!(content.contains(
+            "Overview · draft · auto-merge enabled · conflicts conflicting · virtual feature"
+        ));
+        let pr_line = buffer_lines(buffer)
+            .into_iter()
+            .find(|line| line.contains("PR #42"))
+            .unwrap();
+        assert!(!pr_line.contains("virtual feature"));
         assert!(content.contains("Checks  [0 1 1]"));
         assert!(content.contains("Reviewers  [✗ changes]"));
         assert!(content.contains("Open comments  1 unresolved"));

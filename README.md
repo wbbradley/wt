@@ -100,19 +100,19 @@ The initial selection is the worktree containing the current directory. The body
 
 ```text
   └▾acme/web · ~/src/web
-●    ├▾feature/login · ~/src/web-login · [~1] · PR #42 · Fix login race · checks failing · review required
-     │  ├▸Overview · open · auto-merge off · conflicts clean
+●    ├▾feature/login · ~/src/web-login · [~1] · PR #42 · checks failing · review required
+     │  ├▸Overview · open · auto-merge off · conflicts clean · Fix login race
      │  ├▸Checks  ✗ 3/4 required
      │  ├▸Reviewers  [req, ✗ changes]
      │  ├▾Open comments  2 unresolved
      │  │  └─@reviewer Handle cancellation (src/login.rs) [outdated]
      │  └▾Stacked branches
-     │     └▾feature/login-ui · PR #43 · Polish login UI · virtual-only
+     │     └▾feature/login-ui · PR #43 · virtual-only
      ├▾chores · ~/src/web-chores
      └▸Backburner
 ```
 
-Every row starts with a fixed two-column location gutter: the containing worktree has a green `●` followed by a space, while every other row has two blanks, keeping tree content aligned. Top-level repositories use `┌─`, `├─`, and `└─` connectors according to sibling position. At every depth, collapsible rows replace the connector's dash with `▾` or `▸`, producing compact forms such as `├▾branch`. Leaf labels follow the dash directly, as in `├─branch`, so labels align with collapsible siblings. Tree connectors and disclosures are muted, PR numbers are orange, reviewer names have stable hash-derived colors, and every tree item stays on one display-width-truncated line. Repository rows show the registered repository path, and local branch rows show the linked-worktree path; paths under the home directory use `~`. Branch rows also show title and compact attention status: failed required checks, outstanding or changes-requested reviews, actual conflicts, auto-merge, non-open state, virtual/Backburner state, and local status. Merged associations retain their PR number in italic purple (`#b16286`) and the compact `merged` state, omitting their title. Unresolved counts live on the Open comments header instead of being repeated on the branch. `[+N ~N ?N]` means staged, unstaged, and untracked entries; `locked` and `prunable` remain explicit.
+Every row starts with a fixed two-column location gutter: the containing worktree has a green `●` followed by a space, while every other row has two blanks, keeping tree content aligned. Top-level repositories use `┌─`, `├─`, and `└─` connectors according to sibling position. At every depth, collapsible rows replace the connector's dash with `▾` or `▸`, producing compact forms such as `├▾branch`. Leaf labels follow the dash directly, as in `├─branch`, so labels align with collapsible siblings. Tree connectors and disclosures are muted, PR numbers are orange, reviewer names have stable hash-derived colors, and every tree item stays on one display-width-truncated line. Repository rows show the registered repository path, and local branch rows show the linked-worktree path; paths under the home directory use `~`. The Overview header shows the PR title after its conflict status. Branch rows show compact attention status: failed required checks, outstanding or changes-requested reviews, actual conflicts, auto-merge, non-open state, virtual/Backburner state, and local status. Merged associations retain their PR number in italic purple (`#b16286`) and the compact `merged` state, omitting their title. Unresolved counts live on the Open comments header instead of being repeated on the branch. `[+N ~N ?N]` means staged, unstaged, and untracked entries; `locked` and `prunable` remain explicit.
 
 PR and branch rows show line counts as green `+N` and red `-N` near the label. PR counts come from GitHub and compare against that PR’s base, including stacked PRs. Branches without a PR show committed changes since their merge base with the locally known default branch (remote HEAD, with main/master fallbacks). Uncommitted changes stay in the separate local-status indicator. Counts are omitted when unavailable or when both counts are zero; binary files do not contribute line counts.
 
