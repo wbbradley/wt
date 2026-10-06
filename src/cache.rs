@@ -528,6 +528,7 @@ mod tests {
             identity: CanonicalPullRequestId { repository, number },
             author: "viewer".to_owned(),
             pull_request: PullRequest {
+                diff_stats: None,
                 number,
                 title: format!("change {number}"),
                 url: format!("https://github.com/team/project/pull/{number}"),

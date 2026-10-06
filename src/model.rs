@@ -564,8 +564,15 @@ pub struct Worktree {
     pub prunable: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct DiffStats {
+    pub additions: u64,
+    pub deletions: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorktreeStatus {
+    pub diff_stats: Option<DiffStats>,
     pub head: Option<String>,
     pub branch: Option<String>,
     pub upstream: Option<String>,
@@ -654,6 +661,8 @@ pub struct PullRequestIdentity {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct PullRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_stats: Option<DiffStats>,
     pub number: u64,
     pub title: String,
     pub url: String,

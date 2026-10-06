@@ -115,7 +115,7 @@ pub(crate) fn row_search_text(app: &App, row: &VisibleRow) -> String {
                     .and_then(GitHubState::data)
                     .and_then(|data| data.pull_request.as_ref());
                 if let Some(pull_request) = pull_request {
-                    spans.splice(0..0, pull_request_prefix_spans(pull_request));
+                    spans.splice(0..0, branch_prefix_spans(app, worktree, Some(pull_request)));
                     let details = app
                         .pull_request_details_for(repository, pull_request)
                         .map(|(_, details)| details);
@@ -129,6 +129,9 @@ pub(crate) fn row_search_text(app: &App, row: &VisibleRow) -> String {
                         backburnered,
                         worktree_is_pull_request_base(worktree, pull_request),
                     ));
+                }
+                if pull_request.is_none() {
+                    spans.splice(0..0, branch_prefix_spans(app, worktree, None));
                 }
                 spans.extend(github_freshness_spans(
                     app.github_network_active(&worktree.path),
@@ -175,7 +178,7 @@ pub(crate) fn row_search_text(app: &App, row: &VisibleRow) -> String {
                 .and_then(GitHubState::data)
                 .and_then(|data| data.pull_request.as_ref());
             if let Some(pull_request) = pull_request {
-                spans.splice(0..0, pull_request_prefix_spans(pull_request));
+                spans.splice(0..0, branch_prefix_spans(app, worktree, Some(pull_request)));
                 let details = app
                     .pull_request_details_for(repository, pull_request)
                     .map(|(_, details)| details);
@@ -189,6 +192,9 @@ pub(crate) fn row_search_text(app: &App, row: &VisibleRow) -> String {
                     backburnered,
                     worktree_is_pull_request_base(worktree, pull_request),
                 ));
+            }
+            if pull_request.is_none() {
+                spans.splice(0..0, branch_prefix_spans(app, worktree, None));
             }
             spans.extend(github_freshness_spans(
                 app.github_network_active(&worktree.path),
@@ -319,12 +325,13 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, rows: &[VisibleRow], area: 
                     location_marker_span(app, row),
                     Span::styled(tree_prefix, Style::default().fg(MUTED)),
                 ];
-                if let Some(pull_request) = singleton
-                    .and_then(|worktree| app.github.get(&worktree.path))
-                    .and_then(GitHubState::data)
-                    .and_then(|data| data.pull_request.as_ref())
-                {
-                    spans.extend(pull_request_prefix_spans(pull_request));
+                if let Some(worktree) = singleton {
+                    let pull_request = app
+                        .github
+                        .get(&worktree.path)
+                        .and_then(GitHubState::data)
+                        .and_then(|data| data.pull_request.as_ref());
+                    spans.extend(branch_prefix_spans(app, worktree, pull_request));
                 }
                 spans.push(Span::styled(
                     repository.config.display_label(),
@@ -436,9 +443,7 @@ fn render_list(frame: &mut Frame<'_>, app: &mut App, rows: &[VisibleRow], area: 
                 } else {
                     tree_prefix
                 };
-                let pr_prefix = pull_request
-                    .map(pull_request_prefix_spans)
-                    .unwrap_or_default();
+                let pr_prefix = branch_prefix_spans(app, worktree, pull_request);
                 let prefix_width = 2
                     + display_width(&tree_prefix)
                     + pr_prefix.iter().map(Span::width).sum::<usize>();
@@ -1115,10 +1120,48 @@ fn pull_request_prefix_spans(pull_request: &crate::model::PullRequest) -> Vec<Sp
     } else {
         Style::default().fg(PR_NUMBER).add_modifier(Modifier::BOLD)
     };
+    let mut spans = vec![Span::styled(format!("PR #{}", pull_request.number), style)];
+    spans.extend(diff_stats_spans(pull_request.diff_stats));
+    spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+    spans
+}
+
+fn diff_stats_spans(stats: Option<crate::model::DiffStats>) -> Vec<Span<'static>> {
+    let Some(stats) = stats else {
+        return Vec::new();
+    };
+    if stats.additions == 0 && stats.deletions == 0 {
+        return Vec::new();
+    }
     vec![
-        Span::styled(format!("PR #{}", pull_request.number), style),
-        Span::styled(" · ", Style::default().fg(MUTED)),
+        Span::raw(" "),
+        Span::styled(
+            format!("+{}", stats.additions),
+            Style::default().fg(SUCCESS),
+        ),
+        Span::raw(" "),
+        Span::styled(format!("-{}", stats.deletions), Style::default().fg(DANGER)),
     ]
+}
+
+fn branch_prefix_spans(
+    app: &App,
+    worktree: &crate::model::Worktree,
+    pull_request: Option<&crate::model::PullRequest>,
+) -> Vec<Span<'static>> {
+    if let Some(pull_request) = pull_request {
+        return pull_request_prefix_spans(pull_request);
+    }
+    let stats = match app.statuses.get(&worktree.path) {
+        Some(StatusState::Ready(status)) => status.diff_stats,
+        _ => None,
+    };
+    let mut spans = diff_stats_spans(stats);
+    if !spans.is_empty() {
+        spans.remove(0);
+        spans.push(Span::styled(" · ", Style::default().fg(MUTED)));
+    }
+    spans
 }
 
 fn pull_request_tree_spans(
@@ -2103,6 +2146,10 @@ mod tests {
         app.statuses.insert(
             PathBuf::from("/repo"),
             StatusState::Ready(WorktreeStatus {
+                diff_stats: Some(crate::model::DiffStats {
+                    additions: 24,
+                    deletions: 7,
+                }),
                 staged: 1,
                 unstaged: 2,
                 untracked: 3,
@@ -2114,6 +2161,9 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(app.viewport_height, 19);
         let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("+24 -7 · project"));
+        assert!(colored_text(terminal.backend().buffer(), SUCCESS).contains("+24"));
+        assert!(colored_text(terminal.backend().buffer(), DANGER).contains("-7"));
         assert!(!content.contains("Worktree ·"));
         let row = buffer_lines(terminal.backend().buffer())
             .into_iter()
@@ -2135,10 +2185,8 @@ mod tests {
             .into_iter()
             .find(|line| line.contains("project"))
             .unwrap();
-        assert!(
-            narrow_row
-                .contains("project · /repo (main) · [+1 ~2 ?3] · locked · prunable [session-only]")
-        );
+        assert!(narrow_row.contains("+24 -7 · project · /repo (main) · [+1 ~2 ?3]"));
+        assert!(narrow_row.contains('…'));
         assert!(!narrow_row.contains("12345678"));
 
         app.current_directory = PathBuf::from("/repo");
@@ -2313,6 +2361,10 @@ mod tests {
             identity: pull_request_id.clone(),
             author: "viewer".to_owned(),
             pull_request: PullRequest {
+                diff_stats: Some(crate::model::DiffStats {
+                    additions: 123,
+                    deletions: 45,
+                }),
                 number: 42,
                 title: "virtual feature".to_owned(),
                 url: "https://github.com/base/project/pull/42".to_owned(),
@@ -2440,7 +2492,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let content = buffer_text(buffer);
         assert!(content.contains("base/project [no local repo]"));
-        assert!(content.contains("└▾PR #42 · feature/compact-attention"));
+        assert!(content.contains("└▾PR #42 +123 -45 · feature/compact-attention"));
         assert!(content.contains("feature/compact-attention-indicators-with-a-very-long-name"));
         assert!(content.contains("PR #42"));
         assert!(content.contains("virtual feature"));
@@ -2452,6 +2504,8 @@ mod tests {
                 .contains("feature/compact-attention-indicators-with-a-very-long-name")
         );
         assert!(colored_text(buffer, PR_NUMBER).contains("#42"));
+        assert!(colored_text(buffer, SUCCESS).contains("+123"));
+        assert!(colored_text(buffer, DANGER).contains("-45"));
         let red = colored_text(buffer, Color::Red);
         assert!(red.contains("changes requested"));
         assert!(red.contains("conflicts present"));
@@ -2474,7 +2528,7 @@ mod tests {
             .unwrap();
         let narrow_buffer = narrow_terminal.backend().buffer();
         let narrow_content = buffer_text(narrow_buffer);
-        assert!(narrow_content.contains("PR #42"));
+        assert!(narrow_content.contains("PR #42 +123 -45"));
         assert!(narrow_content.contains("draft"));
         let narrow_lines = buffer_lines(narrow_buffer);
         let branch_line = narrow_lines
@@ -3086,6 +3140,7 @@ mod tests {
             path.clone(),
             GitHubState::Ready(GitHubBranchData {
                 pull_request: Some(PullRequest {
+                    diff_stats: None,
                     number: 42,
                     title: "merged change".to_owned(),
                     url: "https://github.com/base/project/pull/42".to_owned(),
@@ -3349,6 +3404,7 @@ mod tests {
                 number,
             };
             let pull_request = PullRequest {
+                diff_stats: None,
                 number,
                 title: format!("Synthetic pull request {number}"),
                 url: format!("https://github.com/benchmark/large-tree/pull/{number}"),

@@ -314,6 +314,7 @@ mod tests {
                 number: 42,
             },
             pull_request: PullRequest {
+                diff_stats: None,
                 number: 42,
                 title: "Fix feedback".to_owned(),
                 url: "https://git.example.com/base/project/pull/42".to_owned(),

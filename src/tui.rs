@@ -2777,6 +2777,7 @@ mod tests {
             number: 42,
         };
         let pull_request = PullRequest {
+            diff_stats: None,
             number: 42,
             title: "Fix CI".to_owned(),
             url: "https://github.com/team/project/pull/42".to_owned(),
@@ -4168,6 +4169,7 @@ mod tests {
         let identity = GitHubRepositoryIdentity::canonical("github.com", "team", "project");
         let pull_request = |number: u64, branch: &str| {
             let pull_request = PullRequest {
+                diff_stats: None,
                 number,
                 title: format!("change {number}"),
                 url: format!("https://github.com/team/project/pull/{number}"),
@@ -5381,6 +5383,7 @@ mod tests {
             },
             author: author.to_owned(),
             pull_request: PullRequest {
+                diff_stats: None,
                 number: 1,
                 title: "change".to_owned(),
                 url: "https://github.com/team/project/pull/1".to_owned(),

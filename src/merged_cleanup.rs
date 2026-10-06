@@ -721,6 +721,7 @@ mod tests {
         AssociatedPullRequest {
             identity,
             pull_request: PullRequest {
+                diff_stats: None,
                 number,
                 title: "change".to_owned(),
                 url: format!("https://github.com/base/project/pull/{number}"),

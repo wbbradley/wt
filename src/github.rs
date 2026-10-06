@@ -1556,7 +1556,7 @@ fn authored_pull_request_query() -> String {
         pageInfo {{ hasNextPage endCursor }}
         nodes {{
           ... on PullRequest {{
-            number title url state isDraft mergedAt updatedAt reviewDecision
+            number title url state isDraft mergedAt updatedAt reviewDecision additions deletions
             autoMergeRequest {{ enabledAt }}
             author {{ login }}
             assignees(first: 10) {{ nodes {{ login }} }}
@@ -1575,7 +1575,7 @@ fn pull_request_query() -> &'static str {
     r#"query($owner: String!, $repository: String!, $number: Int!) {
       repository(owner: $owner, name: $repository) {
         pullRequest(number: $number) {
-          number title url state isDraft mergedAt updatedAt reviewDecision
+          number title url state isDraft mergedAt updatedAt reviewDecision additions deletions
           autoMergeRequest { enabledAt }
           author { login }
           baseRefName baseRefOid baseRepository { nameWithOwner }
@@ -1944,7 +1944,7 @@ fn build_query(
               ... on Commit {{
                 associatedPullRequests(first: 20) {{
                   nodes {{
-                    number title url state isDraft mergedAt updatedAt reviewDecision
+                    number title url state isDraft mergedAt updatedAt reviewDecision additions deletions
                     autoMergeRequest {{ enabledAt }}
                     baseRefName baseRefOid baseRepository {{ nameWithOwner }}
                     headRefName headRefOid headRepository {{ nameWithOwner }}
@@ -2127,6 +2127,14 @@ fn normalize_pull_request(node: &Value) -> Result<PullRequest, GitHubError> {
         .map(check_rollup)
         .unwrap_or(CheckRollup::Unknown);
     Ok(PullRequest {
+        diff_stats: node
+            .get("additions")
+            .and_then(Value::as_u64)
+            .zip(node.get("deletions").and_then(Value::as_u64))
+            .map(|(additions, deletions)| crate::model::DiffStats {
+                additions,
+                deletions,
+            }),
         number,
         title: required("title")?,
         url: required("url")?,
@@ -2575,6 +2583,30 @@ mod tests {
             "headRepository": {"nameWithOwner": "fork/project"},
             "commits": {"nodes": []}
         })
+    }
+
+    #[test]
+    fn pull_request_size_is_normalized_and_old_cache_entries_remain_readable() {
+        let mut node = authored_node(42, "viewer", false);
+        assert_eq!(normalize_pull_request(&node).unwrap().diff_stats, None);
+        node["additions"] = serde_json::json!(123);
+        node["deletions"] = serde_json::json!(45);
+        let pr = normalize_pull_request(&node).unwrap();
+        assert_eq!(
+            pr.diff_stats,
+            Some(crate::model::DiffStats {
+                additions: 123,
+                deletions: 45
+            })
+        );
+        let mut cached = serde_json::to_value(&pr).unwrap();
+        cached.as_object_mut().unwrap().remove("diff_stats");
+        assert_eq!(
+            serde_json::from_value::<PullRequest>(cached)
+                .unwrap()
+                .diff_stats,
+            None
+        );
     }
 
     fn authored_body(nodes: Vec<Value>, has_next_page: bool, cursor: Option<&str>) -> String {
@@ -3372,6 +3404,7 @@ mod tests {
     #[test]
     fn canonical_ids_use_the_base_repository_and_mapping_obeys_precedence() {
         let pull_request = PullRequest {
+            diff_stats: None,
             number: 42,
             title: "fork change".to_owned(),
             url: "https://github.com/base/project/pull/42".to_owned(),

@@ -1506,6 +1506,7 @@ mod tests {
                 },
                 author: "viewer".to_owned(),
                 pull_request: PullRequest {
+                    diff_stats: None,
                     number,
                     title: "Test".to_owned(),
                     url: format!("https://github.com/team/project/pull/{number}"),

@@ -5196,6 +5196,7 @@ mod tests {
             },
             author: "viewer".to_owned(),
             pull_request: crate::model::PullRequest {
+                diff_stats: None,
                 number,
                 title: format!("feature {number}"),
                 url: format!("https://github.com/{owner}/{repository}/pull/{number}"),
@@ -8083,6 +8084,7 @@ mod tests {
             path.clone(),
             GitHubState::Ready(GitHubBranchData {
                 pull_request: Some(crate::model::PullRequest {
+                    diff_stats: None,
                     number: 42,
                     title: "Improve frobnicator".to_owned(),
                     url: "https://example.test/pull/42".to_owned(),
@@ -8962,6 +8964,7 @@ mod tests {
                 identity: CanonicalPullRequestId { repository, number },
                 author: "viewer".to_owned(),
                 pull_request: crate::model::PullRequest {
+                    diff_stats: None,
                     number,
                     title: format!("change {number}"),
                     url: format!("https://example/pull/{number}"),

@@ -36,8 +36,10 @@ impl StatusPool {
         Self::new(
             worker_count,
             Arc::new(|path, configured| {
-                git::status_with_ignored(&SystemGit, path, configured)
-                    .map_err(|error| error.to_string())
+                let mut status = git::status_with_ignored(&SystemGit, path, configured)
+                    .map_err(|error| error.to_string())?;
+                status.diff_stats = git::branch_diff_stats(&SystemGit, path);
+                Ok(status)
             }),
         )
     }

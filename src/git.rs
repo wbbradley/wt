@@ -256,6 +256,81 @@ pub fn status_with_ignored(
     Ok(result)
 }
 
+/// Committed changes since the branch forked from the locally known default
+/// branch. Missing refs or unrelated histories leave the size unavailable.
+pub fn branch_diff_stats(
+    runner: &dyn GitRunner,
+    worktree: &Path,
+) -> Option<crate::model::DiffStats> {
+    let remotes = run_checked(runner, worktree, &["remote"]).ok()?;
+    let remotes = String::from_utf8(remotes).ok()?;
+    let mut remotes: Vec<_> = remotes.lines().collect();
+    remotes.sort_by_key(|remote| (*remote != "origin", *remote));
+    let mut bases = Vec::new();
+    for remote in &remotes {
+        if let Ok(head) = run_checked(
+            runner,
+            worktree,
+            &[
+                "symbolic-ref",
+                "--quiet",
+                &format!("refs/remotes/{remote}/HEAD"),
+            ],
+        ) {
+            bases.push(String::from_utf8(head).ok()?.trim().to_owned());
+        }
+    }
+    for remote in &remotes {
+        for branch in ["main", "master"] {
+            bases.push(format!("refs/remotes/{remote}/{branch}"));
+        }
+    }
+    bases.extend(["refs/heads/main".to_owned(), "refs/heads/master".to_owned()]);
+    for base in bases {
+        if let Ok(output) = run_git(
+            runner,
+            worktree,
+            &[
+                "diff".into(),
+                "--numstat".into(),
+                "-z".into(),
+                "--find-renames".into(),
+                "--no-ext-diff".into(),
+                format!("{base}...HEAD").into(),
+                "--".into(),
+            ],
+        ) {
+            return parse_diff_stats(&output);
+        }
+    }
+    None
+}
+
+fn parse_diff_stats(output: &[u8]) -> Option<crate::model::DiffStats> {
+    let mut stats = crate::model::DiffStats::default();
+    let mut records = output.split(|byte| *byte == 0);
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.splitn(3, |byte| *byte == b'\t');
+        let additions = fields.next()?;
+        let deletions = fields.next()?;
+        let path = fields.next()?; // Paths may contain tabs, newlines, or non-UTF-8 bytes.
+        if path.is_empty() {
+            // With -z, renames have separate source and destination fields.
+            records.next()?;
+            records.next()?;
+        }
+        if additions == b"-" && deletions == b"-" {
+            continue; // Git cannot count lines in binary files.
+        }
+        stats.additions += std::str::from_utf8(additions).ok()?.parse::<u64>().ok()?;
+        stats.deletions += std::str::from_utf8(deletions).ok()?.parse::<u64>().ok()?;
+    }
+    Some(stats)
+}
+
 fn ignored_files(
     runner: &dyn GitRunner,
     worktree: &Path,
@@ -476,6 +551,81 @@ fn bytes_to_path(bytes: &[u8], field: &'static str) -> Result<PathBuf, GitError>
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn branch_size_uses_merge_base_and_excludes_uncommitted_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "Test"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        fs::write(
+            root.join("file"),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+        )
+        .unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        assert_eq!(
+            branch_diff_stats(&SystemGit, root),
+            Some(crate::model::DiffStats::default())
+        );
+        git(root, &["checkout", "-qb", "topic"]);
+        fs::write(
+            root.join("file"),
+            "one\nreplacement\nthree\nfour\nfive\nsix\nseven\neight\nnine\nextra\n",
+        )
+        .unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "topic"]);
+        git(root, &["checkout", "-q", "main"]);
+        fs::write(root.join("trunk-only"), "not part of topic\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "trunk"]);
+        git(root, &["checkout", "-q", "topic"]);
+        git(root, &["mv", "file", "renamed"]);
+        git(root, &["commit", "-qm", "rename"]);
+        fs::write(root.join("renamed"), "uncommitted\n").unwrap();
+        let expected = Some(crate::model::DiffStats {
+            additions: 2,
+            deletions: 1,
+        });
+        assert_eq!(branch_diff_stats(&SystemGit, root), expected);
+        // A remote's symbolic HEAD supports trunk names other than main/master.
+        git(root, &["branch", "-m", "main", "trunk"]);
+        git(
+            root,
+            &["remote", "add", "origin", "https://example.com/repo.git"],
+        );
+        git(root, &["update-ref", "refs/remotes/origin/trunk", "trunk"]);
+        git(
+            root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+        assert_eq!(branch_diff_stats(&SystemGit, root), expected);
+    }
+
+    #[test]
+    fn diff_size_handles_binary_and_unusual_paths_and_unknown_base() {
+        assert_eq!(
+            parse_diff_stats(b"5\t2\tpath\twith\nodd\xffbytes\0-\t-\tbinary\0"),
+            Some(crate::model::DiffStats {
+                additions: 5,
+                deletions: 2
+            })
+        );
+        assert_eq!(
+            parse_diff_stats(b"0\t0\t\0old\0new\0"),
+            Some(crate::model::DiffStats::default())
+        );
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init", "-q", "-b", "topic"]);
+        assert_eq!(branch_diff_stats(&SystemGit, directory.path()), None);
+    }
 
     #[test]
     fn ignored_files_use_git_rules_and_refresh_without_affecting_dirty_state() {
