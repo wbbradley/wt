@@ -118,6 +118,14 @@ impl AuthoredPullRequestState {
             .collect();
     }
 
+    pub fn seed_baseline(&mut self, pull_requests: Vec<AuthoredPullRequest>) {
+        for pull_request in pull_requests {
+            self.baseline
+                .entry(pull_request.identity.clone())
+                .or_insert(pull_request);
+        }
+    }
+
     pub fn begin(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.pending.clear();

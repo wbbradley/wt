@@ -578,16 +578,17 @@ impl Controller {
             return;
         }
         self.remote_cache_revision = Some(revision);
-        self.apply_remote_cache(remote_cache, &self.current_github_bindings());
+        self.apply_remote_cache(remote_cache, &self.current_github_bindings(), false);
     }
 
     fn apply_remote_cache(
         &mut self,
         remote_cache: cache::RemoteCache,
         current_bindings: &HashMap<PathBuf, LocalGitHubBinding>,
+        seed_only: bool,
     ) {
         self.app.github_hosts = crate::github::inferred_github_hosts(&self.catalog);
-        self.app.pull_request_details = remote_cache
+        let details = remote_cache
             .pull_request_details
             .into_iter()
             .filter(|cached| {
@@ -596,31 +597,57 @@ impl Controller {
                     .contains(&cached.identity.repository.host)
             })
             .map(|cached| (cached.identity, cached.details))
-            .collect();
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if seed_only {
+            for (identity, details) in details {
+                self.app
+                    .pull_request_details
+                    .entry(identity)
+                    .or_insert(details);
+            }
+        } else {
+            self.app.pull_request_details = details;
+        }
         for cached in remote_cache.branches {
             if let Some(binding) = current_bindings.get(&cached.worktree).filter(|binding| {
                 binding.branch == cached.branch
                     && cached.repository_binding.as_ref() == Some(&binding.repository)
             }) {
-                self.app.github.insert(
-                    cached.worktree.clone(),
-                    crate::app::GitHubState::Ready(cached.data),
-                );
+                let state = self
+                    .app
+                    .github
+                    .entry(cached.worktree.clone())
+                    .or_insert(crate::app::GitHubState::Ready(cached.data.clone()));
+                if !seed_only {
+                    *state = crate::app::GitHubState::Ready(cached.data);
+                } else if state.data().is_none() {
+                    // Keep the loading state while hydrating a cold worktree.
+                    match state {
+                        crate::app::GitHubState::Loading { previous }
+                        | crate::app::GitHubState::Stale { previous, .. } => {
+                            *previous = Some(cached.data);
+                        }
+                        crate::app::GitHubState::Ready(_) => {}
+                    }
+                }
                 self.github_bindings
                     .insert(cached.worktree, binding.clone());
             }
         }
-        self.app.authored_pull_requests.hydrate(
-            remote_cache
-                .authored_pull_requests
-                .into_iter()
-                .filter(|pull_request| {
-                    self.app
-                        .github_hosts
-                        .contains(&pull_request.identity.repository.host)
-                })
-                .collect(),
-        );
+        let authored = remote_cache
+            .authored_pull_requests
+            .into_iter()
+            .filter(|pull_request| {
+                self.app
+                    .github_hosts
+                    .contains(&pull_request.identity.repository.host)
+            })
+            .collect();
+        if seed_only {
+            self.app.authored_pull_requests.seed_baseline(authored);
+        } else {
+            self.app.authored_pull_requests.hydrate(authored);
+        }
         if let Some(shared) = remote_cache.refreshes.first() {
             if let Some(completed_at) = shared.snapshot_at() {
                 let now_epoch = SystemTime::now()
@@ -1499,7 +1526,7 @@ impl Controller {
             && generation == self.app.github_generation
             && self.materialization_job.is_none()
         {
-            self.apply_remote_cache(cache, &current_bindings);
+            self.apply_remote_cache(cache, &current_bindings, false);
             self.remote_cache_revision = Some(revision);
         }
     }
@@ -1912,11 +1939,15 @@ impl Controller {
                                 current_bindings.get(&cached.worktree) == Some(binding)
                             })
                         });
-                        let authored = cache.authored_pull_requests.clone();
-                        self.app.github.clear();
-                        self.github_bindings.clear();
-                        self.apply_remote_cache(cache, &current_bindings);
-                        self.app.authored_pull_requests.hydrate_baseline(authored);
+                        // Preliminary snapshots may omit local branches or be
+                        // older than the displayed data. Only fill gaps until
+                        // completed refresh results supply updates/removals.
+                        self.github_bindings
+                            .retain(|path, binding| current_bindings.get(path) == Some(binding));
+                        self.app
+                            .github
+                            .retain(|path, _| self.github_bindings.contains_key(path));
+                        self.apply_remote_cache(cache, &current_bindings, true);
                         self.refresh_authored_mappings();
                         changed = true;
                     }
@@ -4333,6 +4364,67 @@ mod tests {
     }
 
     #[test]
+    fn refresh_baseline_hydrates_startup_and_completed_refresh_can_remove_prs() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            App::new(Vec::new(), directory.path().to_owned()),
+        );
+        let authored = test_authored_pull_request("viewer");
+        let details = crate::model::PullRequestDetails {
+            feedback_complete: true,
+            ..crate::model::PullRequestDetails::default()
+        };
+        let generation = controller.app.begin_github_refresh(&[]);
+        let authored_generation = controller.app.authored_pull_requests.begin();
+        controller.github_in_flight = true;
+        controller.next_github_refresh = Instant::now() + Duration::from_secs(300);
+        controller.next_local_refresh = Instant::now() + Duration::from_secs(300);
+        controller
+            .github_sender
+            .send(GitHubMessage::Baseline {
+                generation,
+                cache: crate::cache::RemoteCache {
+                    authored_pull_requests: vec![authored.clone()],
+                    pull_request_details: vec![crate::cache::CachedPullRequestDetails {
+                        identity: authored.identity.clone(),
+                        details: details.clone(),
+                    }],
+                    ..crate::cache::RemoteCache::default()
+                },
+                cache_updates: Vec::new(),
+                bindings: HashMap::new(),
+            })
+            .unwrap();
+        assert!(controller.pump_background_results());
+        assert_eq!(
+            controller.app.authored_pull_requests.visible(),
+            vec![authored.clone()]
+        );
+        assert_eq!(
+            controller.app.pull_request_details[&authored.identity],
+            details
+        );
+        assert_eq!(controller.app.virtual_repositories.len(), 1);
+
+        controller
+            .github_sender
+            .send(GitHubMessage::Authored {
+                generation: authored_generation,
+                event: AuthoredRefreshEvent::Finished {
+                    complete: true,
+                    warnings: Vec::new(),
+                    error: None,
+                },
+            })
+            .unwrap();
+        assert!(controller.pump_background_results());
+        assert!(controller.app.authored_pull_requests.visible().is_empty());
+        assert!(controller.app.virtual_repositories.is_empty());
+    }
+
+    #[test]
     fn remote_cache_preserves_selected_local_pr_and_virtual_stack() {
         use crate::app::{GitHubState, RepositoryView};
         use crate::model::{
@@ -4501,6 +4593,74 @@ mod tests {
         let generation = controller
             .app
             .begin_github_refresh(std::slice::from_ref(&worktree_path));
+        controller.app.authored_pull_requests.begin();
+        controller.github_in_flight = true;
+        controller.next_github_refresh = Instant::now() + Duration::from_secs(300);
+        controller.next_local_refresh = Instant::now() + Duration::from_secs(300);
+        controller.app.selected = Some(crate::app::RowId::VirtualPullRequest(
+            virtual_pr.identity.clone(),
+        ));
+        let before_baseline = controller
+            .app
+            .visible_rows()
+            .into_iter()
+            .map(|row| row.id().clone())
+            .collect::<Vec<_>>();
+        let selected = controller.app.selected.clone();
+        let mut older_local = local.clone();
+        older_local.pull_request.title = "older cached title".to_owned();
+        let mut older_cache = cache::load(&controller.remote_cache_path).unwrap();
+        older_cache.branches[0].data.pull_request = Some(older_local.pull_request.clone());
+        older_cache.authored_pull_requests = vec![older_local.clone()];
+        older_cache.pull_request_details[0].details = crate::model::PullRequestDetails::default();
+        // The remote-only startup snapshot has no local branch bindings; a
+        // later scope miss can also supply an entirely empty baseline.
+        for baseline in [
+            crate::cache::RemoteCache {
+                authored_pull_requests: vec![older_local],
+                ..crate::cache::RemoteCache::default()
+            },
+            crate::cache::RemoteCache::default(),
+            older_cache,
+        ] {
+            controller
+                .github_sender
+                .send(GitHubMessage::Baseline {
+                    generation,
+                    cache: baseline,
+                    cache_updates: Vec::new(),
+                    bindings: controller.current_github_bindings(),
+                })
+                .unwrap();
+            assert!(controller.pump_background_results());
+            assert_eq!(
+                controller
+                    .app
+                    .visible_rows()
+                    .iter()
+                    .map(|row| row.id().clone())
+                    .collect::<Vec<_>>(),
+                before_baseline,
+                "preliminary cache snapshots must preserve the rendered tree"
+            );
+            assert_eq!(controller.app.selected, selected);
+            assert_eq!(
+                controller.app.authored_pull_requests.visible(),
+                vec![local.clone(), virtual_pr.clone()]
+            );
+            assert!(
+                controller
+                    .app
+                    .pull_request_details
+                    .contains_key(&local.identity)
+            );
+            assert!(matches!(
+                controller.app.github.get(&worktree_path),
+                Some(GitHubState::Loading { previous: Some(data) })
+                    if data.pull_request.as_ref() == Some(&local.pull_request)
+            ));
+            assert!(controller.app.pull_request_details[&local.identity].check_contexts_complete);
+        }
         assert!(controller.app.apply_github_refresh(
             generation,
             std::slice::from_ref(&worktree_path),
@@ -4515,6 +4675,13 @@ mod tests {
             std::collections::HashSet::from([local.identity.clone()]),
             "a failed refresh retains the selected PR for an unchanged worktree"
         );
+        controller.app.authored_pull_requests.finish(
+            controller.app.authored_pull_requests.generation,
+            false,
+            Vec::new(),
+            Some("offline".to_owned()),
+        );
+        controller.github_in_flight = false;
 
         controller.app.repositories[0].worktrees.push(Worktree {
             path: directory.path().join("new-worktree"),
