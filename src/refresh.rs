@@ -1,7 +1,7 @@
 //! Coordinates whole GitHub refreshes across processes. The stable refresh
 //! sidecar is held through publication; the cache write lock is held only while
 //! merging and publishing. Catalog locks must be released before entering here.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -170,6 +170,7 @@ pub fn hosts(catalog: &Catalog, catalog_path: &Path) -> Vec<AuthoredHost> {
 
 pub struct Scope {
     key: String,
+    remote_key: String,
     credentials: Vec<(String, String)>,
 }
 
@@ -207,11 +208,10 @@ pub fn scope(
                 branch.strip_prefix("refs/heads/").unwrap_or(branch),
             );
             let remote_key = match remote {
-                Ok(remote) => serde_json::to_string(&(
-                    remote.identity(),
-                    remote.graphql_url(),
-                    credential(&remote.host, &input.repository.path),
-                ))?,
+                Ok(remote) => {
+                    let token = credential(&remote.host, &input.repository.path);
+                    serde_json::to_string(&(remote.identity(), remote.graphql_url(), token))?
+                }
                 Err(error) => format!("unresolved:{error}"),
             };
             branches.push(serde_json::to_string(&(
@@ -235,11 +235,71 @@ pub fn scope(
     host_keys.sort();
     authentication.sort();
     authentication.dedup();
+    let remote_key = remote_scope(runner, credentials, inputs, hosts, discover)?;
     let key = fingerprint(&serde_json::to_vec(&(1, branches, host_keys, discover))?);
     Ok(Scope {
         key,
+        remote_key,
         credentials: authentication,
     })
+}
+
+/// Account/endpoint matching for cached PR data, without branch or trunk lookups.
+pub fn remote_scope(
+    runner: &dyn GitRunner,
+    credentials: &dyn CredentialProvider,
+    inputs: &[RepositoryGitHubInput],
+    hosts: &[AuthoredHost],
+    discover: bool,
+) -> Result<String, CacheError> {
+    let credential =
+        |host: &str, anchor: &Path| match github::resolve_token(credentials, host, anchor) {
+            Ok(token) => fingerprint(token.expose().as_bytes()),
+            Err(error) => format!("missing:{error}"),
+        };
+    let mut remote_keys = Vec::new();
+    for input in inputs {
+        // Remote cache identity must not depend on which worktrees exist or
+        // whether their current branches are refreshable (e.g. trunk/detached).
+        let mut remotes: BTreeSet<_> = input.repository.github_remotes.keys().cloned().collect();
+        remotes.extend(input.repository.github_remote.iter().cloned());
+        remotes.extend(input.repository.github_preferred_remote.iter().cloned());
+        if remotes.is_empty() {
+            remotes.insert("origin".to_owned());
+        }
+        for name in remotes {
+            if let Ok(url) = crate::git::run_git(
+                runner,
+                &input.repository.path,
+                &["remote".into(), "get-url".into(), name.into()],
+            ) && let Ok(remote) = github::parse_remote_url(&String::from_utf8_lossy(&url))
+            {
+                let token = credential(&remote.host, &input.repository.path);
+                remote_keys.push(serde_json::to_string(&(
+                    &remote.host,
+                    remote.graphql_url(),
+                    token,
+                ))?);
+            }
+        }
+    }
+    let mut host_keys = Vec::new();
+    for host in hosts {
+        host_keys.push(serde_json::to_string(&(
+            &host.host,
+            &host.graphql_url,
+            credential(&host.host, &host.credential_anchor),
+        ))?);
+    }
+    remote_keys.sort();
+    remote_keys.dedup();
+    host_keys.sort();
+    Ok(fingerprint(&serde_json::to_vec(&(
+        1,
+        remote_keys,
+        host_keys,
+        discover,
+    ))?))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -344,14 +404,21 @@ impl Outcome {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CachedRefresh {
     scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_scope: Option<String>,
     attempted_at: u64,
     pub successful_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot_at: Option<u64>,
     retry_after: u64,
     pub snapshot: Snapshot,
     pub outcome: Outcome,
 }
 
 impl CachedRefresh {
+    pub fn snapshot_at(&self) -> Option<u64> {
+        self.snapshot_at.or(self.successful_at)
+    }
     pub fn scope_id(&self) -> &str {
         &self.scope
     }
@@ -363,6 +430,14 @@ impl CachedRefresh {
                 .successful_at
                 .is_some_and(|at| at <= now && now - at < REUSE_SECONDS)
                 || now < self.retry_after)
+    }
+
+    fn reusable_for(&self, cache: &RemoteCache, scope: &Scope) -> bool {
+        self.reusable(epoch_seconds())
+            && !cache.refreshes.iter().any(|cached| {
+                cached.remote_scope.as_deref() == Some(&scope.remote_key)
+                    && cached.attempted_at > self.attempted_at
+            })
     }
 }
 
@@ -379,18 +454,49 @@ pub enum Event {
     Branches(GitHubRefresh),
     Authored(AuthoredRefreshEvent),
     Details(BTreeMap<CanonicalPullRequestId, Result<PullRequestDetails, GitHubError>>),
+    Refreshed(u64),
 }
 
 pub fn select(cache: &RemoteCache, scope: &Scope) -> Option<RemoteCache> {
-    cache
+    let local = cache
         .refreshes
         .iter()
-        .find(|cached| cached.scope == scope.key)
-        .map(|cached| {
-            let mut selected = cached.snapshot.cache();
-            selected.refreshes.push(cached.clone());
-            selected
-        })
+        .find(|cached| cached.scope == scope.key);
+    // PRs and their comments belong to a host/account, not a local HEAD or
+    // worktree. Reuse their newest snapshot without reusing branch associations
+    // or replaying a refresh outcome for different local state.
+    let cached = cache
+        .refreshes
+        .iter()
+        .filter(|cached| cached.remote_scope.as_deref() == Some(&scope.remote_key))
+        .max_by_key(|cached| cached.attempted_at)
+        .or(local)?;
+    Some(select_snapshot(cached, local))
+}
+
+pub fn select_remote(cache: &RemoteCache, remote_key: &str) -> Option<RemoteCache> {
+    let cached = cache
+        .refreshes
+        .iter()
+        .filter(|cached| cached.remote_scope.as_deref() == Some(remote_key))
+        .max_by_key(|cached| cached.attempted_at)?;
+    Some(select_snapshot(cached, None))
+}
+
+fn select_snapshot(cached: &CachedRefresh, local: Option<&CachedRefresh>) -> RemoteCache {
+    let mut selected = cached.snapshot.cache();
+    selected.branches.clear();
+    selected.active_pull_requests.clear();
+    let mut remote = cached.clone();
+    remote.outcome.branches = GitHubRefresh::default();
+    if let Some(local) = local {
+        selected.branches = local.snapshot.branches.clone();
+        selected.active_pull_requests = local.snapshot.active_pull_requests.clone();
+        remote.outcome.branches = local.outcome.branches.clone();
+    }
+    remote.snapshot = Snapshot::from_cache(selected.clone());
+    selected.refreshes.push(remote);
+    selected
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -418,13 +524,15 @@ pub fn run(
         let credentials = Credentials::new(credentials);
         let scope = scope(&runner, &credentials, inputs, hosts, discover)?;
         let cache = read_cache(path);
+        if let Some(baseline) = select(&cache, &scope) {
+            publish(Event::Baseline(baseline));
+        }
         if let Some(previous) = cache
             .refreshes
             .iter()
             .find(|cached| cached.scope == scope.key)
-            && previous.reusable(epoch_seconds())
+            && previous.reusable_for(&cache, &scope)
         {
-            publish(Event::Baseline(previous.snapshot.cache()));
             previous.outcome.replay(&mut publish);
             return Ok(());
         }
@@ -442,14 +550,13 @@ pub fn run(
         .refreshes
         .iter()
         .find(|cached| cached.scope == scope.key);
+    let baseline = select(&cache, &scope).unwrap_or_default();
+    publish(Event::Baseline(baseline.clone()));
     if let Some(previous) = previous {
-        publish(Event::Baseline(previous.snapshot.cache()));
-        if previous.reusable(epoch_seconds()) {
+        if previous.reusable_for(&cache, &scope) {
             previous.outcome.replay(&mut publish);
             return Ok(());
         }
-    } else {
-        publish(Event::Baseline(RemoteCache::default()));
     }
     service.clear_rate_limits();
     for limit in &cache.rate_limits {
@@ -498,9 +605,11 @@ pub fn run(
         return Err(CacheError::LockCancelled);
     }
     outcome.details = service.hydrate_pull_requests_with(&credentials, hosts, identities);
-    let mut retained = previous
-        .map(|previous| previous.snapshot.cache())
-        .unwrap_or_default();
+    let previous_snapshot_at = baseline
+        .refreshes
+        .first()
+        .and_then(CachedRefresh::snapshot_at);
+    let mut retained = baseline;
     retained.merge_branch_refresh(inputs, &outcome.branches);
     if discover && outcome.authored_complete {
         retained.replace_authored(outcome.authored.clone());
@@ -509,8 +618,14 @@ pub fn run(
     let now = epoch_seconds();
     let cached = CachedRefresh {
         scope: scope.key.clone(),
+        remote_scope: Some(scope.remote_key.clone()),
         attempted_at: now,
         successful_at: outcome.successful().then_some(now),
+        snapshot_at: if outcome.successful() {
+            Some(now)
+        } else {
+            previous_snapshot_at
+        },
         retry_after: if outcome.successful() {
             0
         } else {
@@ -552,6 +667,9 @@ pub fn run(
         outcome
             .warnings
             .push(format!("unable to persist remote cache: {error}"));
+    }
+    if outcome.successful() {
+        publish(Event::Refreshed(now));
     }
     publish(Event::Details(outcome.details));
     publish(Event::Authored(AuthoredRefreshEvent::Finished {
@@ -960,6 +1078,155 @@ mod tests {
     }
 
     #[test]
+    fn remote_data_loads_before_lock_wait_after_head_and_worktree_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("github.json");
+        let server = Server::new("200 OK", String::new());
+        let base = server.base.clone();
+        let inputs = [input(directory.path())];
+        fetch(&path, &base, &inputs, "test-secret", false);
+        let pr: AuthoredPullRequest = serde_json::from_value(serde_json::json!({
+            "identity": {"repository": {"host": base.trim_start_matches("http://"),
+                "owner": "team", "repository": "project"}, "number": 42},
+            "author": "viewer",
+            "pull_request": {"number": 42, "title": "cached title", "url": "https://example.com/pull/42",
+                "state": "open", "updated_at": "2026-01-01T00:00:00Z", "review_decision": null,
+                "auto_merge": false, "checks": "unknown",
+                "base": {"repository": "team/project", "branch": "main", "oid": "base"},
+                "head": {"repository": "team/project", "branch": "topic", "oid": "head-1"}}
+        })).unwrap();
+        let details: PullRequestDetails = serde_json::from_value(serde_json::json!({
+            "feedback": [{"id": "comment", "kind": "inline_thread", "author": "reviewer",
+                "body": "cached comment"}], "feedback_complete": true
+        }))
+        .unwrap();
+        let old = epoch_seconds() - 185;
+        cache::update(&path, |cache| {
+            let cached = &mut cache.refreshes[0];
+            cached.attempted_at = old;
+            cached.successful_at = Some(old);
+            cached.snapshot_at = Some(old);
+            cached.snapshot.authored_pull_requests.push(pr.clone());
+            cached
+                .snapshot
+                .pull_request_details
+                .push(CachedPullRequestDetails {
+                    identity: pr.identity.clone(),
+                    details: details.clone(),
+                });
+        })
+        .unwrap();
+        let mut changed = inputs.clone();
+        changed[0].worktrees[0].head = Some("new-head".to_owned());
+        changed[0].worktrees[0].path = directory.path().join("new-worktree");
+        changed[0].worktrees[0].branch = Some("refs/heads/renamed-topic".to_owned());
+        let git = Git(base.clone());
+        let hosts = [host(&base, directory.path())];
+        let scope = scope(&git, &Token("test-secret"), &changed, &hosts, false).unwrap();
+        let cache = cache::load(&path).unwrap();
+        let selected = select(&cache, &scope).unwrap();
+        struct RemoteOnly<'a>(&'a Git);
+        impl GitRunner for RemoteOnly<'_> {
+            fn run(&self, path: &Path, args: &[OsString]) -> Result<CommandOutput, GitError> {
+                assert_eq!(
+                    args[0], "remote",
+                    "cache loading must not query local branches"
+                );
+                self.0.run(path, args)
+            }
+        }
+        let remote_key = remote_scope(
+            &RemoteOnly(&git),
+            &Token("test-secret"),
+            &changed,
+            &hosts,
+            false,
+        )
+        .unwrap();
+        let early = select_remote(&cache, &remote_key).unwrap();
+        assert_eq!(early.pull_request_details[0].details, details);
+        assert_eq!(early.authored_pull_requests, vec![pr.clone()]);
+        assert!(early.branches.is_empty());
+        assert_eq!(selected.authored_pull_requests, vec![pr.clone()]);
+        assert_eq!(selected.pull_request_details[0].details, details);
+        assert!(selected.branches.is_empty());
+        assert!(selected.refreshes[0].outcome.branches.branches.is_empty());
+        assert_eq!(selected.refreshes[0].snapshot_at(), Some(old));
+        let mut no_worktrees = changed.clone();
+        no_worktrees[0].worktrees.clear();
+        let without_worktrees =
+            super::scope(&git, &Token("test-secret"), &no_worktrees, &hosts, false).unwrap();
+        assert_eq!(without_worktrees.remote_key, scope.remote_key);
+        assert_eq!(
+            select(&cache, &without_worktrees)
+                .unwrap()
+                .pull_request_details[0]
+                .details,
+            details
+        );
+        let original_scope =
+            super::scope(&git, &Token("test-secret"), &inputs, &hosts, false).unwrap();
+        let mut newer_cache = cache.clone();
+        let mut newer = newer_cache.refreshes[0].clone();
+        newer.scope = scope.key.clone();
+        newer.attempted_at += 1;
+        newer.snapshot.authored_pull_requests[0].pull_request.title =
+            "newer remote title".to_owned();
+        newer_cache.refreshes.push(newer);
+        let newest = select(&newer_cache, &original_scope).unwrap();
+        assert_eq!(
+            newest.authored_pull_requests[0].pull_request.title,
+            "newer remote title"
+        );
+        assert_eq!(newest.branches.len(), 1);
+        let other_account =
+            super::scope(&git, &Token("other-account"), &changed, &hosts, false).unwrap();
+        assert!(select(&cache, &other_account).is_none());
+        let other_host = super::scope(
+            &Git("http://localhost:9999".to_owned()),
+            &Token("test-secret"),
+            &changed,
+            &hosts,
+            false,
+        )
+        .unwrap();
+        assert!(select(&cache, &other_host).is_none());
+
+        // The baseline must be available even when a different process owns
+        // network refresh. Cancel as soon as it arrives to avoid waiting.
+        let lock = acquire_lock(&path, || false).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let result = run(
+            &path,
+            &GitHubService::new(),
+            &git,
+            &Token("test-secret"),
+            &changed,
+            &hosts,
+            false,
+            || cancelled.load(Ordering::SeqCst),
+            |event| {
+                if let Event::Baseline(cache) = event {
+                    assert_eq!(cache.pull_request_details[0].details, details);
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(matches!(result, Err(CacheError::LockCancelled)));
+        drop(lock);
+        drop(server);
+
+        // An offline refresh must carry the comments and their original age
+        // into the new local scope rather than saving an empty snapshot.
+        fetch(&path, &base, &changed, "test-secret", false);
+        let selected = select(&cache::load(&path).unwrap(), &scope).unwrap();
+        assert_eq!(selected.authored_pull_requests, vec![pr]);
+        assert_eq!(selected.pull_request_details[0].details, details);
+        assert_eq!(selected.refreshes[0].snapshot_at(), Some(old));
+    }
+
+    #[test]
     fn scope_matches_head_hosts_credentials_and_requested_discovery() {
         let inputs = [input(Path::new("/repo"))];
         let git = Git("http://localhost:9999".to_owned());
@@ -1155,8 +1422,10 @@ mod tests {
         let now = epoch_seconds();
         let future = CachedRefresh {
             scope: String::new(),
+            remote_scope: None,
             attempted_at: now + 20,
             successful_at: Some(now + 20),
+            snapshot_at: None,
             retry_after: 0,
             snapshot: Snapshot::default(),
             outcome: Outcome::default(),

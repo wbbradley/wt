@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(test))]
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -352,7 +352,7 @@ pub fn load_changed(
         path: path.to_owned(),
         source,
     };
-    let file = match File::open(path) {
+    let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(read_error(error)),
@@ -373,8 +373,11 @@ pub fn load_changed(
     }
     // Read the same opened file we inspected, even if another process replaces
     // the pathname meanwhile. Atomic publication keeps this snapshot complete.
+    // Parsing a byte slice avoids the per-byte reader overhead on large caches.
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents).map_err(read_error)?;
     let cache: RemoteCache =
-        serde_json::from_reader(BufReader::new(file)).map_err(|source| CacheError::Parse {
+        serde_json::from_slice(&contents).map_err(|source| CacheError::Parse {
             path: path.to_owned(),
             source,
         })?;

@@ -54,6 +54,10 @@ struct LocalSnapshot {
 }
 
 enum GitHubMessage {
+    Refreshed {
+        generation: u64,
+        completed_at: u64,
+    },
     Baseline {
         generation: u64,
         cache: cache::RemoteCache,
@@ -253,7 +257,7 @@ fn run_with_startup_deletion(
     app.set_committed_filter(initial_filter);
     let mut controller = Controller::new(catalog_path, catalog, app);
     controller.relocation_destination = relocation_destination;
-    controller.load_remote_cache();
+    controller.request_github_refresh();
     let _panic_hook = PanicHookGuard::install();
     let mut terminal = InteractiveTerminal::open()?;
     if let Some((repository, worktree)) = deletion {
@@ -269,7 +273,6 @@ fn run_with_startup_deletion(
         controller.reload_catalog_and_worktrees()?;
     }
     controller.start_status_refresh(true);
-    controller.request_github_refresh();
     terminal
         .terminal_mut()
         .draw(|frame| ui::render(frame, &mut controller.app))?;
@@ -559,6 +562,7 @@ impl Controller {
         controller
     }
 
+    #[cfg(test)]
     fn load_remote_cache(&mut self) {
         let (revision, remote_cache) = match cache::load_changed(&self.remote_cache_path, None) {
             Ok(Some(snapshot)) => snapshot,
@@ -618,7 +622,7 @@ impl Controller {
                 .collect(),
         );
         if let Some(shared) = remote_cache.refreshes.first() {
-            if let Some(completed_at) = shared.successful_at {
+            if let Some(completed_at) = shared.snapshot_at() {
                 let now_epoch = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -634,8 +638,10 @@ impl Controller {
                     let age = Duration::from_secs(now_epoch - completed_at);
                     let now = Instant::now();
                     self.app.last_refresh = now.checked_sub(age);
-                    self.next_github_refresh =
-                        now + self.github_refresh_interval.saturating_sub(age);
+                    if !self.github_in_flight {
+                        self.next_github_refresh =
+                            now + self.github_refresh_interval.saturating_sub(age);
+                    }
                     self.github_last_shared_success =
                         Some((shared.scope_id().to_owned(), completed_at));
                 }
@@ -1526,7 +1532,8 @@ impl Controller {
                     if cache.refreshes.is_empty() {
                         snapshot.remote_cache = Some((generation, revision, cache));
                     } else {
-                        let inputs = github_inputs_for_repositories(&snapshot.repositories);
+                        let mut inputs = github_inputs_for_repositories(&snapshot.repositories);
+                        resolve_trunk_branches(&mut inputs);
                         let hosts = crate::refresh::hosts(&snapshot.catalog, &catalog_path);
                         let credentials = crate::refresh::Credentials::new(&SystemCredentials);
                         let scope = crate::refresh::scope(
@@ -1622,6 +1629,44 @@ impl Controller {
         let cancelled = self.github_cancelled.clone();
         std::thread::spawn(move || {
             let mut inputs = inputs;
+            // Load account-matched remote data before catalog-lock waits,
+            // remote-identity maintenance, or network refresh ownership.
+            let cache_started = Instant::now();
+            if let Ok(cache) = cache::load(&remote_cache_path) {
+                tracing::debug!(
+                    elapsed_ms = cache_started.elapsed().as_millis(),
+                    "startup remote cache read"
+                );
+                let hosts = crate::refresh::hosts(&fallback_catalog, &catalog_path);
+                let credentials = crate::refresh::Credentials::new(&SystemCredentials);
+                let selected = if cache.refreshes.is_empty() {
+                    Some(cache)
+                } else {
+                    crate::refresh::remote_scope(
+                        &SystemGit,
+                        &credentials,
+                        &inputs,
+                        &hosts,
+                        discover_authored_pull_requests,
+                    )
+                    .ok()
+                    .and_then(|scope| crate::refresh::select_remote(&cache, &scope))
+                };
+                tracing::debug!(
+                    elapsed_ms = cache_started.elapsed().as_millis(),
+                    matched = selected.is_some(),
+                    "startup remote cache selected"
+                );
+                if let Some(cache) = selected {
+                    let _ = sender.send(GitHubMessage::Baseline {
+                        generation,
+                        cache,
+                        cache_updates: Vec::new(),
+                        bindings: github_bindings(&inputs),
+                    });
+                }
+            }
+            resolve_trunk_branches(&mut inputs);
             let refreshable_paths = inputs
                 .iter()
                 .map(|input| input.repository.path.clone())
@@ -1697,6 +1742,12 @@ impl Controller {
                 || cancelled.load(Ordering::Relaxed),
                 |event| {
                     let message = match event {
+                        crate::refresh::Event::Refreshed(completed_at) => {
+                            GitHubMessage::Refreshed {
+                                generation,
+                                completed_at,
+                            }
+                        }
                         crate::refresh::Event::Baseline(cache) => GitHubMessage::Baseline {
                             generation,
                             cache,
@@ -1830,6 +1881,22 @@ impl Controller {
         }
         while let Ok(message) = self.github_receiver.try_recv() {
             match message {
+                GitHubMessage::Refreshed {
+                    generation,
+                    completed_at,
+                } => {
+                    if generation == self.app.github_generation {
+                        let now_epoch = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if completed_at <= now_epoch {
+                            self.app.last_refresh = Instant::now()
+                                .checked_sub(Duration::from_secs(now_epoch - completed_at));
+                            changed = true;
+                        }
+                    }
+                }
                 GitHubMessage::Baseline {
                     generation,
                     cache,
@@ -1923,9 +1990,6 @@ impl Controller {
                             .authored_pull_requests
                             .finish(generation, complete, warnings, error);
                         changed |= applied;
-                        if applied && complete {
-                            self.app.last_refresh = Some(Instant::now());
-                        }
                         self.refresh_authored_mappings();
                         self.github_in_flight = false;
                         self.app.progress = None;
@@ -2310,7 +2374,12 @@ impl Controller {
             &mapping_catalog,
             self.app.authored_pull_requests.identities(),
             &self.app.active_pull_requests,
-            |repository| git::resolve_repository(&SystemGit, &repository.path).is_ok(),
+            |repository| {
+                self.app
+                    .repositories
+                    .iter()
+                    .any(|view| view.config.path == repository.path && view.stale_error.is_none())
+            },
         );
         self.app.rebuild_virtual_repositories();
     }
@@ -2499,13 +2568,21 @@ fn github_inputs_for_repositories(repositories: &[RepositoryView]) -> Vec<Reposi
         .iter()
         .filter(|repository| repository.stale_error.is_none())
         .map(|repository| RepositoryGitHubInput {
-            trunk_branch: crate::github::remote_trunk_branch(&SystemGit, &repository.config)
-                .ok()
-                .flatten(),
+            trunk_branch: None,
             repository: repository.config.clone(),
             worktrees: repository.worktrees.clone(),
         })
         .collect()
+}
+
+/// Trunk discovery is enrichment for background GitHub requests. Comparing
+/// cached bindings uses the branch/HEAD already present in the local snapshot.
+fn resolve_trunk_branches(inputs: &mut [RepositoryGitHubInput]) {
+    for input in inputs {
+        input.trunk_branch = crate::github::remote_trunk_branch(&SystemGit, &input.repository)
+            .ok()
+            .flatten();
+    }
 }
 
 /// Names a worktree for a status message: its directory name, falling back to
@@ -3486,6 +3563,54 @@ mod tests {
     }
 
     #[test]
+    fn cached_pr_mapping_uses_local_discovery_snapshot_until_the_next_local_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        run_git_command(
+            directory.path(),
+            &["init", "--quiet", root.to_str().unwrap()],
+        );
+        let root = std::fs::canonicalize(root).unwrap();
+        let pr = test_authored_pull_request("viewer");
+        let repository = RepositoryConfig {
+            path: root.clone(),
+            label: None,
+            worktree_root: None,
+            github_remote: Some("origin".to_owned()),
+            github_remotes: [("origin".to_owned(), pr.identity.repository.clone())].into(),
+            github_preferred_remote: Some("origin".to_owned()),
+        };
+        let catalog = Catalog {
+            repositories: vec![repository],
+            ..Catalog::default()
+        };
+        let outside = directory.path().to_owned();
+        let mut app = App::new(load_repository_views(&catalog, &outside), outside.clone());
+        app.authored_pull_requests.hydrate(vec![pr]);
+        let mut controller =
+            Controller::new(directory.path().join("wt.json"), catalog.clone(), app);
+        std::fs::remove_dir_all(root.join(".git")).unwrap();
+        // Ingesting remote data uses the already validated local snapshot;
+        // it must not run Git again for every PR/repository pair.
+        controller.refresh_authored_mappings();
+        assert_eq!(
+            controller.app.authored_mappings[0]
+                .mapped_repository
+                .as_ref(),
+            Some(&root)
+        );
+        controller
+            .app
+            .replace_repositories(load_repository_views(&catalog, &outside));
+        controller.refresh_authored_mappings();
+        assert!(
+            controller.app.authored_mappings[0]
+                .mapped_repository
+                .is_none()
+        );
+    }
+
+    #[test]
     fn session_only_worktree_retains_pr_mapping_across_refresh_and_reload() {
         use crate::model::GitHubBranchData;
 
@@ -3899,6 +4024,15 @@ mod tests {
                 Ok(details.clone()),
             )]));
             cache.refreshes[0].snapshot = crate::refresh::Snapshot::from_cache(retained);
+            let old = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - 185;
+            let mut snapshot = serde_json::to_value(&cache.refreshes[0]).unwrap();
+            snapshot["snapshot_at"] = serde_json::json!(old);
+            snapshot["successful_at"] = serde_json::json!(old);
+            cache.refreshes[0] = serde_json::from_value(snapshot).unwrap();
         })
         .unwrap();
         controller.next_github_refresh = Instant::now() + Duration::from_secs(10);
@@ -3914,7 +4048,13 @@ mod tests {
         assert!(controller.remote_cache_revision.is_some());
         assert_eq!(controller.app.pull_request_details[&identity], details);
         assert!(controller.next_github_refresh > old_deadline);
-        assert_eq!(controller.app.minutes_since_last_refresh(), Some(0));
+        assert_eq!(controller.app.minutes_since_last_refresh(), Some(3));
+        assert!(
+            controller
+                .next_github_refresh
+                .duration_since(Instant::now())
+                <= Duration::from_secs(115)
+        );
 
         std::fs::write(&controller.remote_cache_path, "corrupt cache").unwrap();
         controller.request_local_refresh(false).unwrap();
@@ -4127,6 +4267,16 @@ mod tests {
         let generation = controller.app.authored_pull_requests.begin();
         controller
             .github_sender
+            .send(GitHubMessage::Refreshed {
+                generation: controller.app.github_generation,
+                completed_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            })
+            .unwrap();
+        controller
+            .github_sender
             .send(GitHubMessage::Authored {
                 generation,
                 event: AuthoredRefreshEvent::Finished {
@@ -4140,6 +4290,34 @@ mod tests {
         assert!(controller.pump_background_results());
         assert_eq!(controller.app.minutes_since_last_refresh(), Some(0));
         assert_eq!(controller.displayed_refresh_age_minutes, Some(0));
+    }
+
+    #[test]
+    fn replayed_refresh_keeps_cached_age_instead_of_resetting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            App::new(Vec::new(), directory.path().to_owned()),
+        );
+        controller.app.last_refresh = Some(Instant::now() - Duration::from_secs(185));
+        controller.next_github_refresh = Instant::now() + Duration::from_secs(60);
+        controller.github_in_flight = true;
+        let generation = controller.app.authored_pull_requests.begin();
+        controller
+            .github_sender
+            .send(GitHubMessage::Authored {
+                generation,
+                event: AuthoredRefreshEvent::Finished {
+                    complete: true,
+                    warnings: Vec::new(),
+                    error: None,
+                },
+            })
+            .unwrap();
+        assert!(controller.pump_background_results());
+        assert_eq!(controller.app.minutes_since_last_refresh(), Some(3));
+        assert_eq!(controller.displayed_refresh_age_minutes, Some(3));
     }
 
     #[test]
