@@ -424,7 +424,7 @@ mod tests {
         let mut catalog = load(&path).unwrap();
         assert_eq!(catalog.open_command, None);
         catalog.open_command = Some(
-            ["/path with spaces/open", "--host", "obsidian", ""]
+            ["/path with spaces/open", "--host", "mac.example.test", ""]
                 .map(str::to_owned)
                 .to_vec(),
         );
@@ -458,9 +458,15 @@ mod tests {
         let encoded: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(encoded.get("copy_command").is_none());
         catalog.copy_command = Some(
-            ["/path with spaces/copy", "obsidian", "", "$HOME", "a; b"]
-                .map(str::to_owned)
-                .to_vec(),
+            [
+                "/path with spaces/copy",
+                "mac.example.test",
+                "",
+                "$HOME",
+                "a; b",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
         );
         save(&path, &catalog).unwrap();
         assert_eq!(load(&path).unwrap(), catalog);

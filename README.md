@@ -162,10 +162,10 @@ It is a JSON array containing an executable and its literal arguments; the copie
 text is sent unchanged on stdin. For example, to use a clipboard helper:
 
 ```sh
-wt config set copy-command tmux-copy-mac obsidian
+wt config set copy-command tmux-copy-mac mac.example.test
 ```
 
-This saves `"copy_command": ["tmux-copy-mac", "obsidian"]` in `~/.config/wt.json`.
+This saves `"copy_command": ["tmux-copy-mac", "mac.example.test"]` in `~/.config/wt.json`.
 Use an executable on `PATH` or an absolute path. Arguments are passed directly,
 without shell expansion, pipelines, or redirection. The configured command keeps
 the same background execution, timeout, cancellation, and tmux-buffer fallback.
@@ -175,8 +175,8 @@ default. Configuration changes are picked up by the next local refresh.
 
 The optional global `open_command` works similarly for every URL-opening path:
 `w`, Enter on inline links, and the browser action in the palette. Configure it
-with `wt config set open-command open-on-mac --host obsidian`, which saves
-`"open_command": ["open-on-mac", "--host", "obsidian"]`. The URL is appended as
+with `wt config set open-command open-on-mac --host mac.example.test`, which saves
+`"open_command": ["open-on-mac", "--host", "mac.example.test"]`. The URL is appended as
 one literal argument after the configured arguments, without shell evaluation.
 Omit the setting or use `null` to restore `open` on macOS, `cmd /C start` on
 Windows, or `xdg-open` elsewhere. Changes apply at the next local refresh.

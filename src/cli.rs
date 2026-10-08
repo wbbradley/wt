@@ -1446,12 +1446,12 @@ mod tests {
             "open-command",
             "/path with spaces/open",
             "--host",
-            "obsidian",
+            "mac.example.test",
         ])
         .unwrap();
         run_with(&SystemGit, &path, cli).unwrap();
         expected.open_command = Some(
-            ["/path with spaces/open", "--host", "obsidian"]
+            ["/path with spaces/open", "--host", "mac.example.test"]
                 .map(str::to_owned)
                 .to_vec(),
         );
