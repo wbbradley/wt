@@ -2507,8 +2507,7 @@ impl App {
             RowId::Backburner(identity) => Some(FocusTarget::Backburner(identity.clone())),
             _ => self.branch_for_row_id(selected).map(FocusTarget::Branch),
         };
-        self.scroll = 0;
-        self.ensure_selection_visible();
+        self.set_committed_filter("");
     }
 
     fn clear_focus(&mut self) {
@@ -6241,7 +6240,62 @@ mod tests {
     }
 
     #[test]
-    fn focus_mode_composes_with_search_and_clears_when_target_disappears() {
+    fn focus_mode_clears_search_and_restores_saved_folds() {
+        let mut app = App::new(
+            vec![repository("/alpha", true), repository("/beta", true)],
+            PathBuf::from("/elsewhere"),
+        );
+        let repository_id = RowId::Repository(PathBuf::from("/alpha"));
+        let branch_key = DisclosureKey::Branch(BranchId::Worktree(PathBuf::from("/alpha-topic")));
+        app.set_disclosure_expanded(branch_key.clone(), false);
+        let saved_folds = app.disclosure_expanded.clone();
+
+        for _ in 0..2 {
+            app.set_committed_filter("^topic$");
+            assert!(
+                !app.visible_rows()
+                    .iter()
+                    .any(|row| { row.id() == &RowId::Worktree(PathBuf::from("/alpha")) })
+            );
+            app.filter_expanded.insert(branch_key.clone());
+            app.filter_collapsed
+                .insert(DisclosureKey::Repository(PathBuf::from("/beta")));
+            app.selected = Some(repository_id.clone());
+
+            assert_eq!(app.handle_key(key(KeyCode::Char('f'))), Intent::None);
+            assert_eq!(
+                app.focus_target,
+                Some(FocusTarget::Repository(PathBuf::from("/alpha")))
+            );
+            assert!(!app.filter_mode());
+            assert!(app.filter_collapsed.is_empty());
+            assert!(app.filter_expanded.is_empty());
+            assert_eq!(app.disclosure_expanded, saved_folds);
+            assert_eq!(app.selected, Some(repository_id.clone()));
+            assert_eq!(
+                app.visible_rows()
+                    .iter()
+                    .map(|row| row.id().clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    repository_id.clone(),
+                    RowId::Worktree(PathBuf::from("/alpha")),
+                    RowId::Worktree(PathBuf::from("/alpha-topic")),
+                ]
+            );
+        }
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.is_focused());
+        assert!(!app.filter_mode());
+        assert!(
+            app.visible_rows()
+                .iter()
+                .any(|row| { row.id() == &RowId::Repository(PathBuf::from("/beta")) })
+        );
+    }
+
+    #[test]
+    fn focus_mode_allows_new_search_and_clears_when_target_disappears() {
         let parent = authored("team", "project", 1, "2026-01-01");
         let unrelated = authored("team", "project", 2, "2026-01-02");
         let mut app = App::new(Vec::new(), PathBuf::from("/elsewhere"));

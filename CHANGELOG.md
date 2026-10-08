@@ -10,6 +10,7 @@
 
 ### Fixed
 
+- Clear the committed search and its temporary fold overrides when focusing an item with `f`.
 - Stop the TUI from hanging after a removal is confirmed.
 - Refuse worktree actions and navigation on a worktree that is being removed, and skip its status refresh, rather than acting on a half-deleted checkout. A failed removal restores the row's normal rendering and reports the reason.
 
