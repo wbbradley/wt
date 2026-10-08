@@ -2,7 +2,7 @@ use std::io::{Seek, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::background::JobContext;
+use crate::background::{JobContext, terminate_child};
 
 const COPY_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -11,16 +11,37 @@ pub trait Clipboard: Send + Sync {
     fn copy(&self, contents: &str, context: &JobContext) -> Result<(), String>;
 }
 
-pub struct SystemClipboard;
+pub struct SystemClipboard {
+    copy_command: Option<Vec<String>>,
+}
+
+impl SystemClipboard {
+    pub fn new(copy_command: Option<Vec<String>>) -> Self {
+        Self { copy_command }
+    }
+
+    fn system_command(&self) -> Result<Command, String> {
+        if let Some(arguments) = &self.copy_command {
+            let (program, arguments) = arguments
+                .split_first()
+                .ok_or("copy_command must name an executable")?;
+            let mut command = Command::new(program);
+            command.args(arguments);
+            return Ok(command);
+        }
+        #[cfg(target_os = "macos")]
+        let command = Command::new("pbcopy");
+        #[cfg(target_os = "windows")]
+        let command = Command::new("clip");
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let command = Command::new("wl-copy");
+        Ok(command)
+    }
+}
 
 impl Clipboard for SystemClipboard {
     fn copy(&self, contents: &str, context: &JobContext) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        let mut command = Command::new("pbcopy");
-        #[cfg(target_os = "windows")]
-        let mut command = Command::new("clip");
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let mut command = Command::new("wl-copy");
+        let mut command = self.system_command()?;
         let mut tmux = std::env::var_os("TMUX")
             .filter(|value| !value.is_empty())
             .map(|_| {
@@ -85,6 +106,11 @@ fn copy_with_command(
         .rewind()
         .map_err(|error| format!("cannot rewind clipboard contents: {error}"))?;
     check()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .stdin(Stdio::from(input))
         // stdout is the shell integration's directory-selection channel.
@@ -110,7 +136,7 @@ fn copy_with_command(
             Err(error) => break Err(format!("cannot wait for clipboard command: {error}")),
         }
     };
-    let _ = child.kill();
+    terminate_child(&mut child);
     let _ = child.wait();
     result
 }
@@ -119,6 +145,67 @@ fn copy_with_command(
 mod tests {
     use super::*;
     use crate::background::{BackgroundJob, JobError, JobMessage};
+
+    #[test]
+    fn configured_command_preserves_executable_arguments_and_stdin() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("copied text");
+        let contents = "quotes ' \" $(touch unwanted)\nUnicode: λ\0\n\n";
+        let arguments = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "test \"$2\" = '$HOME; literal' && cat > \"$1\"".to_owned(),
+            "clipboard-test".to_owned(),
+            output.to_str().unwrap().to_owned(),
+            "$HOME; literal".to_owned(),
+        ];
+        let clipboard = SystemClipboard::new(Some(arguments));
+        let mut command = clipboard.system_command().unwrap();
+        let job = BackgroundJob::spawn("configured-clipboard", move |context| {
+            copy_to_clipboards(None, &mut command, contents, &context)
+        })
+        .unwrap();
+        assert!(finish(&job).is_ok());
+        assert_eq!(std::fs::read_to_string(output).unwrap(), contents);
+    }
+
+    #[test]
+    fn default_backend_and_literal_program_path() {
+        let command = SystemClipboard::new(None).system_command().unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(command.get_program(), "pbcopy");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(command.get_program(), "wl-copy");
+        let command = SystemClipboard::new(Some(vec![
+            "/path with spaces/copy".to_owned(),
+            "two words".to_owned(),
+        ]))
+        .system_command()
+        .unwrap();
+        assert_eq!(command.get_program(), "/path with spaces/copy");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["two words"]);
+    }
+
+    #[test]
+    fn configured_command_failure_and_timeout_are_reported() {
+        for (script, expected) in [("exit 7", "exited"), ("exec sleep 30", "timed out")] {
+            let clipboard =
+                SystemClipboard::new(Some(["sh", "-c", script].map(str::to_owned).to_vec()));
+            let mut command = clipboard.system_command().unwrap();
+            let job = BackgroundJob::spawn("configured-clipboard-failure", move |context| {
+                copy_with_command(
+                    &mut command,
+                    "contents",
+                    &context,
+                    Duration::from_millis(100),
+                )
+            })
+            .unwrap();
+            assert!(
+                matches!(finish(&job), Err(JobError::Failed(error)) if error.contains(expected))
+            );
+        }
+    }
 
     fn run(script: &str, contents: String, timeout: Duration) -> Result<(), JobError> {
         let script = script.to_owned();
@@ -241,6 +328,35 @@ mod tests {
         assert!(
             matches!(run("cat >/dev/null; exec sleep 30", "contents".into(), Duration::from_millis(100)), Err(JobError::Failed(error)) if error.contains("timed out"))
         );
+    }
+
+    #[test]
+    fn timeout_kills_descendants_of_configured_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("descendant-finished");
+        let script = "(sleep 0.3; echo survived > \"$1\") & wait";
+        let clipboard = SystemClipboard::new(Some(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "clipboard-test".to_owned(),
+            marker.to_str().unwrap().to_owned(),
+        ]));
+        let mut command = clipboard.system_command().unwrap();
+        let job = BackgroundJob::spawn("clipboard-descendants", move |context| {
+            copy_with_command(
+                &mut command,
+                "contents",
+                &context,
+                Duration::from_millis(100),
+            )
+        })
+        .unwrap();
+        assert!(
+            matches!(finish(&job), Err(JobError::Failed(error)) if error.contains("timed out"))
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!marker.exists(), "descendant survived clipboard timeout");
     }
 
     #[test]
