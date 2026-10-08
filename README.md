@@ -157,6 +157,37 @@ For `p`, a leaf or non-stacking section selects its owning PR and container scop
 
 When running inside tmux (`$TMUX` is set), `c` and `p` first copy to the tmux paste buffer, available with `prefix ]`, then attempt the system clipboard. Copying succeeds if either destination works, including over SSH without a system clipboard. Clipboard copies run in the background and each command times out after five seconds if it stalls. Navigation and quitting remain available; additional `c` or `p` presses are ignored while a copy is pending.
 
+Set the optional global `copy_command` to replace the system clipboard backend.
+It is a JSON array containing an executable and its literal arguments; the copied
+text is sent unchanged on stdin. For example, to use a clipboard helper:
+
+```sh
+wt config set copy-command tmux-copy-mac obsidian
+```
+
+This saves `"copy_command": ["tmux-copy-mac", "obsidian"]` in `~/.config/wt.json`.
+Use an executable on `PATH` or an absolute path. Arguments are passed directly,
+without shell expansion, pipelines, or redirection. The configured command keeps
+the same background execution, timeout, cancellation, and tmux-buffer fallback.
+Without this setting (or with `null`), wt uses `pbcopy` on macOS, `clip` on Windows,
+and `wl-copy` elsewhere. Remove the setting or set it to `null` to restore that
+default. Configuration changes are picked up by the next local refresh.
+
+The optional global `open_command` works similarly for every URL-opening path:
+`w`, Enter on inline links, and the browser action in the palette. Configure it
+with `wt config set open-command open-on-mac --host obsidian`, which saves
+`"open_command": ["open-on-mac", "--host", "obsidian"]`. The URL is appended as
+one literal argument after the configured arguments, without shell evaluation.
+Omit the setting or use `null` to restore `open` on macOS, `cmd /C start` on
+Windows, or `xdg-open` elsewhere. Changes apply at the next local refresh.
+
+URL openers run in a cancellable background job with a five-second command
+deadline. Navigation and quitting remain available; additional open requests
+are ignored while an opener is pending. Successful launchers may leave browser
+processes running, while timeout or cancellation kills the launcher's process
+group. The `open-on-mac` helper detaches its own worker and applies its shorter
+one-second SSH deadline before attempting a local browser fallback.
+
 ```text
 In feature/login (#42 Fix login race):
 

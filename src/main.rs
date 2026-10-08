@@ -15,6 +15,7 @@ mod logging;
 mod materialize;
 mod merged_cleanup;
 mod model;
+mod opener;
 mod operations;
 mod prompt;
 mod refresh;

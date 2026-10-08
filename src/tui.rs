@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -25,6 +25,7 @@ use crate::github::{
     SystemCredentials,
 };
 use crate::model::{Catalog, RepositoryConfig, Worktree};
+use crate::opener::{SystemUrlOpener, UrlOpener};
 use crate::operations::{self, CreateMode};
 use crate::state::{self, PersistentState};
 use crate::terminal::{InteractiveTerminal, PanicHookGuard};
@@ -371,41 +372,6 @@ enum ControlFlow {
     EditFile(PathBuf),
 }
 
-trait UrlOpener: Send + Sync {
-    fn open(&self, url: &str) -> Result<(), String>;
-}
-
-struct SystemUrlOpener;
-
-impl UrlOpener for SystemUrlOpener {
-    fn open(&self, url: &str) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        let mut command = Command::new("open");
-        #[cfg(target_os = "windows")]
-        let mut command = {
-            let mut command = Command::new("cmd");
-            command.args(["/C", "start", ""]);
-            command
-        };
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let mut command = Command::new("xdg-open");
-        // Browser descendants can keep these handles after the opener exits.
-        // Keep their diagnostics and input away from the active TUI.
-        let status = command
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let status = status.map_err(|error| format!("cannot launch URL opener: {error}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("URL opener exited with {status}"))
-        }
-    }
-}
-
 struct MaterializationOutcome {
     path: PathBuf,
 }
@@ -427,6 +393,12 @@ struct ClipboardCopy {
     job: BackgroundJob<()>,
     success_message: &'static str,
     error_prefix: &'static str,
+    show_feedback: bool,
+}
+
+struct UrlOpen {
+    job: BackgroundJob<()>,
+    url: String,
     show_feedback: bool,
 }
 
@@ -466,6 +438,7 @@ struct Controller {
     completed_creation: Option<PathBuf>,
     relocation_destination: Option<PathBuf>,
     url_opener: Arc<dyn UrlOpener>,
+    url_open: Option<UrlOpen>,
     clipboard: Arc<dyn Clipboard>,
     clipboard_copy: Option<ClipboardCopy>,
     state_path: PathBuf,
@@ -483,6 +456,8 @@ impl Controller {
             .map(|parallelism| parallelism.get().min(4))
             .unwrap_or(2);
         let github_refresh_interval = github_refresh_interval(&catalog);
+        let clipboard = Arc::new(SystemClipboard::new(catalog.copy_command.clone()));
+        let url_opener = Arc::new(SystemUrlOpener::new(catalog.open_command.clone()));
         let (github_sender, github_receiver) = mpsc::channel();
         let remote_cache_path = cache::path(&catalog_path);
         let state_path = state::path(&catalog_path);
@@ -525,8 +500,9 @@ impl Controller {
             completed_materialization: None,
             completed_creation: None,
             relocation_destination: None,
-            url_opener: Arc::new(SystemUrlOpener),
-            clipboard: Arc::new(SystemClipboard),
+            url_opener,
+            url_open: None,
+            clipboard,
             clipboard_copy: None,
             state_path,
         };
@@ -722,6 +698,17 @@ impl Controller {
     }
 
     fn handle_intent(&mut self, intent: Intent) -> Result<ControlFlow, TuiError> {
+        if !matches!(
+            intent,
+            Intent::None | Intent::OpenUrl(_) | Intent::BeginAction(Action::OpenPullRequestWeb)
+        ) {
+            if let Some(open) = &mut self.url_open {
+                open.show_feedback = false;
+                if self.app.progress.as_deref() == Some("opening in browser…") {
+                    self.app.progress = None;
+                }
+            }
+        }
         if !matches!(
             intent,
             Intent::None
@@ -1079,9 +1066,44 @@ impl Controller {
     }
 
     fn open_url(&mut self, url: &str) {
-        if let Err(error) = self.url_opener.open(url) {
-            self.app.inline_error = Some(format!("unable to open {url}: {error}"));
+        if self.url_open.is_some() {
+            return;
         }
+        let opener = Arc::clone(&self.url_opener);
+        let target = url.to_owned();
+        match BackgroundJob::spawn("wt-url-open", move |context| opener.open(&target, &context)) {
+            Ok(job) => {
+                self.url_open = Some(UrlOpen {
+                    job,
+                    url: url.to_owned(),
+                    show_feedback: true,
+                });
+                self.app.progress = Some("opening in browser…".to_owned());
+            }
+            Err(error) => self.app.inline_error = Some(format!("unable to open {url}: {error}")),
+        }
+    }
+
+    fn pump_url_open(&mut self) -> bool {
+        let result = self.url_open.as_ref().and_then(|open| open.job.try_recv());
+        let Some(JobMessage::Finished(result)) = result else {
+            return false;
+        };
+        let open = self.url_open.take().unwrap();
+        let owns_progress = self.app.progress.as_deref() == Some("opening in browser…");
+        if owns_progress {
+            self.app.progress = None;
+        }
+        if open.show_feedback && owns_progress && self.app.inline_error.is_none() {
+            if let Err(error) = result {
+                let message = match error {
+                    JobError::Failed(message) => message,
+                    JobError::Cancelled => "URL opening cancelled".to_owned(),
+                };
+                self.app.inline_error = Some(format!("unable to open {}: {message}", open.url));
+            }
+        }
+        true
     }
 
     fn submit_form(&mut self, action: Action, values: Vec<String>) -> Result<(), TuiError> {
@@ -1487,6 +1509,12 @@ impl Controller {
     }
 
     fn replace_catalog(&mut self, catalog: Catalog) {
+        if self.catalog.open_command != catalog.open_command {
+            self.url_opener = Arc::new(SystemUrlOpener::new(catalog.open_command.clone()));
+        }
+        if self.catalog.copy_command != catalog.copy_command {
+            self.clipboard = Arc::new(SystemClipboard::new(catalog.copy_command.clone()));
+        }
         if self.catalog.ignored_files != catalog.ignored_files {
             self.app.begin_status_refresh(&[], false);
             self.status_backlog.clear();
@@ -1891,6 +1919,7 @@ impl Controller {
 
     fn pump_background_results(&mut self) -> bool {
         let mut changed = self.pump_clipboard();
+        changed |= self.pump_url_open();
         changed |= self.pump_local_refresh();
         self.submit_status_backlog();
         let mut refresh = false;
@@ -2934,6 +2963,15 @@ mod tests {
         app
     }
 
+    fn finish_url_open(controller: &mut Controller) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while controller.url_open.is_some() {
+            assert!(Instant::now() < deadline, "URL opening did not finish");
+            controller.pump_url_open();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn finish_clipboard(controller: &mut Controller) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while controller.clipboard_copy.is_some() {
@@ -3512,10 +3550,103 @@ mod tests {
     }
 
     impl UrlOpener for FakeUrlOpener {
-        fn open(&self, url: &str) -> Result<(), String> {
+        fn open(&self, url: &str, _context: &crate::background::JobContext) -> Result<(), String> {
             self.opened.lock().unwrap().push(url.to_owned());
             self.error.clone().map_or(Ok(()), Err)
         }
+    }
+
+    #[test]
+    fn configured_opener_handles_inline_links_w_and_catalog_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let command = |path: &std::path::Path| {
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf '%s' \"$2\" > \"$1\"".to_owned(),
+                "test".to_owned(),
+                path.to_str().unwrap().to_owned(),
+            ]
+        };
+        let mut catalog = Catalog {
+            open_command: Some(command(&first)),
+            ..Catalog::default()
+        };
+        let mut controller = Controller::new(
+            directory.path().join("wt.json"),
+            catalog.clone(),
+            prompt_app(),
+        );
+        let url = "https://example.org/?x=$(literal)&quoted='two words'";
+        controller
+            .handle_intent(Intent::OpenUrl(url.to_owned()))
+            .unwrap();
+        finish_url_open(&mut controller);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), url);
+        catalog.open_command = Some(command(&second));
+        controller.replace_catalog(catalog);
+        controller
+            .handle_intent(Intent::BeginAction(Action::OpenPullRequestWeb))
+            .unwrap();
+        finish_url_open(&mut controller);
+        assert_eq!(
+            std::fs::read_to_string(second).unwrap(),
+            "https://github.com/team/project/pull/42"
+        );
+        assert_eq!(std::fs::read_to_string(first).unwrap(), url);
+    }
+
+    #[test]
+    fn pending_opener_allows_quit_bounds_repeats_and_cancels_promptly() {
+        struct WaitingOpener {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl UrlOpener for WaitingOpener {
+            fn open(
+                &self,
+                _url: &str,
+                context: &crate::background::JobContext,
+            ) -> Result<(), String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                while !context.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err("cancelled".to_owned())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let opener = Arc::new(WaitingOpener {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut controller = Controller::with_url_opener(
+            directory.path().join("wt.json"),
+            Catalog::default(),
+            prompt_app(),
+            opener.clone(),
+        );
+        let start = Instant::now();
+        controller
+            .handle_intent(Intent::OpenUrl("https://example.org/".to_owned()))
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_millis(200));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while opener.calls.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        controller
+            .handle_intent(Intent::OpenUrl("https://example.org/again".to_owned()))
+            .unwrap();
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            controller.handle_intent(Intent::Cancel).unwrap(),
+            ControlFlow::Exit(None)
+        ));
+        let start = Instant::now();
+        drop(controller);
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -3537,6 +3668,7 @@ mod tests {
                 .unwrap(),
             ControlFlow::Continue
         ));
+        finish_url_open(&mut controller);
         assert_eq!(
             opener.opened.lock().unwrap().as_slice(),
             ["https://example/pr/1"]
@@ -3546,6 +3678,7 @@ mod tests {
         controller
             .handle_intent(Intent::BeginAction(Action::OpenPullRequestWeb))
             .unwrap();
+        finish_url_open(&mut controller);
         assert_eq!(
             opener.opened.lock().unwrap().as_slice(),
             [
@@ -3562,6 +3695,7 @@ mod tests {
         controller
             .handle_intent(Intent::OpenUrl("https://example/pr/2".to_owned()))
             .unwrap();
+        finish_url_open(&mut controller);
         assert!(
             controller
                 .app

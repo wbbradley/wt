@@ -18,6 +18,10 @@ pub struct Catalog {
     pub github_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored_files: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_command: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_command: Option<Vec<String>>,
     #[serde(default)]
     pub repositories: Vec<RepositoryConfig>,
 }
@@ -30,6 +34,8 @@ impl Default for Catalog {
             repository_root: None,
             github_hosts: Vec::new(),
             ignored_files: Vec::new(),
+            copy_command: None,
+            open_command: None,
             repositories: Vec::new(),
         }
     }

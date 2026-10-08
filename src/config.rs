@@ -43,6 +43,14 @@ pub enum ConfigError {
         "invalid ignored_files path {path:?}: expected a nonempty relative file path without parent traversal"
     )]
     InvalidIgnoredFile { path: PathBuf },
+    #[error(
+        "invalid copy_command: expected a nonempty executable followed by literal arguments without NUL bytes"
+    )]
+    InvalidCopyCommand,
+    #[error(
+        "invalid open_command: expected a nonempty executable followed by literal arguments without NUL bytes"
+    )]
+    InvalidOpenCommand,
 }
 
 pub struct CatalogLock {
@@ -83,7 +91,33 @@ pub fn load(path: &Path) -> Result<Catalog, ConfigError> {
         });
     }
     normalize_ignored_files(&mut catalog)?;
+    validate_copy_command(&catalog)?;
+    validate_open_command(&catalog)?;
     Ok(catalog)
+}
+
+fn validate_copy_command(catalog: &Catalog) -> Result<(), ConfigError> {
+    if let Some(command) = &catalog.copy_command
+        && (command
+            .first()
+            .is_none_or(|program| program.trim().is_empty())
+            || command.iter().any(|argument| argument.contains('\0')))
+    {
+        return Err(ConfigError::InvalidCopyCommand);
+    }
+    Ok(())
+}
+
+fn validate_open_command(catalog: &Catalog) -> Result<(), ConfigError> {
+    if let Some(command) = &catalog.open_command
+        && (command
+            .first()
+            .is_none_or(|program| program.trim().is_empty())
+            || command.iter().any(|argument| argument.contains('\0')))
+    {
+        return Err(ConfigError::InvalidOpenCommand);
+    }
+    Ok(())
 }
 
 pub fn normalize_ignored_files(catalog: &mut Catalog) -> Result<(), ConfigError> {
@@ -112,6 +146,8 @@ pub fn normalize_ignored_files(catalog: &mut Catalog) -> Result<(), ConfigError>
 pub fn save(path: &Path, catalog: &Catalog) -> Result<(), ConfigError> {
     let mut catalog = catalog.clone();
     normalize_ignored_files(&mut catalog)?;
+    validate_copy_command(&catalog)?;
+    validate_open_command(&catalog)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
         path: path.to_owned(),
@@ -378,6 +414,77 @@ mod tests {
                 .join("new/project")
         );
         assert!(!directory.path().join("new").exists());
+    }
+
+    #[test]
+    fn open_command_defaults_round_trips_and_rejects_invalid_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wt.json");
+        fs::write(&path, r#"{"version":1}"#).unwrap();
+        let mut catalog = load(&path).unwrap();
+        assert_eq!(catalog.open_command, None);
+        catalog.open_command = Some(
+            ["/path with spaces/open", "--host", "obsidian", ""]
+                .map(str::to_owned)
+                .to_vec(),
+        );
+        save(&path, &catalog).unwrap();
+        assert_eq!(load(&path).unwrap(), catalog);
+        let original = fs::read(&path).unwrap();
+        for command in [vec![], vec![""], vec!["  "], vec!["open", "bad\0arg"]] {
+            let mut invalid = catalog.clone();
+            invalid.open_command = Some(command.into_iter().map(str::to_owned).collect());
+            assert!(matches!(
+                save(&path, &invalid),
+                Err(ConfigError::InvalidOpenCommand)
+            ));
+            assert_eq!(fs::read(&path).unwrap(), original);
+            fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(matches!(load(&path), Err(ConfigError::InvalidOpenCommand)));
+            fs::write(&path, &original).unwrap();
+        }
+        fs::write(&path, r#"{"version":1,"open_command":null}"#).unwrap();
+        assert_eq!(load(&path).unwrap().open_command, None);
+    }
+
+    #[test]
+    fn copy_command_defaults_and_round_trips_literal_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wt.json");
+        fs::write(&path, r#"{"version":1}"#).unwrap();
+        let mut catalog = load(&path).unwrap();
+        assert_eq!(catalog.copy_command, None);
+        save(&path, &catalog).unwrap();
+        let encoded: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(encoded.get("copy_command").is_none());
+        catalog.copy_command = Some(
+            ["/path with spaces/copy", "obsidian", "", "$HOME", "a; b"]
+                .map(str::to_owned)
+                .to_vec(),
+        );
+        save(&path, &catalog).unwrap();
+        assert_eq!(load(&path).unwrap(), catalog);
+        fs::write(&path, r#"{"version":1,"copy_command":null}"#).unwrap();
+        assert_eq!(load(&path).unwrap().copy_command, None);
+    }
+
+    #[test]
+    fn invalid_copy_command_is_rejected_without_changing_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wt.json");
+        let original = r#"{"version":1,"copy_command":["copy-helper"]}"#;
+        for command in [vec![], vec![""], vec!["  "], vec!["copy", "bad\0arg"]] {
+            fs::write(&path, original).unwrap();
+            let mut catalog = load(&path).unwrap();
+            catalog.copy_command = Some(command.into_iter().map(str::to_owned).collect());
+            assert!(matches!(
+                save(&path, &catalog),
+                Err(ConfigError::InvalidCopyCommand)
+            ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+            assert!(matches!(load(&path), Err(ConfigError::InvalidCopyCommand)));
+        }
     }
 
     #[test]

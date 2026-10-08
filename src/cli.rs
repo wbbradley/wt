@@ -74,6 +74,16 @@ enum ConfigCommand {
 enum ConfigSetting {
     /// Set the legacy repository root (repository creation now requires a dialog).
     RepositoryRoot { expression: String },
+    /// Set the clipboard executable and literal arguments (text is sent on stdin).
+    CopyCommand {
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Set the URL opener and literal arguments (the URL is appended as one argument).
+    OpenCommand {
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -370,6 +380,16 @@ fn run_with(runner: &dyn GitRunner, catalog_path: &Path, cli: Cli) -> Result<(),
                 let _lock = config::acquire_catalog_lock(catalog_path)?;
                 let mut catalog = config::load(catalog_path)?;
                 match setting {
+                    ConfigSetting::OpenCommand { command } => {
+                        catalog.open_command = Some(command);
+                        config::save(catalog_path, &catalog)?;
+                        show_open_command(&catalog)?;
+                    }
+                    ConfigSetting::CopyCommand { command } => {
+                        catalog.copy_command = Some(command);
+                        config::save(catalog_path, &catalog)?;
+                        show_copy_command(&catalog)?;
+                    }
                     ConfigSetting::RepositoryRoot { expression } => {
                         let resolved = config::resolve_repository_root(&expression)?;
                         catalog.repository_root = Some(expression.clone());
@@ -418,6 +438,22 @@ fn show_config(catalog: &Catalog) -> Result<(), CliError> {
     for host in catalog.effective_github_hosts(std::iter::empty()) {
         println!("github-host\t{host}");
     }
+    show_copy_command(catalog)?;
+    show_open_command(catalog)?;
+    Ok(())
+}
+
+fn show_copy_command(catalog: &Catalog) -> Result<(), CliError> {
+    let command =
+        serde_json::to_string(&catalog.copy_command).map_err(config::ConfigError::Encode)?;
+    println!("copy-command\tconfigured={command}");
+    Ok(())
+}
+
+fn show_open_command(catalog: &Catalog) -> Result<(), CliError> {
+    let command =
+        serde_json::to_string(&catalog.open_command).map_err(config::ConfigError::Encode)?;
+    println!("open-command\tconfigured={command}");
     Ok(())
 }
 
@@ -616,7 +652,7 @@ fn complete_config(words: &[String], candidates: &mut BTreeSet<String>) {
         candidates.extend(["set", "show"].map(str::to_owned));
     }
     if words.get(1).map(String::as_str) == Some("set") && words.len() <= 3 {
-        candidates.insert("repository-root".to_owned());
+        candidates.extend(["copy-command", "open-command", "repository-root"].map(str::to_owned));
     }
     if words.get(2).map(String::as_str) == Some("repository-root") {
         candidates.extend(file_candidates(
@@ -1363,6 +1399,81 @@ mod tests {
     use crate::git::{CommandOutput, GitError};
     use std::ffi::OsString;
     use std::process::Command as ProcessCommand;
+
+    #[test]
+    fn config_set_commands_preserves_arguments_and_existing_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wt.json");
+        let original = Catalog {
+            github_refresh_interval_secs: 123,
+            repositories: vec![repository("/test/repository", "project")],
+            ..Catalog::default()
+        };
+        config::save(&path, &original).unwrap();
+        let cli = Cli::try_parse_from([
+            "wt",
+            "config",
+            "set",
+            "copy-command",
+            "/path with spaces/copy",
+            "--flag",
+            "two words",
+            "$HOME",
+            "",
+        ])
+        .unwrap();
+        run_with(&SystemGit, &path, cli).unwrap();
+        let mut expected = original;
+        expected.copy_command = Some(
+            ["/path with spaces/copy", "--flag", "two words", "$HOME", ""]
+                .map(str::to_owned)
+                .to_vec(),
+        );
+        assert_eq!(config::load(&path).unwrap(), expected);
+        assert!(Cli::try_parse_from(["wt", "config", "set", "copy-command"]).is_err());
+
+        let before = fs::read(&path).unwrap();
+        let cli = Cli::try_parse_from(["wt", "config", "set", "copy-command", ""]).unwrap();
+        assert!(matches!(
+            run_with(&SystemGit, &path, cli),
+            Err(CliError::Config(config::ConfigError::InvalidCopyCommand))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let cli = Cli::try_parse_from([
+            "wt",
+            "config",
+            "set",
+            "open-command",
+            "/path with spaces/open",
+            "--host",
+            "obsidian",
+        ])
+        .unwrap();
+        run_with(&SystemGit, &path, cli).unwrap();
+        expected.open_command = Some(
+            ["/path with spaces/open", "--host", "obsidian"]
+                .map(str::to_owned)
+                .to_vec(),
+        );
+        assert_eq!(config::load(&path).unwrap(), expected);
+        assert!(Cli::try_parse_from(["wt", "config", "set", "open-command"]).is_err());
+        let before = fs::read(&path).unwrap();
+        let cli = Cli::try_parse_from(["wt", "config", "set", "open-command", ""]).unwrap();
+        assert!(matches!(
+            run_with(&SystemGit, &path, cli),
+            Err(CliError::Config(config::ConfigError::InvalidOpenCommand))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn config_completion_includes_copy_command() {
+        let mut candidates = BTreeSet::new();
+        complete_config(&["config", "set", ""].map(str::to_owned), &mut candidates);
+        assert!(candidates.contains("copy-command"));
+        assert!(candidates.contains("open-command"));
+        assert!(candidates.contains("repository-root"));
+    }
 
     #[test]
     fn cleanup_flag_prepares_containing_worktree_without_removing_it() {

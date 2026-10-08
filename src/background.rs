@@ -373,11 +373,11 @@ impl CancellableGitRunner {
     }
 }
 
-fn terminate_child(child: &mut std::process::Child) {
+pub(crate) fn terminate_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        // The child starts its own process group, so this also terminates Git's
-        // SSH/credential helpers and closes every inherited output pipe.
+        // The child starts its own process group, so this also terminates its
+        // helpers and closes every inherited output pipe.
         unsafe {
             libc::kill(-(child.id() as i32), libc::SIGKILL);
         }
