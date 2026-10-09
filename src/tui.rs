@@ -119,8 +119,7 @@ pub enum TuiError {
 enum PendingAction {
     MoveFile {
         source: PathBuf,
-        directory: PathBuf,
-        create_parents: bool,
+        destination: PathBuf,
     },
     DeleteFile {
         path: PathBuf,
@@ -845,13 +844,7 @@ impl Controller {
                     field: "file",
                     message: "select an untracked or ignored file".to_owned(),
                 })?);
-            self.app.open_form(
-                action,
-                vec![
-                    field("destination folder", ""),
-                    field("create missing folders (yes/no)", "no"),
-                ],
-            );
+            self.app.open_form(action, vec![field("destination", "")]);
             return Ok(());
         }
         if action == Action::DeleteFile {
@@ -1134,23 +1127,23 @@ impl Controller {
 
     fn submit_form(&mut self, action: Action, values: Vec<String>) -> Result<(), TuiError> {
         if action == Action::MoveFile {
-            require_len(&values, 2, "move file")?;
+            require_len(&values, 1, "move file")?;
             let source = self.file_move_source.clone().ok_or(TuiError::InvalidForm {
                 field: "file",
                 message: "no file was selected for this move".to_owned(),
             })?;
-            let directory = absolute_path(
-                &self.app.current_directory,
-                nonempty(&values[0], "destination folder")?,
-            )?;
-            let create_parents = parse_yes_no(&values[1], "create missing folders")?;
-            let destination = crate::file_ops::validate_move(&source, &directory, create_parents)
-                .map_err(file_move_error)?;
+            let value = nonempty(&values[0], "destination")?;
+            let target = absolute_path(&self.app.current_directory, value)?;
+            let destination = crate::file_ops::resolve_destination(
+                &source,
+                &target,
+                value.ends_with(std::path::MAIN_SEPARATOR),
+            )
+            .map_err(file_move_error)?;
             self.confirm(
                 PendingAction::MoveFile {
                     source: source.clone(),
-                    directory,
-                    create_parents,
+                    destination: destination.clone(),
                 },
                 vec![
                     format!("from: {}", source.display()),
@@ -1350,11 +1343,9 @@ impl Controller {
         match pending {
             PendingAction::MoveFile {
                 source,
-                directory,
-                create_parents,
+                destination,
             } => {
-                crate::file_ops::move_file(&source, &directory, create_parents)
-                    .map_err(file_move_error)?;
+                crate::file_ops::move_file(&source, &destination).map_err(file_move_error)?;
             }
             PendingAction::DeleteFile { path } => {
                 std::fs::remove_file(&path).map_err(|error| TuiError::InvalidForm {
@@ -3195,10 +3186,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn moving_a_file_uses_a_folder_and_keeps_the_source_through_selection_changes() {
+    fn file_move_destinations_resolve_before_confirmation_and_survive_selection_changes() {
         use crate::app::{BranchId, InlineSection, StatusState};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        for section in [InlineSection::UntrackedFiles, InlineSection::IgnoredFiles] {
+        for (section, value) in [
+            (InlineSection::UntrackedFiles, "../nw"),
+            (InlineSection::IgnoredFiles, "../nw/nested/renamed file"),
+            (InlineSection::UntrackedFiles, "../nw/"),
+        ] {
             let temporary = tempfile::tempdir().unwrap();
             let root = temporary.path().join("repo");
             std::fs::create_dir(&root).unwrap();
@@ -3239,23 +3234,37 @@ mod tests {
             assert_eq!(intent, Intent::BeginAction(Action::MoveFile));
             controller.handle_intent(intent).unwrap();
             assert!(
-                matches!(&controller.app.modal, Some(Modal::Form { action: Action::MoveFile, fields, .. }) if fields[0].label == "destination folder")
+                matches!(&controller.app.modal, Some(Modal::Form { action: Action::MoveFile, fields, .. }) if fields.len() == 1 && fields[0].label == "destination")
             );
             controller.app.selected = Some(RowId::Repository(root.clone()));
             let directory = temporary.path().join("nw");
-            // A relative folder keeps just the basename, even for a nested file.
+            let destination = if value == "../nw" {
+                std::fs::create_dir(&directory).unwrap();
+                directory.join(source.file_name().unwrap())
+            } else if value.ends_with('/') {
+                directory.join(source.file_name().unwrap())
+            } else {
+                directory.join("nested/renamed file")
+            };
             controller
-                .submit_form(Action::MoveFile, vec!["../nw/".into(), "yes".into()])
+                .submit_form(Action::MoveFile, vec![value.into()])
                 .unwrap();
-            let destination = directory.join(source.file_name().unwrap());
             assert!(
                 matches!(&controller.pending_action, Some(PendingAction::MoveFile { source: selected, .. }) if selected == &source)
             );
+            let confirmed_destination = if value == "../nw/nested/renamed file" {
+                root.join(value)
+            } else {
+                root.join(value).join(source.file_name().unwrap())
+            };
             assert!(
-                matches!(&controller.app.modal, Some(Modal::Confirm { action: Action::MoveFile, summary }) if summary.iter().any(|line| line.contains(source.file_name().unwrap().to_str().unwrap())))
+                matches!(&controller.app.modal, Some(Modal::Confirm { action: Action::MoveFile, summary }) if summary.contains(&format!("to: {}", confirmed_destination.display())))
             );
             assert!(source.exists());
-            assert!(!directory.exists());
+            assert!(!destination.exists());
+            if value != "../nw" {
+                assert!(!directory.exists());
+            }
             let intent = controller.app.handle_key(key(KeyCode::Enter));
             assert_eq!(intent, Intent::ConfirmAction(Action::MoveFile));
             controller.handle_intent(intent).unwrap();

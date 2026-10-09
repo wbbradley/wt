@@ -420,10 +420,12 @@ The listing refreshes after deletion. Symlinks are removed without deleting thei
 targets; directories are never recursively deleted. On worktree rows, `d` keeps
 its existing remove-worktree behavior.
 
-Press `m` on an untracked or ignored file to move that file into a destination
-folder, keeping its filename. Paths such as `~/nw/` expand to your home directory.
-The dialog can create missing folders and confirms the full source and destination
-paths before moving. Existing files are never overwritten. The listing refreshes
-after the move. On worktree rows, `m` moves the worktree.
+Press `m` on an untracked or ignored file to move it. An existing destination
+folder keeps the filename; a new file path moves and renames the file. Missing
+parent directories are created automatically. A trailing `/` specifies a folder,
+even if it does not exist yet. Paths such as `~/nw/` expand to your home directory.
+The dialog confirms the full source and destination paths before moving. Existing
+files are never overwritten. The listing refreshes after the move. On worktree
+rows, `m` moves the worktree.
 
 Diagnostics use `tracing` and append to `~/wt.log` by default. Set `WT_LOG_PATH` to change the file and `RUST_LOG` to change the filter (default: `info`). Subprocess logs include arguments, exit status, stdout, and stderr; credential lookup output is suppressed and authenticated Git output redacts the active token. Logs stay out of the TUI and shell selection output.
