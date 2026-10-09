@@ -117,6 +117,11 @@ pub enum TuiError {
 
 #[derive(Clone, Debug)]
 enum PendingAction {
+    MoveFile {
+        source: PathBuf,
+        directory: PathBuf,
+        create_parents: bool,
+    },
     DeleteFile {
         path: PathBuf,
     },
@@ -177,6 +182,7 @@ enum PendingAction {
 impl PendingAction {
     fn action(&self) -> Action {
         match self {
+            Self::MoveFile { .. } => Action::MoveFile,
             Self::DeleteFile { .. } => Action::DeleteFile,
             Self::Create { .. } => Action::Create,
             Self::NewWorktree { .. } => Action::NewWorktree,
@@ -427,6 +433,7 @@ struct Controller {
     displayed_refresh_age_minutes: Option<u64>,
     discover_authored_pull_requests: bool,
     pending_action: Option<PendingAction>,
+    file_move_source: Option<PathBuf>,
     materialization_job: Option<BackgroundJob<MaterializationOutcome>>,
     deletions: Vec<Deletion>,
     materialization_progress: Option<String>,
@@ -492,6 +499,7 @@ impl Controller {
             displayed_refresh_age_minutes: None,
             discover_authored_pull_requests: true,
             pending_action: None,
+            file_move_source: None,
             materialization_job: None,
             deletions: Vec::new(),
             materialization_progress: None,
@@ -830,6 +838,22 @@ impl Controller {
     }
 
     fn begin_action(&mut self, action: Action) -> Result<(), TuiError> {
+        self.file_move_source = None;
+        if action == Action::MoveFile {
+            self.file_move_source =
+                Some(self.app.selected_file().ok_or(TuiError::InvalidForm {
+                    field: "file",
+                    message: "select an untracked or ignored file".to_owned(),
+                })?);
+            self.app.open_form(
+                action,
+                vec![
+                    field("destination folder", ""),
+                    field("create missing folders (yes/no)", "no"),
+                ],
+            );
+            return Ok(());
+        }
         if action == Action::DeleteFile {
             let path = self.app.selected_file().ok_or(TuiError::InvalidForm {
                 field: "file",
@@ -915,7 +939,9 @@ impl Controller {
             .ok_or(TuiError::RepositoryGone)?;
         let repository_path = repository.config.path.clone();
         match action {
-            Action::DeleteFile | Action::CopyFilePath => unreachable!("handled above"),
+            Action::DeleteFile | Action::MoveFile | Action::CopyFilePath => {
+                unreachable!("handled above")
+            }
             Action::CopyAgentPrompt => unreachable!("handled before repository resolution"),
             Action::CopyReviewRequest => {
                 unreachable!("handled before repository resolution")
@@ -1107,6 +1133,33 @@ impl Controller {
     }
 
     fn submit_form(&mut self, action: Action, values: Vec<String>) -> Result<(), TuiError> {
+        if action == Action::MoveFile {
+            require_len(&values, 2, "move file")?;
+            let source = self.file_move_source.clone().ok_or(TuiError::InvalidForm {
+                field: "file",
+                message: "no file was selected for this move".to_owned(),
+            })?;
+            let directory = absolute_path(
+                &self.app.current_directory,
+                nonempty(&values[0], "destination folder")?,
+            )?;
+            let create_parents = parse_yes_no(&values[1], "create missing folders")?;
+            let destination = crate::file_ops::validate_move(&source, &directory, create_parents)
+                .map_err(file_move_error)?;
+            self.confirm(
+                PendingAction::MoveFile {
+                    source: source.clone(),
+                    directory,
+                    create_parents,
+                },
+                vec![
+                    format!("from: {}", source.display()),
+                    format!("to: {}", destination.display()),
+                ],
+            );
+            self.file_move_source = None;
+            return Ok(());
+        }
         let (repository_view, _) = self
             .app
             .selected_repository()
@@ -1132,7 +1185,7 @@ impl Controller {
                 let destination = if values[3].trim().is_empty() {
                     operations::suggested_destination(&repository, &mode)
                 } else {
-                    absolute_path(&self.app.current_directory, values[3].trim())
+                    absolute_path(&self.app.current_directory, values[3].trim())?
                 };
                 let create_parents = parse_yes_no(&values[4], "create missing parents")?;
                 operations::validate_create(
@@ -1192,7 +1245,7 @@ impl Controller {
                 let destination = absolute_path(
                     &self.app.current_directory,
                     nonempty(&values[0], "destination")?,
-                );
+                )?;
                 let create_parents = parse_yes_no(&values[1], "create missing parents")?;
                 operations::validate_move(
                     &SystemGit,
@@ -1237,7 +1290,7 @@ impl Controller {
                 let path = absolute_path(
                     &self.app.current_directory,
                     nonempty(&values[0], "worktree path")?,
-                );
+                )?;
                 let pending = PendingAction::Repair {
                     repository: repository.path,
                     path: path.clone(),
@@ -1249,7 +1302,7 @@ impl Controller {
                 let path = absolute_path(
                     &self.app.current_directory,
                     nonempty(&values[0], "repository path")?,
-                );
+                )?;
                 let identity = git::resolve_repository(&SystemGit, &path)?;
                 for other in self
                     .catalog
@@ -1264,7 +1317,8 @@ impl Controller {
                     }
                 }
                 let worktree_root = optional_text(&values[2])
-                    .map(|path| absolute_path(&self.app.current_directory, &path));
+                    .map(|path| absolute_path(&self.app.current_directory, &path))
+                    .transpose()?;
                 let pending = PendingAction::EditRepository {
                     repository: repository.path.clone(),
                     new_repository: identity.anchor.clone(),
@@ -1294,6 +1348,14 @@ impl Controller {
 
     fn execute(&mut self, pending: PendingAction) -> Result<(), TuiError> {
         match pending {
+            PendingAction::MoveFile {
+                source,
+                directory,
+                create_parents,
+            } => {
+                crate::file_ops::move_file(&source, &directory, create_parents)
+                    .map_err(file_move_error)?;
+            }
             PendingAction::DeleteFile { path } => {
                 std::fs::remove_file(&path).map_err(|error| TuiError::InvalidForm {
                     field: "file deletion",
@@ -2797,12 +2859,19 @@ fn invalid<T>(field: &'static str, message: impl Into<String>) -> Result<T, TuiE
     })
 }
 
-fn absolute_path(current_directory: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
+fn file_move_error(error: io::Error) -> TuiError {
+    TuiError::InvalidForm {
+        field: "file move",
+        message: error.to_string(),
+    }
+}
+
+fn absolute_path(current_directory: &Path, value: &str) -> Result<PathBuf, TuiError> {
+    let path = config::expand_user_path(Path::new(value))?;
     if path.is_absolute() {
-        path
+        Ok(path)
     } else {
-        current_directory.join(path)
+        Ok(current_directory.join(path))
     }
 }
 
@@ -3121,6 +3190,99 @@ mod tests {
                     .enabled
             );
             assert!(controller.begin_action(Action::DeleteFile).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn moving_a_file_uses_a_folder_and_keeps_the_source_through_selection_changes() {
+        use crate::app::{BranchId, InlineSection, StatusState};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for section in [InlineSection::UntrackedFiles, InlineSection::IgnoredFiles] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("repo");
+            std::fs::create_dir(&root).unwrap();
+            git::run_git(&SystemGit, &root, &["init".into(), "-q".into()]).unwrap();
+            let root = std::fs::canonicalize(root).unwrap();
+            let relative = PathBuf::from("nested/file ;$(literal) with spaces");
+            let source = root.join(&relative);
+            std::fs::create_dir(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, "move these contents").unwrap();
+            let mut catalog = Catalog::default();
+            if section == InlineSection::IgnoredFiles {
+                std::fs::write(root.join(".git/info/exclude"), "nested/\n").unwrap();
+                catalog.ignored_files.push(relative.clone());
+            }
+            catalog.repositories.push(RepositoryConfig {
+                path: root.clone(),
+                label: None,
+                worktree_root: None,
+                github_remote: None,
+                github_remotes: Default::default(),
+                github_preferred_remote: None,
+            });
+            let catalog_path = temporary.path().join("wt.json");
+            config::save(&catalog_path, &catalog).unwrap();
+            let mut app = App::new(load_repository_views(&catalog, &root), root.clone());
+            app.statuses.insert(
+                root.clone(),
+                StatusState::Ready(
+                    git::status_with_ignored(&SystemGit, &root, &catalog.ignored_files).unwrap(),
+                ),
+            );
+            let file_id = RowId::File(BranchId::Worktree(root.clone()), section, relative);
+            app.selected = Some(file_id.clone());
+            let mut controller = Controller::new(catalog_path, catalog, app);
+            controller.github_in_flight = true;
+            let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+            let intent = controller.app.handle_key(key(KeyCode::Char('m')));
+            assert_eq!(intent, Intent::BeginAction(Action::MoveFile));
+            controller.handle_intent(intent).unwrap();
+            assert!(
+                matches!(&controller.app.modal, Some(Modal::Form { action: Action::MoveFile, fields, .. }) if fields[0].label == "destination folder")
+            );
+            controller.app.selected = Some(RowId::Repository(root.clone()));
+            let directory = temporary.path().join("nw");
+            // A relative folder keeps just the basename, even for a nested file.
+            controller
+                .submit_form(Action::MoveFile, vec!["../nw/".into(), "yes".into()])
+                .unwrap();
+            let destination = directory.join(source.file_name().unwrap());
+            assert!(
+                matches!(&controller.pending_action, Some(PendingAction::MoveFile { source: selected, .. }) if selected == &source)
+            );
+            assert!(
+                matches!(&controller.app.modal, Some(Modal::Confirm { action: Action::MoveFile, summary }) if summary.iter().any(|line| line.contains(source.file_name().unwrap().to_str().unwrap())))
+            );
+            assert!(source.exists());
+            assert!(!directory.exists());
+            let intent = controller.app.handle_key(key(KeyCode::Enter));
+            assert_eq!(intent, Intent::ConfirmAction(Action::MoveFile));
+            controller.handle_intent(intent).unwrap();
+            assert!(!source.exists());
+            assert_eq!(
+                std::fs::read_to_string(&destination).unwrap(),
+                "move these contents"
+            );
+            assert!(root.join(".git").is_dir());
+            assert_eq!(controller.app.repositories[0].worktrees[0].path, root);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                controller.submit_status_backlog();
+                if let Some(update) = controller.status_pool.try_recv() {
+                    controller.app.apply_status(update);
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                !controller
+                    .app
+                    .visible_rows()
+                    .iter()
+                    .any(|row| row.id() == &file_id)
+            );
         }
     }
 
@@ -4062,11 +4224,25 @@ mod tests {
     }
 
     #[test]
+    fn form_paths_expand_home_before_resolving_relative_paths() {
+        let home = PathBuf::from(env::var_os("HOME").expect("test environment has HOME"));
+        assert_eq!(
+            absolute_path(Path::new("/base"), "~/nw/").unwrap(),
+            home.join("nw")
+        );
+        assert_eq!(absolute_path(Path::new("/base"), "~").unwrap(), home);
+        assert_eq!(
+            absolute_path(Path::new("/base"), "/absolute/path").unwrap(),
+            PathBuf::from("/absolute/path")
+        );
+    }
+
+    #[test]
     fn form_parsers_reject_ambiguous_values() {
         assert!(parse_yes_no("maybe", "choice").is_err());
         assert!(nonempty("  ", "branch").is_err());
         assert_eq!(
-            absolute_path(Path::new("/base"), "relative"),
+            absolute_path(Path::new("/base"), "relative").unwrap(),
             PathBuf::from("/base/relative")
         );
     }

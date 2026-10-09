@@ -18,6 +18,8 @@ pub const CONFIG_PATH_ENV: &str = "WT_CONFIG_PATH";
 pub enum ConfigError {
     #[error("cannot determine the configuration directory; set {CONFIG_PATH_ENV}")]
     NoConfigDirectory,
+    #[error("cannot expand '~' in a path because HOME is not defined")]
+    NoHomeDirectory,
     #[error("failed to read catalog {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
     #[error("catalog {path} is not valid JSON: {source}")]
@@ -227,6 +229,18 @@ fn resolve_repository_root_with(
     Ok(canonical)
 }
 
+/// Expand a leading `~` path component without interpreting shell syntax.
+pub fn expand_user_path(path: &Path) -> Result<PathBuf, ConfigError> {
+    expand_user_path_with(path, env::var_os("HOME"))
+}
+
+fn expand_user_path_with(path: &Path, home: Option<OsString>) -> Result<PathBuf, ConfigError> {
+    match path.strip_prefix("~") {
+        Ok(suffix) => Ok(PathBuf::from(home.ok_or(ConfigError::NoHomeDirectory)?).join(suffix)),
+        Err(_) => Ok(path.to_owned()),
+    }
+}
+
 /// Expand and normalize a destination without creating any filesystem entries.
 pub fn expand_repository_path(expression: &str) -> Result<PathBuf, ConfigError> {
     expand_repository_path_with(expression, |name| env::var_os(name))
@@ -399,6 +413,33 @@ mod tests {
     use crate::model::{DEFAULT_GITHUB_REFRESH_INTERVAL_SECS, RepositoryConfig};
     use std::collections::HashMap;
     use std::sync::mpsc;
+
+    #[test]
+    fn user_paths_expand_only_a_leading_tilde_component() {
+        let home = OsString::from("/home/test user");
+        for (input, expected) in [
+            ("~", "/home/test user"),
+            ("~/nw/", "/home/test user/nw"),
+            ("~//nw/project", "/home/test user/nw/project"),
+            ("relative/path", "relative/path"),
+            ("./~/literal", "./~/literal"),
+            ("/absolute/~/literal", "/absolute/~/literal"),
+            ("~someone/project", "~someone/project"),
+        ] {
+            assert_eq!(
+                expand_user_path_with(Path::new(input), Some(home.clone())).unwrap(),
+                PathBuf::from(expected)
+            );
+        }
+        assert!(matches!(
+            expand_user_path_with(Path::new("~/project"), None),
+            Err(ConfigError::NoHomeDirectory)
+        ));
+        assert_eq!(
+            expand_user_path_with(Path::new("relative"), None).unwrap(),
+            PathBuf::from("relative")
+        );
+    }
 
     #[test]
     fn destination_expansion_does_not_create_directories() {

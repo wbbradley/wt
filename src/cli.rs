@@ -1231,7 +1231,7 @@ fn add(
 ) -> Result<(), CliError> {
     validate_optional_text(arguments.label.as_deref(), "label")?;
     validate_optional_text(arguments.github_remote.as_deref(), "GitHub remote")?;
-    let identity = git::resolve_repository(runner, &arguments.path)?;
+    let identity = git::resolve_repository(runner, &absolute_path(arguments.path)?)?;
     if let Some(existing) = find_by_common_dir(runner, catalog, &identity.common_git_dir, None) {
         return Err(CliError::DuplicateRepository(existing.display_label()));
     }
@@ -1295,7 +1295,7 @@ fn edit(
     let index = select(catalog, &arguments.selector)?;
 
     if let Some(path) = arguments.path {
-        let identity = git::resolve_repository(runner, &path)?;
+        let identity = git::resolve_repository(runner, &absolute_path(path)?)?;
         if let Some(existing) =
             find_by_common_dir(runner, catalog, &identity.common_git_dir, Some(index))
         {
@@ -1386,6 +1386,7 @@ fn validate_optional_text(value: Option<&str>, field: &'static str) -> Result<()
 }
 
 fn absolute_path(path: PathBuf) -> Result<PathBuf, CliError> {
+    let path = config::expand_user_path(&path)?;
     if path.is_absolute() {
         return Ok(path);
     }

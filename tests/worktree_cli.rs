@@ -7,6 +7,60 @@ use std::process::{Command, Output};
 use std::thread;
 
 #[test]
+fn quoted_home_paths_expand_for_creating_and_moving_worktrees() {
+    let fixture = Fixture::normal("home paths");
+    let home = fixture.root.join("home directory");
+    fs::create_dir(&home).unwrap();
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_wt"))
+            .current_dir(&fixture.anchor)
+            .env("WT_CONFIG_PATH", &fixture.config)
+            .env("HOME", &home)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    assert_success(&run(&[
+        "worktree",
+        "create",
+        "project",
+        "~/topic",
+        "--new-branch",
+        "topic",
+        "--yes",
+    ]));
+    assert!(home.join("topic/.git").exists());
+    let missing_parent = run(&[
+        "worktree",
+        "move",
+        "project",
+        "topic",
+        "~/nw/topic",
+        "--yes",
+    ]);
+    assert_failure_contains(
+        &missing_parent,
+        &format!(
+            "destination parent does not exist: {}",
+            home.join("nw").display()
+        ),
+    );
+    assert!(!home.join("nw").exists());
+    assert_success(&run(&[
+        "worktree",
+        "move",
+        "project",
+        "topic",
+        "~/nw/topic",
+        "--create-parents",
+        "--yes",
+    ]));
+    assert!(!home.join("topic").exists());
+    assert!(home.join("nw/topic/.git").exists());
+    assert!(!fixture.anchor.join("~").exists());
+}
+
+#[test]
 fn creates_all_modes_reports_status_and_validates_conflicts() {
     let fixture = Fixture::normal("creation");
     let existing = fixture.root.join("existing tree");

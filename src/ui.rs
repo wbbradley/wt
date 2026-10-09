@@ -769,7 +769,7 @@ fn list_selection_hint(app: &App, rows: &[VisibleRow]) -> &'static str {
         return "Enter selects";
     };
     if matches!(row.id(), crate::app::RowId::File(..)) {
-        return "Enter views · e edits";
+        return "Enter views · e edits · m moves file";
     }
     match row {
         VisibleRow::Repository {
@@ -1610,6 +1610,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, rows: &[VisibleRow], area: Re
                 })
             ) {
                 shortcuts.insert(0, ("d", "delete file"));
+                if let Some(shortcut) = shortcuts.iter_mut().find(|(key, _)| *key == "m") {
+                    shortcut.1 = "move file";
+                }
             }
             if app.filter.is_empty() {
                 shortcuts.insert(4, ("n", "create"));

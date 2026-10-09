@@ -346,6 +346,7 @@ pub enum Action {
     Create,
     NewWorktree,
     Move,
+    MoveFile,
     Lock,
     Unlock,
     Remove,
@@ -358,7 +359,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::CopyAgentPrompt,
         Self::CopyFilePath,
         Self::CopyReviewRequest,
@@ -366,6 +367,7 @@ impl Action {
         Self::Create,
         Self::NewWorktree,
         Self::Move,
+        Self::MoveFile,
         Self::Lock,
         Self::Unlock,
         Self::Remove,
@@ -386,6 +388,7 @@ impl Action {
             Self::Create => "create worktree",
             Self::NewWorktree => "new tracked worktree",
             Self::Move => "move worktree",
+            Self::MoveFile => "move file",
             Self::Lock => "lock worktree",
             Self::Unlock => "unlock worktree",
             Self::Remove => "remove worktree",
@@ -405,7 +408,7 @@ impl Action {
             Self::OpenPullRequestWeb => Some("w"),
             Self::Create => None,
             Self::NewWorktree => Some("n"),
-            Self::Move => Some("m"),
+            Self::Move | Self::MoveFile => Some("m"),
             Self::Lock => Some("L"),
             Self::Unlock => Some("U"),
             Self::Remove | Self::DeleteFile => Some("d"),
@@ -2924,7 +2927,17 @@ impl App {
             enabled: false,
             reason: Some(reason.to_owned()),
         };
-        if matches!(action, Action::DeleteFile | Action::CopyFilePath) {
+        if matches!(
+            action,
+            Action::DeleteFile | Action::MoveFile | Action::CopyFilePath
+        ) {
+            if action == Action::MoveFile
+                && self
+                    .selected_worktree()
+                    .is_some_and(|(_, worktree, _)| self.is_deleting(&worktree.path))
+            {
+                return disabled("worktree is being removed");
+            }
             return if self.selected_file().is_some() {
                 ActionAvailability {
                     action,
@@ -2934,6 +2947,9 @@ impl App {
             } else {
                 disabled("select an untracked or ignored file")
             };
+        }
+        if action == Action::Move && self.selected_file().is_some() {
+            return disabled("select a worktree row to move a worktree");
         }
         if matches!(action, Action::CopyAgentPrompt | Action::CopyReviewRequest) {
             return ActionAvailability {
@@ -2995,7 +3011,7 @@ impl App {
                     disabled("repository is already registered")
                 }
             }
-            Action::DeleteFile | Action::CopyFilePath => {
+            Action::DeleteFile | Action::MoveFile | Action::CopyFilePath => {
                 unreachable!("handled before selection validation")
             }
             Action::CopyAgentPrompt => unreachable!("handled before selection validation"),
@@ -4080,6 +4096,7 @@ impl App {
             'p' => Action::CopyReviewRequest,
             'w' => Action::OpenPullRequestWeb,
             'n' => Action::NewWorktree,
+            'm' if self.selected_file().is_some() => Action::MoveFile,
             'm' => Action::Move,
             'L' => Action::Lock,
             'U' => Action::Unlock,
@@ -5034,6 +5051,12 @@ mod tests {
                 app.handle_key(key(KeyCode::Char('e'))),
                 Intent::EditFile(root.join(&paths[1]))
             );
+            assert_eq!(
+                app.handle_key(key(KeyCode::Char('m'))),
+                Intent::BeginAction(Action::MoveFile)
+            );
+            assert!(app.action_availability(Action::MoveFile).enabled);
+            assert!(!app.action_availability(Action::Move).enabled);
             app.apply_status(update(paths.clone()));
             assert_eq!(
                 app.selected,
